@@ -6,17 +6,14 @@ How to *interact with* this project. Says nothing about what the project does
 ## Running / driving the GUI
 
 - Entry point: `python main.py` (PyQt6, `MainWindow(project_dir=".")`).
-- **PyQt6 lives only in the anaconda python** (`~/AppData/Local/anaconda3`).
-  The other interpreters on PATH (Python311, Python37, WindowsApps) don't have
-  it — `where python` lists anaconda first.
-- **As of this session the anaconda PyQt6 is broken**: any `import PyQt6.QtCore`
-  fails with `ImportError: DLL load failed while importing QtCore: The specified
-  procedure could not be found.` This is a Qt-DLL / binding version mismatch, not
-  a PATH issue (adding `anaconda3\Library\bin` doesn't fix it). Until it's
-  repaired you **cannot launch or headlessly drive the GUI here** — don't burn
-  time retrying; fall back to static checks (below) and say so.
-- When PyQt6 works, the GUI is driven **headlessly** with offscreen Qt — no
-  display needed. Pattern (see `scripts/render_tabs.py`, `scripts/gui_smoke_test.py`):
+- **Use the repo venv: `.venv\Scripts\python.exe`.** It has PyQt6 (6.11.0) and
+  `import gui.main_window` succeeds. The interpreters on the system PATH do NOT
+  work: the anaconda python's PyQt6 is DLL-broken (`ImportError: DLL load failed
+  while importing QtCore`), and Python311/Python37/WindowsApps have no PyQt6.
+  A bare `python ...` will therefore fail — always call the venv python
+  explicitly. (`.venv` is hidden/git-ignored, so a casual dir listing can miss it.)
+- The GUI is driven **headlessly** with offscreen Qt — no display needed. Pattern
+  (see `scripts/render_tabs.py`, `scripts/gui_smoke_test.py`):
   set `QT_QPA_PLATFORM=offscreen` (and `QT_QPA_FONTDIR=C:/Windows/Fonts` on
   Windows) *before* importing PyQt, build `MainWindow`, call `state.load_video(...)`
   / `state.open_cache(key)`, invoke slot methods directly, `app.processEvents()`,
@@ -32,9 +29,10 @@ How to *interact with* this project. Says nothing about what the project does
 - Source files contain non-cp1252 glyphs (✏, ×, —, …). `ast.parse(open(f).read())`
   fails on Windows with a cp1252 `UnicodeDecodeError` — always pass
   `encoding='utf-8'`: `ast.parse(open(f, encoding='utf-8').read())`.
-- `import gui.*` transitively imports PyQt6, so it fails right now. Prefer
-  `ast.parse` for syntax verification; you won't get an import-level check until
-  PyQt6 is fixed.
+- `import gui.*` transitively imports PyQt6, so with a bare `python` it fails.
+  With `.venv\Scripts\python.exe` it works, so prefer an actual
+  `& .\.venv\Scripts\python.exe -c "import gui.main_window"` import check over a
+  mere `ast.parse` when you want to catch more than syntax.
 
 ## Architecture touchpoints (stable enough to rely on)
 
