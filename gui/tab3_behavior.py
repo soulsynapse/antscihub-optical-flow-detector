@@ -203,7 +203,10 @@ class Tab3Behavior(QWidget):
     # -- library -------------------------------------------------------------
 
     def _refresh_library(self):
-        self.state.reload_behaviors()
+        # Only repopulate the picker from disk. The ethogram is scoped to the
+        # loaded behavior (see _recompute), so we must NOT pull the whole library
+        # into state.behaviors here -- doing so is what made the ethogram show
+        # detections for every saved behavior even with none loaded.
         self.lib_picker.blockSignals(True)
         self.lib_picker.clear()
         self.lib_picker.addItems(self.state.library.list())
@@ -215,6 +218,9 @@ class Tab3Behavior(QWidget):
             return
         self.current = Behavior(name=name, spec=LogicNode(op="and"))
         self._sync_editor()
+        # A fresh behavior has no leaves, so this clears any previously-loaded
+        # behavior from the ethogram rather than leaving its traces up.
+        self._recompute()
 
     def _add_example(self):
         if not self.state.has_cache or not self.state.band_features:
@@ -511,13 +517,15 @@ class Tab3Behavior(QWidget):
         self._series_cache.clear()
         if not self.state.has_cache:
             return
+        # The ethogram/exports show exactly the behaviors that are "loaded".
+        # For now that is just the one open in the editor (or none). This is the
+        # single hook a future multi-select ("tick which behaviors to load")
+        # would replace with the checked set.
         if self.current:
             self.current.criteria = self._criteria()
-            # Keep the edited behavior in the state's list so the timeline and
-            # exports see the un-saved version the user is looking at.
-            self.state.behaviors = [
-                b for b in self.state.behaviors if b.name != self.current.name
-            ] + [self.current]
+            self.state.behaviors = [self.current]
+        else:
+            self.state.behaviors = []
         self.state.recompute_traces()
         self._refresh_timeline()
         self._refresh_inspector()
