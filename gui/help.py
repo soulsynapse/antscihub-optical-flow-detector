@@ -148,11 +148,16 @@ HELP: dict[str, tuple[str, str]] = {
     "normalize": ("Contrast / illumination normalization", _h(
         "CLAHE equalizes local contrast; z-score normalizes each frame's mean and "
         "standard deviation. Both counteract lighting that changes over time or "
-        "across the frame.",
+        "across the frame. WARNING: CLAHE has a known replicate-boundary artifact "
+        "(it runs per box, per frame, and its edge tiles amplify contrast into "
+        "phantom edge speeds) -- prefer z-score until that is reworked. See "
+        "KNOWN_ISSUES.md.",
         "Helps when illumination flickers (mains hum on some lights produces a "
         "real, and quite periodic, brightness oscillation). Also amplifies noise "
         "in dark regions.",
-        "Off. Most controlled lab footage does not need it.",
+        "Z-score (the default). It is boundary-safe; reach for CLAHE only if "
+        "z-score leaves genuinely too little local contrast, and read the warning "
+        "above first.",
         "Suspect this if band power shows a spatially uniform oscillation across "
         "the whole frame at a suspiciously round frequency -- 50 or 60 Hz mains, "
         "or a harmonic of it. Note that at 60 fps you cannot even see 60 Hz "

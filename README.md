@@ -170,6 +170,7 @@ high-frequency band power is partly insulated from slow drift.
 
 ## Documentation
 
+- [Known issues and deferred design decisions](KNOWN_ISSUES.md)
 - [Documentation index](docs/README.md)
 - [Current design decisions](docs/decisions.md)
 - [Prioritized next steps and approaches to avoid](docs/next-steps.md)

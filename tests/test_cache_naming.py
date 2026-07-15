@@ -40,10 +40,12 @@ class TestCacheNamingTests(unittest.TestCase):
             _test_cache_suffix(cfg, 10.25),
         )
 
-    def test_suffix_makes_default_off_states_explicit(self):
+    def test_suffix_makes_default_states_explicit(self):
         suffix = _test_cache_suffix(PipelineConfig(), 10.0)
         self.assertIn("_test10s_farneback_b16_dsauto", suffix)
-        self.assertIn("_regoff_denoff_bgoff_normoff_", suffix)
+        # Registration/denoise/bg default off; normalization defaults to z-score
+        # (CLAHE has a known replicate-edge artifact -- see KNOWN_ISSUES.md).
+        self.assertIn("_regoff_denoff_bgoff_normzscore_", suffix)
         self.assertIn("_band12to25_win1_hop0p25_f16_zstd", suffix)
 
 

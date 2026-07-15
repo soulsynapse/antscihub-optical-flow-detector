@@ -15,10 +15,12 @@ separation, false-positive motion and manual-mark agreement.
 Success means a setting improves transfer across replicates/videos without
 flattening behavior amplitude or raising low-texture false positives.
 
-Do not enable CLAHE globally based on one visually improved frame. Do not fit one
-normalization across the whole video, and do not normalize every frame to a fixed
-scalar distribution. Those approaches either mix unequal replicates or remove
-the temporal contrast the classifier needs.
+z-score is the current default because it is boundary-safe and near-neutral for a
+small target in a larger box; this validation must confirm it does not flatten
+amplitude when a target fills its box (see decisions: normalization). Do not
+re-enable CLAHE globally based on one visually improved frame — it has a known
+replicate-edge artifact (KNOWN_ISSUES.md). Do not fit one normalization across the
+whole video, which mixes unequal replicates.
 
 ## 2. Turn the reference clip into an accuracy regression
 
@@ -106,14 +108,36 @@ Do not advertise it as a speed optimization in the current implementation, and
 do not remove it solely for conceptual neatness while it still covers real
 within-box nuisances.
 
+## 9. Replace the synthetic reflected halo with a neighbor-safe source halo
+
+The private reflected border (decisions: "create support synthetically") is a
+mirror, and a mirror is a poor input for a translation estimator — it is the main
+reason CLAHE edge contrast becomes phantom edge speed on difficult footage.
+Replace it with a small real source halo, sized to the normalization/CLAHE need
+(roughly one block, not the full flow-support width), decoded around each box and
+discarded after the solve so only the core is cached. On replicate 23, eight real
+working pixels already drop the artifact from 861 to ~53 px/s.
+
+The halo must not break replicate isolation. Clip it against neighbors with a
+Voronoi rule: it may read any pixel outside every box, including the gap between
+two boxes up to the perpendicular bisector, but never crosses into another box's
+interior. Fall back to reflected padding only on the strip facing a genuinely
+adjacent neighbor. This also lets the CLAHE-tiling question be revisited — test
+`tileGridSize=(1,1)` per box against the halo before committing.
+
+Do not size the halo for full Farnebäck support if that reaches into a neighbor;
+the isolation contract (`validate_replicates`) stays. See KNOWN_ISSUES.md.
+
 ## Approaches deliberately not on the near-term path
 
 - Returning to full-frame flow as the production default. The measured cost is
   disproportionate when experimental units occupy a small fraction of the frame.
 - Allowing overlapping replicate ownership without a new semantic model. It
   double-counts pixels and breaks isolate independence.
-- Reading real pixels outside a replicate as flow padding. This can import a
-  nearby ant; private reflection provides support without leakage.
+- Reading real pixels from *another replicate box* as flow padding. This imports a
+  nearby ant and breaks isolate independence. Reading true background between boxes,
+  Voronoi-clipped so it never enters a neighbor, is the planned halo (§9) and is
+  safe; reflected support remains the fallback where boxes are genuinely adjacent.
 - Storing thresholded/binary flow or permanently filtered vectors. Those choices
   prevent later inspection and threshold sweeps.
 - Running forward/backward diagnostics on every frame of the full corpus. Sampled

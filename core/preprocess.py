@@ -175,6 +175,13 @@ class Preprocessor:
 
     def _normalize(self, gray: np.ndarray) -> np.ndarray:
         if self.cfg.normalize == "clahe":
+            # KNOWN ISSUE (see KNOWN_ISSUES.md): CLAHE runs per replicate box, per
+            # frame, on the hard crop. Its edge tiles have truncated histograms
+            # that clipLimit amplifies, and because the tile grid shifts with any
+            # added context it perturbs every block, not just the boundary. On
+            # difficult footage this produces large phantom edge speeds (replicate
+            # 23: 861 px/s, 60 crossings vs 48 px/s / 0 with CLAHE off). Prefer
+            # z-score until the halo/global-normalization rework lands.
             g = np.clip(gray, 0, 255).astype(np.uint8)
             return self._clahe.apply(g).astype(np.float32)
         std = float(gray.std())

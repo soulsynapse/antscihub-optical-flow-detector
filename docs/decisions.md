@@ -22,17 +22,28 @@ matching cache.
 
 ## Crop exactly, create support synthetically, then discard it
 
-FFmpeg emits the exact replicate rectangles. Before dense flow, each crop gets a
-private reflected border derived only from its own edge pixels. This gives the
-solver numerical context without reading a neighboring replicate. The border is
-removed before block reduction.
+FFmpeg emits the exact replicate rectangles with `crop:exact=1`, so an odd-valued
+box origin is never silently rounded to an even boundary. That rounding shifted
+the window by up to a whole source pixel, and — being inconsistent frame to frame
+— dense flow read the sub-pixel offset as real translation. Before dense flow,
+each crop then gets a private reflected border derived only from its own edge
+pixels, giving the solver numerical context without reading a neighboring
+replicate. The border is removed before block reduction.
 
-The final partial block on a drawn right or bottom edge is retained with its real
-pixel count. Padding never changes ownership, and a threshold failure never
-causes underlying continuous flow values to be discarded.
+The final partial block on a drawn right or bottom edge keeps its real pixel
+count, and every downstream area count now weights it by that valid area. Clump
+size, passing-block count and detection strength treat a one-pixel-tall edge
+sliver as the fraction of a block it actually is, so a row of slivers can no
+longer masquerade as a real clump (`core.replicates.block_weight_plane`). A
+threshold failure never causes underlying continuous flow values to be discarded.
 
-We do not use source-image padding around a replicate. That would be harmless for
-widely separated grasshopper tubes but unsafe for close ant isolation assays.
+The synthetic reflected border is a known compromise, not a settled ideal: a
+mirror is a poor input for a translation estimator, and on difficult footage it is
+the main reason CLAHE edge contrast becomes phantom edge speed. We still do not
+read source pixels from *another* replicate box — that would import a neighbor's
+motion and break isolate independence. Replacing the mirror with a small real
+source halo drawn only from background between boxes (Voronoi-clipped so it never
+enters a neighbor) is planned; see KNOWN_ISSUES.md and next-steps §9.
 
 ## Preprocessing state belongs to one replicate
 
@@ -40,14 +51,24 @@ Registration, temporal denoising, background models and normalization each have
 independent state per replicate. A single video-wide normalization was rejected
 because replicate illumination and contrast can differ even within one frame.
 
-Per-frame scalar normalization was also rejected as a default. It forces every
-frame toward the same distribution and can erase the temporal amplitude that
-behavior detection is supposed to measure.
+Per-frame z-score normalization is now the default (it previously defaulted off).
+It is boundary-safe — a single global per-frame mean/std rescale, with none of
+CLAHE's per-tile edge behavior — and near-neutral for the common case of a small
+target in a larger box, where its global statistics barely move frame to frame,
+while still countering slow ambient drift. The earlier concern that per-frame
+scalar normalization can erase temporal amplitude is not discarded; it bounds
+where z-score is trusted. When a target fills most of its box, its own motion
+shifts the per-frame statistics and the rescaling can inject inter-frame contrast
+changes that flow misreads. That regime must be confirmed in the normalization
+validation (next-steps §1), and `off` stays available for it.
 
-CLAHE remains opt-in. It is spatially local and adapts its mapping on every frame,
-which can help subtle ambient drift but can also create apparent motion in weakly
-textured areas. It must earn its place through marked-video validation rather
-than being enabled as a universal correction.
+CLAHE is opt-in and now carries an explicit warning in the flow tab. Its per-box,
+per-frame local equalization has a known replicate-boundary artifact: truncated
+edge-tile histograms amplify into phantom edge speeds, and because the tile grid
+shifts with any added context it perturbs every block, not only the edge. On the
+reference clip, replicate 23 peaked at 861 px/s with CLAHE versus 48 with it off.
+It must earn its place through marked-video validation rather than being a
+universal correction. See KNOWN_ISSUES.md.
 
 The optional within-replicate mask remains available for a fixed nuisance inside
 a useful box. It does not reduce FFmpeg output geometry, flow-solver geometry or
@@ -64,6 +85,25 @@ cost.
 
 Thresholds, unit conversion, spatial medians and baseline-relative features stay
 outside the raw cache so their effects remain visible and adjustable.
+
+## Cache precision stops at float16
+
+Flow blocks store as float16 by default; float32 is available but doubles size for
+precision the data does not carry. The right precision is set by the intrinsic
+uncertainty of a block flow estimate (order 5–10%): float16's ~0.05% relative
+quantization sits far below that, so it is effectively lossless for this signal,
+while float32 mostly stores noise more precisely.
+
+Going below float16 was considered and rejected. An 8-bit float (E4M3) tops out at
+448 and would clip the fastest block speeds outright — edge artifacts alone reach
+~860 px/s — and its ~6–12% relative step is comparable to the real measurement
+uncertainty, so it would add noise where float16 adds none, worst exactly in the
+low-speed baseline the standardized noise references depend on. It also has no
+native numpy support in the current stack. Band power is stored as float32
+regardless, because it sums PSD over a band and can exceed float16's range. When
+cache size is the real constraint, block size is the correct lever: it scales
+storage roughly quadratically and trades spatial resolution that can be reasoned
+about, not precision that cannot.
 
 The per-replicate noise reference is fixed over time. An explicit quiescent
 interval supplies its p99 when available. The automatic fallback takes a spatial

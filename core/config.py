@@ -39,8 +39,11 @@ class Band:
 class PreprocessConfig:
     """Preprocessing applied to frames before flow is computed.
 
-    Defaults are all-off except downsampling, so a first-time user can hit
-    "Run test" immediately and get a result.
+    Defaults are all-off except downsampling and normalization, so a first-time
+    user can hit "Run test" immediately and get a result. Normalization defaults
+    to z-score rather than off because raw inter-frame brightness drift otherwise
+    shows up as spurious global flow; z-score is chosen over CLAHE because CLAHE's
+    per-tile equalization has a known replicate-edge artifact (see KNOWN_ISSUES).
     """
     # Optional mask within replicate-owned rectangles (white = keep). This does
     # not change ROI-first decode/cache geometry; None keeps every owned pixel.
@@ -62,8 +65,10 @@ class PreprocessConfig:
     # which is the default. An explicit float overrides that.
     downsample: float | None = None
 
-    # Contrast / illumination normalization.
-    normalize: Literal["off", "clahe", "zscore"] = "off"
+    # Contrast / illumination normalization. z-score (global per-frame mean/std)
+    # is the default; CLAHE is available but carries a known replicate-boundary
+    # artifact -- see KNOWN_ISSUES.md before selecting it.
+    normalize: Literal["off", "clahe", "zscore"] = "zscore"
 
     def resolve_downsample(self, src_width: int) -> float:
         """Pick the downsample factor for a given source width."""

@@ -5,6 +5,9 @@ The root [README](../README.md) remains the operational starting point.
 
 ## Current documents
 
+- [Known issues](../KNOWN_ISSUES.md) — open artifacts and deferred design
+  decisions (CLAHE boundary artifact, synthetic-halo rework, cache precision),
+  with symptoms, causes and planned fixes.
 - [Current design decisions](decisions.md) — what the live implementation does,
   the evidence behind it and the boundaries that should not be changed casually.
 - [Next steps](next-steps.md) — ranked validation and engineering work, including

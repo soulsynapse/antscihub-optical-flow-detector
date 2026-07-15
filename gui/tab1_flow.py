@@ -37,6 +37,46 @@ _REF_FPS_AT_1300PX = 7.1
 _REF_WIDTH = 1300
 _BACKEND_SPEED = {"farneback": 1.0, "dis": 2.25, "raft": 6.0}
 
+# Options that carry a caveat. Selecting the flagged value surfaces an inline
+# warning next to that control, coloured by severity: "known" (red) for a real
+# known-issue artifact, "caution" (orange) for a tradeoff that is fine when you
+# mean it. Keep the full rationale in KNOWN_ISSUES.md and only summarize here. Add
+# an entry as {control_key: {value: (severity, text)}} -- _wire_option_warning
+# does the rest.
+_DENOISE_CAUTION = (
+    "Temporal denoise blends each frame with its neighbours: it cancels sensor "
+    "noise in still regions but smears real motion across frames -- the very "
+    "signal the flow pass measures. It helps on clean, high-frame-rate footage "
+    "where per-frame motion is small; on noisy, compressed, or low-frame-rate "
+    "video it tends to attenuate motion and cost more than it removes. Median is "
+    "more motion-tolerant than gaussian.")
+
+OPTION_WARNINGS: dict[str, dict[str, tuple[str, str]]] = {
+    "normalize": {
+        "clahe": ("known",
+            "CLAHE has a known replicate-boundary artifact: it runs per box, per "
+            "frame, and its edge tiles amplify contrast into phantom edge speeds "
+            "(replicate 23 peaked at 861 px/s vs 48 with it off). Prefer z-score "
+            "until the halo/global-normalization rework lands. See KNOWN_ISSUES.md."),
+    },
+    "denoise": {
+        "median": ("caution", _DENOISE_CAUTION),
+        "gaussian": ("caution", _DENOISE_CAUTION),
+    },
+    "dtype": {
+        "float32": ("known",
+            "float32 doubles cache size on disk and in RAM versus float16, for "
+            "precision the u/v/speed arrays do not need — band power is stored as "
+            "float32 regardless. Choose it only for a specific reason. See "
+            "KNOWN_ISSUES.md."),
+    },
+}
+
+_WARNING_STYLE = {
+    "known": "color:#b00020; font-weight:bold; font-size:11px;",
+    "caution": "color:#c77400; font-size:11px;",
+}
+
 
 def _number_slug(value: float) -> str:
     """Compact filesystem-safe number used in descriptive cache names."""
@@ -177,8 +217,10 @@ class Tab1Flow(QWidget):
                    QLabel("Registration"))
 
         self.denoise = QComboBox()
-        self.denoise.addItems(["off", "median", "gaussian"])
+        self.denoise.addItems(["off", "gaussian", "median"])
         pre.addRow(labelled(self.denoise, "denoise"), QLabel("Temporal denoise"))
+        self.denoise_warning = self._wire_option_warning(self.denoise, "denoise")
+        pre.addRow(self.denoise_warning)
 
         self.bg = QComboBox()
         self.bg.addItems(["off", "median", "mog2"])
@@ -186,7 +228,13 @@ class Tab1Flow(QWidget):
 
         self.normalize = QComboBox()
         self.normalize.addItems(["off", "clahe", "zscore"])
+        # Match the PreprocessConfig default (z-score); the combo otherwise starts
+        # on its first item ("off") and build_config would silently run un-normed.
+        self.normalize.setCurrentText(PreprocessConfig().normalize)
         pre.addRow(labelled(self.normalize, "normalize"), QLabel("Normalization"))
+        self.normalize_warning = self._wire_option_warning(
+            self.normalize, "normalize")
+        pre.addRow(self.normalize_warning)
 
         self._mask_path: str | None = None
         self.mask_btn = QPushButton("No within-box mask")
@@ -276,6 +324,8 @@ class Tab1Flow(QWidget):
         self.dtype.addItems(["float16", "float32"])
         self.dtype.currentTextChanged.connect(self._refresh_estimates)
         feat.addRow(labelled(self.dtype, "dtype"), QLabel("Precision"))
+        self.dtype_warning = self._wire_option_warning(self.dtype, "dtype")
+        feat.addRow(self.dtype_warning)
 
         self.compression = QComboBox()
         self.compression.addItems(["zstd", "lz4", "none"])
@@ -470,6 +520,23 @@ class Tab1Flow(QWidget):
         self.band_hi.setMaximum(info.nyquist_hz)
         self._refresh_estimates()
         self._refresh_cache_list()
+
+    def _wire_option_warning(self, combo: QComboBox, key: str) -> QLabel:
+        """Attach an inline warning that appears whenever ``combo`` holds a value
+        flagged in OPTION_WARNINGS, coloured by that value's severity. Returns the
+        label to add to a layout."""
+        label = QLabel("")
+        label.setWordWrap(True)
+
+        def update(value: str) -> None:
+            severity, text = OPTION_WARNINGS.get(key, {}).get(value, ("", ""))
+            label.setText(text)
+            label.setStyleSheet(_WARNING_STYLE.get(severity, ""))
+            label.setVisible(bool(text))
+
+        combo.currentTextChanged.connect(update)
+        update(combo.currentText())
+        return label
 
     def _on_backend_changed(self, name: str):
         msg = self._status.get(name, "")
