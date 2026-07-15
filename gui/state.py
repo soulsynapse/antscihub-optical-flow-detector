@@ -63,6 +63,11 @@ class AppState(QObject):
         self.strengths: dict[tuple[int, str], np.ndarray] = {}
 
         self.current_frame = 0
+        # Keep the most recently decoded source frame as well as its cheap
+        # overview. Focused replicate views crop this full-resolution frame first,
+        # avoiding the grainy result of enlarging a ~100 px-wide overview crop.
+        self._full_frame: np.ndarray | None = None
+        self._full_idx: int = -1
         self._disp_frame: np.ndarray | None = None
         self._disp_idx: int = -1
         # (roi_id, feature) -> full-length mean time series over the ROI's blocks.
@@ -126,6 +131,8 @@ class AppState(QObject):
             self.source.release()
         self.source = VideoSource(path)
         self.current_frame = 0
+        self._full_frame = None
+        self._full_idx = -1
         self._disp_frame = None
         self._disp_idx = -1
 
@@ -317,7 +324,9 @@ class AppState(QObject):
 
     # -- frame ---------------------------------------------------------------
 
-    def display_frame(self, idx: int) -> np.ndarray | None:
+    def display_frame(self, idx: int,
+                      focus_frac: tuple[float, float, float, float] | None = None
+                      ) -> np.ndarray | None:
         """The current frame, decoded once and downscaled for display.
 
         This MUST be the only place the video is decoded for the UI. Tabs 2 and 3
@@ -336,20 +345,41 @@ class AppState(QObject):
 
         if self.source is None:
             return None
-        if self._disp_idx == idx and self._disp_frame is not None:
+        if self._full_idx != idx or self._full_frame is None:
+            frame = self.source.frame_at(idx)
+            if frame is None:
+                return None
+            self._full_frame = frame
+            self._full_idx = idx
+            h, w = frame.shape[:2]
+            if w > DISPLAY_MAX_W:
+                s = DISPLAY_MAX_W / w
+                frame = cv2.resize(
+                    frame, (DISPLAY_MAX_W, max(1, int(round(h * s)))),
+                    interpolation=cv2.INTER_AREA)
+            self._disp_frame = frame
+            self._disp_idx = idx
+
+        if focus_frac is None:
             return self._disp_frame
 
-        frame = self.source.frame_at(idx)
-        if frame is None:
-            return None
-        h, w = frame.shape[:2]
-        if w > DISPLAY_MAX_W:
-            s = DISPLAY_MAX_W / w
-            frame = cv2.resize(frame, (DISPLAY_MAX_W, max(1, int(round(h * s)))),
-                               interpolation=cv2.INTER_AREA)
-        self._disp_frame = frame
-        self._disp_idx = idx
-        return frame
+        x0, y0, x1, y1 = map(float, focus_frac)
+        if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+            raise ValueError(f"Invalid display focus rectangle: {focus_frac}")
+        full = self._full_frame
+        h, w = full.shape[:2]
+        sx0 = max(0, min(w - 1, int(round(x0 * w))))
+        sy0 = max(0, min(h - 1, int(round(y0 * h))))
+        sx1 = max(sx0 + 1, min(w, int(round(x1 * w))))
+        sy1 = max(sy0 + 1, min(h, int(round(y1 * h))))
+        crop = full[sy0:sy1, sx0:sx1]
+        ch, cw = crop.shape[:2]
+        if cw > DISPLAY_MAX_W:
+            s = DISPLAY_MAX_W / cw
+            crop = cv2.resize(
+                crop, (DISPLAY_MAX_W, max(1, int(round(ch * s)))),
+                interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(crop)
 
     def set_frame(self, idx: int) -> None:
         n = self.cache.n_frames if self.cache else (

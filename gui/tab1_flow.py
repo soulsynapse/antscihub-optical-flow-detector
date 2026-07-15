@@ -38,6 +38,52 @@ _REF_WIDTH = 1300
 _BACKEND_SPEED = {"farneback": 1.0, "dis": 2.25, "raft": 6.0}
 
 
+def _number_slug(value: float) -> str:
+    """Compact filesystem-safe number used in descriptive cache names."""
+    return f"{float(value):.8g}".replace("-", "m").replace(".", "p")
+
+
+def _test_cache_suffix(cfg: PipelineConfig, duration_s: float) -> str:
+    """Describe every cache-affecting setting exposed by this tab.
+
+    The leading cache hash remains authoritative and includes the complete
+    configuration. This suffix is for humans comparing test runs in the cache
+    picker and filesystem.
+    """
+    pre = cfg.preprocess
+    flow = cfg.flow
+    feat = cfg.features
+    bands = "-".join(
+        f"{_number_slug(b.lo_hz)}to{_number_slug(b.hi_hz)}"
+        for b in feat.bands)
+    downsample = "auto" if pre.downsample is None else \
+        _number_slug(pre.downsample)
+    precision = {"float16": "f16", "float32": "f32"}.get(
+        feat.dtype, feat.dtype)
+    parts = [
+        f"test{_number_slug(duration_s)}s",
+        flow.backend,
+        f"b{flow.block_size}",
+        f"ds{downsample}",
+        f"reg{pre.registration}",
+        f"den{pre.denoise}",
+        f"bg{pre.bg_subtract}",
+        f"norm{pre.normalize}",
+        f"band{bands}",
+        f"win{_number_slug(feat.window_s)}",
+        f"hop{_number_slug(feat.hop_s)}",
+        precision,
+        feat.compression,
+    ]
+    if pre.mask_path:
+        parts.append("mask")
+    if feat.cache_fb_error:
+        parts.append("fberr")
+    if feat.cache_texture:
+        parts.append("texture")
+    return "_" + "_".join(parts)
+
+
 class PipelineWorker(QThread):
     progress = pyqtSignal(object)
     finished_ok = pyqtSignal(str)
@@ -630,10 +676,10 @@ class Tab1Flow(QWidget):
 
         duration = self.test_seconds.value() if test else None
 
-        # The test duration must be part of the key. Two test runs with identical
-        # settings but different durations are NOT the same cache, and keying them
-        # the same would silently hand you a 10 s cache when you asked for 30 s.
-        suffix = f"_test{int(round(duration))}s" if test else ""
+        # Test caches retain a human-readable settings snapshot after the complete
+        # config hash. Duration keeps its meaningful decimals, so 10 s and 10.5 s
+        # cannot collide.
+        suffix = _test_cache_suffix(cfg, duration) if test else ""
         key = cfg.cache_key(info.video_hash, geometry_hash(reps)) + suffix
 
         if cache_mod.cache_exists(self.state.cache_root, key) and \
@@ -664,17 +710,6 @@ class Tab1Flow(QWidget):
                 self.state.open_cache(key)
                 return
             # Falling through re-runs and overwrites it, which is what "No" means.
-
-        if test:
-            # Any OTHER test cache for this video is now stale -- it was built
-            # from settings you have since changed. Drop it rather than letting
-            # scratch caches pile up, one per tweak.
-            removed = cache_mod.purge_stale_test_caches(
-                self.state.cache_root, info.video_hash, keep_key=key)
-            if removed:
-                self.state.status.emit(
-                    f"Replaced {len(removed)} stale test cache(s) "
-                    f"from earlier settings.")
 
         self.state.cfg = cfg
         self._mode = "TEST" if test else "FULL"

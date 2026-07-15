@@ -473,13 +473,11 @@ def delete_cache(cache_root: str, cache_key: str) -> None:
 
 def purge_stale_test_caches(cache_root: str, video_hash: str,
                             keep_key: str | None = None) -> list[str]:
-    """Delete test caches for this video other than `keep_key`.
+    """Explicitly delete test caches for this video other than `keep_key`.
 
-    Test caches are scratch by definition -- they exist to answer "are these
-    settings any good?" and are worthless the moment the settings change.
-    Accumulating one per parameter tweak silently fills the disk with hundreds of
-    megabytes apiece, so only the current one is kept. Full-pass caches are never
-    touched: those are the expensive artefact the whole tool exists to produce.
+    This is an opt-in maintenance utility. The GUI intentionally retains test
+    caches so runs made with different settings can be compared side by side.
+    Full-pass caches are never touched.
     """
     removed = []
     for c in list_caches(cache_root):

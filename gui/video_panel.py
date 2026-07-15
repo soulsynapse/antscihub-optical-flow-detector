@@ -40,12 +40,16 @@ class FrameView(QLabel):
     both the display scale and the source resolution.
     """
     clicked = pyqtSignal(QPoint)
+    back_requested = pyqtSignal()
     box_drawn = pyqtSignal(float, float, float, float)   # x0,y0,x1,y1 fractions
     stamp_at = pyqtSignal(float, float)                  # click point, fractions
 
     def __init__(self):
         super().__init__()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # A click should make this the keyboard target. The owning window's Space
+        # shortcut can then dispatch to this view's nearest playback controller.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(480, 320)
         self.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333;")
@@ -53,10 +57,18 @@ class FrameView(QLabel):
         self._pix: QPixmap | None = None
         self._draw_rect = QRect()
         self._src_size = (1, 1)
+        # Which full-frame fraction the pixels in _pix represent. Ordinarily the
+        # pixmap is the overview (0..1); focused views can provide a native-detail
+        # crop while clicks and boxes remain in full-frame coordinates.
+        self._image_frac = (0.0, 0.0, 1.0, 1.0)
+        # Fractional crop of the full frame. Clicks are transformed back into
+        # full-frame coordinates, so consumers never need zoom-specific math.
+        self._focus_frac: tuple[float, float, float, float] | None = None
 
         self.draw_enabled = False
         # Persistent boxes to render: [(x0,y0,x1,y1 fractions, label, hex, selected)]
         self.boxes: list[tuple] = []
+        self._overlays_hidden = False
         self._rubber: tuple | None = None    # in-progress drag, display coords
         self._drag_start: QPoint | None = None
 
@@ -64,21 +76,65 @@ class FrameView(QLabel):
         self.boxes = boxes
         self.update()
 
+    def set_overlays_hidden(self, hidden: bool) -> None:
+        """Temporarily suppress persistent annotations without discarding them."""
+        self._overlays_hidden = bool(hidden)
+        self.update()
+
+    def set_focus_frac(self, frac: tuple[float, float, float, float] | None
+                       ) -> None:
+        if frac is None:
+            self._focus_frac = None
+        else:
+            x0, y0, x1, y1 = map(float, frac)
+            if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+                raise ValueError(f"Invalid focus rectangle: {frac}")
+            self._focus_frac = (x0, y0, x1, y1)
+        self.update()
+
+    @property
+    def focus_frac(self) -> tuple[float, float, float, float] | None:
+        return self._focus_frac
+
+    def _view_frac(self) -> tuple[float, float, float, float]:
+        return self._focus_frac or (0.0, 0.0, 1.0, 1.0)
+
     def _frac_of(self, pos: QPoint) -> tuple[float, float]:
         r = self._draw_rect
-        fx = (pos.x() - r.x()) / max(1, r.width())
-        fy = (pos.y() - r.y()) / max(1, r.height())
+        lx = (pos.x() - r.x()) / max(1, r.width())
+        ly = (pos.y() - r.y()) / max(1, r.height())
+        x0, y0, x1, y1 = self._view_frac()
+        fx = x0 + lx * (x1 - x0)
+        fy = y0 + ly * (y1 - y0)
         return float(np.clip(fx, 0, 1)), float(np.clip(fy, 0, 1))
 
     def _rect_for_frac(self, x0, y0, x1, y1) -> QRect:
         r = self._draw_rect
+        vx0, vy0, vx1, vy1 = self._view_frac()
+        x0 = (x0 - vx0) / (vx1 - vx0)
+        x1 = (x1 - vx0) / (vx1 - vx0)
+        y0 = (y0 - vy0) / (vy1 - vy0)
+        y1 = (y1 - vy0) / (vy1 - vy0)
         return QRect(
             int(r.x() + x0 * r.width()), int(r.y() + y0 * r.height()),
             int((x1 - x0) * r.width()), int((y1 - y0) * r.height()))
 
-    def set_frame(self, img: np.ndarray):
+    @staticmethod
+    def _aspect_fit_rect(area: QRect, source_size) -> QRect:
+        """Largest centered rect with source aspect; unused space is letterboxed."""
+        scaled = source_size.scaled(area.size(),
+                                    Qt.AspectRatioMode.KeepAspectRatio)
+        return QRect(
+            area.x() + (area.width() - scaled.width()) // 2,
+            area.y() + (area.height() - scaled.height()) // 2,
+            scaled.width(), scaled.height())
+
+    def set_frame(self, img: np.ndarray,
+                  image_frac: tuple[float, float, float, float] | None = None,
+                  coordinate_size: tuple[int, int] | None = None):
         h, w = img.shape[:2]
-        self._src_size = (w, h)
+        self._src_size = coordinate_size or (w, h)
+        self._image_frac = image_frac or (0.0, 0.0, 1.0, 1.0)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
         self._pix = QPixmap.fromImage(qimg.copy())
@@ -95,28 +151,42 @@ class FrameView(QLabel):
             return
 
         area = self.rect().adjusted(1, 1, -1, -1)
-        scaled = self._pix.size().scaled(area.size(),
-                                         Qt.AspectRatioMode.KeepAspectRatio)
-        self._draw_rect = QRect(
-            area.x() + (area.width() - scaled.width()) // 2,
-            area.y() + (area.height() - scaled.height()) // 2,
-            scaled.width(), scaled.height())
-        p.drawPixmap(self._draw_rect, self._pix)
+        vx0, vy0, vx1, vy1 = self._view_frac()
+        ix0, iy0, ix1, iy1 = self._image_frac
+        # Transform the requested full-frame view into the pixel extent supplied
+        # by set_frame. When focused pixels already represent exactly that view,
+        # this becomes 0..1 and the native-detail crop is drawn in full.
+        px0 = float(np.clip((vx0 - ix0) / (ix1 - ix0), 0, 1))
+        py0 = float(np.clip((vy0 - iy0) / (iy1 - iy0), 0, 1))
+        px1 = float(np.clip((vx1 - ix0) / (ix1 - ix0), 0, 1))
+        py1 = float(np.clip((vy1 - iy0) / (iy1 - iy0), 0, 1))
+        if px1 <= px0 or py1 <= py0:
+            px0, py0, px1, py1 = 0.0, 0.0, 1.0, 1.0
+        source = QRect(
+            int(round(px0 * self._pix.width())),
+            int(round(py0 * self._pix.height())),
+            max(1, int(round((px1 - px0) * self._pix.width()))),
+            max(1, int(round((py1 - py0) * self._pix.height()))))
+        self._draw_rect = self._aspect_fit_rect(area, source.size())
+        p.drawPixmap(self._draw_rect, self._pix, source)
 
         # Persistent boxes.
-        for x0, y0, x1, y1, label, hexcol, selected in self.boxes:
-            rect = self._rect_for_frac(x0, y0, x1, y1)
-            col = QColor(hexcol)
-            p.setPen(QPen(col, 3 if selected else 2))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRect(rect)
-            if selected:
-                fill = QColor(col)
-                fill.setAlpha(40)
-                p.fillRect(rect, fill)
-            if label:
-                p.setPen(QPen(col, 1))
-                p.drawText(rect.x() + 3, rect.y() + 14, label)
+        if not self._overlays_hidden:
+            for x0, y0, x1, y1, label, hexcol, selected in self.boxes:
+                if x1 <= vx0 or x0 >= vx1 or y1 <= vy0 or y0 >= vy1:
+                    continue
+                rect = self._rect_for_frac(x0, y0, x1, y1)
+                col = QColor(hexcol)
+                p.setPen(QPen(col, 3 if selected else 2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(rect)
+                if selected and self._focus_frac is None:
+                    fill = QColor(col)
+                    fill.setAlpha(40)
+                    p.fillRect(rect, fill)
+                if label:
+                    p.setPen(QPen(col, 1))
+                    p.drawText(rect.x() + 3, rect.y() + 14, label)
 
         # Rubber-band in progress.
         if self._rubber is not None:
@@ -129,16 +199,22 @@ class FrameView(QLabel):
         p.end()
 
     def mousePressEvent(self, e):
-        if self._pix is None or not self._draw_rect.contains(e.pos()):
+        if self._pix is None:
+            return
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if e.button() == Qt.MouseButton.RightButton:
+            self.back_requested.emit()
+            return
+        if not self._draw_rect.contains(e.pos()):
             return
         if self.draw_enabled and e.button() == Qt.MouseButton.LeftButton:
             self._drag_start = e.pos()
             self._rubber = QRect(e.pos(), e.pos())
             return
-        fx = (e.pos().x() - self._draw_rect.x()) / self._draw_rect.width()
-        fy = (e.pos().y() - self._draw_rect.y()) / self._draw_rect.height()
-        self.clicked.emit(QPoint(int(fx * self._src_size[0]),
-                                 int(fy * self._src_size[1])))
+        fx, fy = self._frac_of(e.pos())
+        self.clicked.emit(QPoint(
+            min(self._src_size[0] - 1, int(fx * self._src_size[0])),
+            min(self._src_size[1] - 1, int(fy * self._src_size[1]))))
 
     def mouseMoveEvent(self, e):
         if self._drag_start is not None:
@@ -209,6 +285,8 @@ class VideoPanel(QWidget):
         self._cache_idx = -1
         self._pending = False
         self._tint_cache: tuple | None = None
+        self._focus_mode = "source"
+        self._focus_work_size: tuple[int, int] | None = None
 
         self.view = FrameView()
         self.view.clicked.connect(self._on_click)
@@ -286,6 +364,22 @@ class VideoPanel(QWidget):
         """Boxes in frame fractions, drawn directly on the view (not the block
         grid): [(x0,y0,x1,y1, label, hex, selected)]."""
         self.view.set_boxes(boxes)
+
+    def set_focus_frac(self, frac: tuple[float, float, float, float] | None,
+                       work_size: tuple[int, int] | None = None) -> None:
+        """Focus the view on a source-frame fraction without changing click space."""
+        self._focus_work_size = work_size if frac is not None else None
+        self.view.set_focus_frac(frac)
+        self.refresh()
+
+    def clear_focus(self) -> None:
+        self.set_focus_frac(None)
+
+    def set_focus_mode(self, mode: str) -> None:
+        if mode not in ("source", "flow"):
+            raise ValueError(f"Unknown focus mode: {mode}")
+        self._focus_mode = mode
+        self.refresh()
 
     # -- playback ------------------------------------------------------------
 
@@ -369,9 +463,17 @@ class VideoPanel(QWidget):
         # Decoding is centralised in AppState so Replicates and Behavior
         # Classification share one decode per frame instead of fighting for
         # the decoder position. See AppState.display_frame().
-        frame = self.state.display_frame(idx)
+        focus = self.view.focus_frac
+        frame = self.state.display_frame(idx, focus_frac=focus)
         if frame is None:
             return
+        if focus is not None and self._focus_mode == "flow" and \
+                self._focus_work_size is not None:
+            from core.config import PipelineConfig
+            from core.preprocess import flow_input_preview
+            cfg = PipelineConfig.from_dict(
+                self.state.cache.meta.get("config", {})).preprocess
+            frame = flow_input_preview(frame, self._focus_work_size, cfg)
         self._cache_frame = frame
         self._cache_idx = idx
 
@@ -406,7 +508,11 @@ class VideoPanel(QWidget):
                 cv2.putText(img, f"#{roi_id}", (int(x0 * sx), int(y0 * sy) - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, bgr, 2)
 
-        self.view.set_frame(img)
+        coordinate_size = None
+        if self.state.source is not None:
+            coordinate_size = (self.state.source.info.width,
+                               self.state.source.info.height)
+        self.view.set_frame(img, image_frac=focus, coordinate_size=coordinate_size)
         self._update_time()
 
     def _update_time(self, frame: int | None = None):
@@ -426,7 +532,7 @@ class VideoPanel(QWidget):
         # FrameView reports coordinates in the image it was handed, which is the
         # DOWNSCALED frame -- not the source. Dividing by the source dimensions
         # here would place every click near the top-left corner.
-        h, w = self._cache_frame.shape[:2]
+        w, h = self.view._src_size
         by = int(pt.y() / h * ny)
         bx = int(pt.x() / w * nx)
         if 0 <= by < ny and 0 <= bx < nx:

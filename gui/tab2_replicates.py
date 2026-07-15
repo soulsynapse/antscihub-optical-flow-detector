@@ -380,10 +380,9 @@ class Tab2Replicates(QWidget):
         if self.state.source is None:
             return
         # pt is in source-frame pixels; convert to fractions.
-        frame = self.video._cache_frame
-        if frame is None:
+        if self.video._cache_frame is None:
             return
-        h, w = frame.shape[:2]
+        w, h = self.video.view._src_size
         fx, fy = pt.x() / w, pt.y() / h
         for i, r in enumerate(self.replicates):
             x0, y0, x1, y1 = r["frac"]

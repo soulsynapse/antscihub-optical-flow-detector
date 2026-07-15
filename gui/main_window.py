@@ -10,8 +10,8 @@ import os
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence, QShortcut
-from PyQt6.QtWidgets import (QFileDialog, QLabel, QMainWindow, QMessageBox,
-                             QTabWidget)
+from PyQt6.QtWidgets import (QApplication, QFileDialog, QLabel, QMainWindow,
+                             QMessageBox, QTabWidget)
 
 from gui.state import AppState
 from gui.tab1_flow import Tab1Flow
@@ -90,6 +90,17 @@ class MainWindow(QMainWindow):
         sc("Ctrl+3", lambda: self.tabs.setCurrentIndex(2))
 
     def _toggle_play(self):
+        # Prefer the video the user actually clicked. Both VideoPanel and the
+        # embeddable SpeedExplorer expose toggle_playback(), so this remains valid
+        # when Speed Explorer becomes a preprocessing sub-tab.
+        widget = QApplication.focusWidget()
+        while widget is not None:
+            toggle = getattr(widget, "toggle_playback", None)
+            if callable(toggle):
+                toggle()
+                return
+            widget = widget.parentWidget()
+
         panel = {0: self.tab2.video, 2: self.tab3.video}.get(
             self.tabs.currentIndex())
         if panel:

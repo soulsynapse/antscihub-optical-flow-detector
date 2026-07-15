@@ -15,6 +15,7 @@ rolling median over unregistered frames smears camera motion into the estimate.
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 
 import cv2
 import numpy as np
@@ -187,3 +188,30 @@ def sample_frames_for_background(source, n: int) -> list[np.ndarray]:
     total = source.info.frame_count
     idxs = np.linspace(0, max(0, total - 1), num=min(n, total), dtype=int)
     return [f for f in (source.frame_at(int(i)) for i in idxs) if f is not None]
+
+
+def flow_input_preview(bgr: np.ndarray, work_size: tuple[int, int],
+                       cfg: PreprocessConfig) -> np.ndarray:
+    """Displayable BGR preview at the spatial resolution supplied to flow.
+
+    Downsampling, grayscale conversion and contrast normalization are replayed
+    exactly. Registration, temporal denoising, background subtraction and masks
+    need run history/reference assets that are not stored in the feature cache,
+    so this diagnostic intentionally omits those stateful/contextual steps.
+    """
+    work_w, work_h = map(int, work_size)
+    h, w = bgr.shape[:2]
+    scale = work_w / max(1, w)
+    preview_cfg = replace(
+        cfg,
+        downsample=scale,
+        mask_path=None,
+        registration="off",
+        denoise="off",
+        bg_subtract="off",
+    )
+    gray = Preprocessor(preview_cfg, w, h).apply(bgr)
+    if gray.shape != (work_h, work_w):
+        gray = cv2.resize(gray, (work_w, work_h), interpolation=cv2.INTER_AREA)
+    gray8 = np.clip(gray, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)

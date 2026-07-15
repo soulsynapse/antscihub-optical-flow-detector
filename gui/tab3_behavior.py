@@ -36,7 +36,8 @@ class Tab3Behavior(QWidget):
         super().__init__()
         self.state = state
         self.current: Behavior | None = None
-        self._series_cache: dict[str, np.ndarray] = {}
+        self._series_cache: dict[tuple[str, int | None], np.ndarray] = {}
+        self._focused_roi_id: int | None = None
 
         split = QSplitter(Qt.Orientation.Horizontal)
         lay = QHBoxLayout(self)
@@ -49,12 +50,25 @@ class Tab3Behavior(QWidget):
         ll.setContentsMargins(2, 2, 2, 2)
         self.video = VideoPanel(state)
         self.video.view.clicked.connect(self._on_view_clicked)
+        self.video.view.back_requested.connect(self._clear_roi_focus)
         ll.addWidget(self.video, 1)
 
         etho_row = QHBoxLayout()
         etho_row.addWidget(QLabel(
-            "Ethogram — click a row to inspect; middle-drag a row to mark ground "
-            "truth for the label below:"), 1)
+            "Ethogram — click a replicate to focus it; right-click the video to "
+            "return; middle-drag a row to mark ground truth:"), 1)
+        etho_row.addWidget(QLabel("Focused view:"))
+        self.focus_mode = QComboBox()
+        self.focus_mode.addItem("Source detail", "source")
+        self.focus_mode.addItem("Flow working resolution", "flow")
+        self.focus_mode.setToolTip(
+            "Source detail crops the original frame before scaling. Flow working "
+            "resolution replays downsampling, grayscale conversion and contrast "
+            "normalization at the cached optical-flow input dimensions. Stateful "
+            "registration, temporal denoising/background and masks are omitted.")
+        self.focus_mode.currentIndexChanged.connect(
+            lambda: self.video.set_focus_mode(self.focus_mode.currentData()))
+        etho_row.addWidget(self.focus_mode)
         etho_row.addWidget(QLabel("Mark as:"))
         self.mark_label_picker = QComboBox()
         self.mark_label_picker.setEditable(True)
@@ -225,6 +239,10 @@ class Tab3Behavior(QWidget):
         # New clip -> load ITS marks (or clear to none if it has none yet) and
         # drop the previous clip's ethogram rows (state.rois was cleared in
         # load_video); the rows repopulate when the new video is cached.
+        self._focused_roi_id = None
+        self.state.selected_roi = None
+        self.video.clear_focus()
+        self._series_cache.clear()
         self._load_marks()
         self._refresh_timeline()
 
@@ -595,10 +613,13 @@ class Tab3Behavior(QWidget):
                 return self.state.sampler.column(feature)
             return np.zeros(0, np.float32)
 
-        key = feature
+        key = (feature, self._focused_roi_id)
         if key in self._series_cache:
             return self._series_cache[key]
-        parts = [self.state.roi_series(r, feature) for r in self.state.rois]
+        rois = self.state.rois
+        if self._focused_roi_id is not None:
+            rois = [r for r in rois if r.roi_id == self._focused_roi_id]
+        parts = [self.state.roi_series(r, feature) for r in rois]
         col = np.concatenate(parts) if parts else np.zeros(0, np.float32)
         self._series_cache[key] = col
         return col
@@ -650,7 +671,10 @@ class Tab3Behavior(QWidget):
 
     def _refresh_timeline(self):
         rows = []
-        for r in self.state.rois:
+        rois = self.state.rois
+        if self._focused_roi_id is not None:
+            rois = [r for r in rois if r.roi_id == self._focused_roi_id]
+        for r in rois:
             beh = {}
             for b in self.state.behaviors:
                 tr = self.state.traces.get((r.roi_id, b.name))
@@ -664,29 +688,62 @@ class Tab3Behavior(QWidget):
             if self.state.has_cache else 1.0)
 
         # Colour each ROI box by whether it matches the current behavior NOW.
-        if self.current and self.state.has_cache:
+        # Neutral boxes remain visible before a behavior is selected so the
+        # click-to-focus interaction is always discoverable.
+        if self.state.has_cache:
             f = self.state.current_frame
             boxes = []
             for r in self.state.rois:
-                tr = self.state.traces.get((r.roi_id, self.current.name))
-                on = tr is not None and f < tr.size and bool(tr[f])
+                on = False
+                if self.current:
+                    tr = self.state.traces.get((r.roi_id, self.current.name))
+                    on = tr is not None and f < tr.size and bool(tr[f])
                 if r.source_frac is not None:
                     boxes.append((*r.source_frac, r.note or f"#{r.roi_id}",
-                                  self.current.color if on else "#555555",
+                                  self.current.color if on and self.current
+                                  else "#777777",
                                   r.roi_id == self.state.selected_roi))
             self.video.set_roi_boxes([])
             self.video.set_frac_boxes(boxes)
 
     def _select_roi(self, roi_id: int):
+        roi = self.state.roi_by_id(roi_id)
+        if roi is None:
+            return
+        self._focused_roi_id = roi_id
         self.state.selected_roi = roi_id
+        if roi.source_frac is not None:
+            work_size = None
+            if self.state.cache is not None:
+                tile = next((t for t in self.state.cache.meta.get(
+                    "replicate_tiles", []) if int(t["id"]) == roi_id), None)
+                if tile is not None:
+                    work_size = (int(tile["work_width"]),
+                                 int(tile["work_height"]))
+            self.video.set_focus_frac(roi.source_frac, work_size=work_size)
+        self._series_cache.clear()
         self._refresh_inspector()
         self._refresh_timeline()
+        self._refresh_selected_leaf_histogram()
+
+    def _clear_roi_focus(self):
+        self._focused_roi_id = None
+        self.state.selected_roi = None
+        self.video.clear_focus()
+        self._series_cache.clear()
+        self._refresh_timeline()
+        self._refresh_inspector()
+        self._refresh_selected_leaf_histogram()
+
+    def _refresh_selected_leaf_histogram(self):
+        item = self.tree.currentItem()
+        if item is not None:
+            self._on_node_selected(item, item)
 
     def _on_view_clicked(self, pt):
-        frame = self.video._cache_frame
-        if frame is None:
+        if self.video._cache_frame is None:
             return
-        h, w = frame.shape[:2]
+        w, h = self.video.view._src_size
         fx, fy = pt.x() / max(1, w), pt.y() / max(1, h)
         for r in self.state.rois:
             if r.source_frac is None:
@@ -710,7 +767,14 @@ class Tab3Behavior(QWidget):
         roi = self.state.roi_by_id(self.state.selected_roi) \
             if self.state.selected_roi is not None else None
         if roi is None or not self.state.has_cache:
-            self.roi_label.setText("No ROI selected.")
+            self.roi_label.setText("Overview — click a replicate to inspect it.")
+            empty = np.zeros(0, np.float32)
+            for plot in self.plots:
+                plot.set_series(empty, empty, "")
+                plot.set_bands([])
+            self.psd.set_psd(empty, empty, nyquist=self.state.fps / 2)
+            self.bout_label.setText("")
+            self.constraints.setText("<i>select a replicate</i>")
             return
 
         fps = self.state.fps
@@ -755,7 +819,13 @@ class Tab3Behavior(QWidget):
     def _refresh_constraints(self):
         roi = self.state.roi_by_id(self.state.selected_roi) \
             if self.state.selected_roi is not None else None
-        if roi is None or not self.current or not self.state.has_cache:
+        if roi is None:
+            self.constraints.setText("<i>select a replicate</i>")
+            return
+        if not self.current:
+            self.constraints.setText("<i>no behavior selected</i>")
+            return
+        if not self.state.has_cache:
             return
         feats = sorted(self.current.features())
         try:
