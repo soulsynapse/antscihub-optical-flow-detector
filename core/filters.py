@@ -189,7 +189,7 @@ def frame_mask(cache, ctx: FeatureContext, state: FilterState,
                frame_idx: int) -> np.ndarray:
     """The (ny, nx) boolean overlay for one frame: blocks passing every range.
 
-    Used to paint the live "matched pixels" overlay in Tab 2. Computed from the
+    Used by the shelved automatic-ROI view to paint its matched-pixels overlay.
     full cache rather than the sample, because an overlay has to be exact.
     """
     ny, nx = cache.grid

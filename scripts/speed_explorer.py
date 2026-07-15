@@ -6,7 +6,8 @@ and in particular, what does the "number of blocks above a threshold" signal (th
 thing detection really thresholds) do as you move the threshold?
 
 It does NOT recompute optical flow. It opens a feature cache you already built in
-the main app (Tab 1) and reads its cached `speed` / `u` / `v` block arrays, so
+the main app (Preprocessing & Flow) and reads its cached `speed` / `u` / `v`
+block arrays, so
 every number here is exactly the number the real pipeline sees -- there is no
 second, slightly-different flow implementation to mistrust.
 
@@ -544,7 +545,7 @@ class SpeedExplorer(QWidget):
 def _pick_cache(cache_root: str) -> str | None:
     caches = cache_mod.list_caches(cache_root)
     if not caches:
-        print(f"No caches under {cache_root}. Build one in the main app (Tab 1) "
+        print(f"No caches under {cache_root}. Build one in Preprocessing & Flow "
               f"first.")
         return None
     caches.sort(key=lambda c: c.get("duration_s", 0))

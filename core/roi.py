@@ -80,6 +80,9 @@ class ROI:
     baseline_end_s: float | None = None
     pixels_per_mm: float | None = None
     body_length_mm: float | None = None
+    # Source-frame ownership boundary. Atlas bbox/mask are internal cache
+    # coordinates in ROI-first caches; the GUI and exports use this fraction.
+    source_frac: tuple[float, float, float, float] | None = None
 
     def duration_s(self, fps: float) -> float:
         return len(self.frames) / fps
@@ -103,6 +106,7 @@ class ROI:
             "baseline_end_s": self.baseline_end_s,
             "pixels_per_mm": self.pixels_per_mm,
             "body_length_mm": self.body_length_mm,
+            "source_frac": list(self.source_frac) if self.source_frac else None,
         }
 
 
@@ -137,8 +141,35 @@ def rect_roi(roi_id: int, frac_box: tuple[float, float, float, float],
               baseline_start_s=baseline_start_s,
               baseline_end_s=baseline_end_s,
               pixels_per_mm=pixels_per_mm,
-              body_length_mm=body_length_mm)
+              body_length_mm=body_length_mm,
+              source_frac=tuple(frac_box))
     return roi
+
+
+def packed_rect_roi(roi_id: int,
+                    source_frac: tuple[float, float, float, float],
+                    atlas_bbox: tuple[int, int, int, int],
+                    atlas_grid: tuple[int, int], n_frames: int,
+                    label: str = "", baseline_start_s: float | None = None,
+                    baseline_end_s: float | None = None,
+                    pixels_per_mm: float | None = None,
+                    body_length_mm: float | None = None) -> ROI:
+    """Materialize one exact replicate tile in a packed ROI-first cache."""
+    ny, nx = atlas_grid
+    y0, x0, y1, x1 = atlas_bbox
+    if not (0 <= y0 < y1 <= ny and 0 <= x0 < x1 <= nx):
+        raise ValueError(f"Invalid packed bbox {atlas_bbox} for grid {atlas_grid}.")
+    mask = np.zeros((ny, nx), dtype=bool)
+    mask[y0:y1, x0:x1] = True
+    return ROI(
+        roi_id=roi_id, frames=list(range(n_frames)), mask=mask,
+        bbox=(y0, x0, y1, x1), note=label,
+        baseline_start_s=baseline_start_s,
+        baseline_end_s=baseline_end_s,
+        pixels_per_mm=pixels_per_mm,
+        body_length_mm=body_length_mm,
+        source_frac=tuple(source_frac),
+    )
 
 
 def _morph(mask: np.ndarray, open_r: int, close_r: int) -> np.ndarray:

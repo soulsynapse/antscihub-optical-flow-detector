@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import json
 
 import numpy as np
 
@@ -20,7 +21,10 @@ from core.features import REGISTRY, FeatureContext, derived_feature_names
 from core.pipeline import run_pipeline
 from core.video import VideoSource
 
-VIDEO = os.path.join("Videos", "Raw", "GX010050c2_02_18_26.MP4")
+VIDEO = os.environ.get(
+    "SMOKE_VIDEO",
+    os.path.join("Videos", "Stabilized", "stab_GX010050c2_02_18_26.MP4"))
+LAYOUT = os.environ.get("SMOKE_LAYOUT", "replicates.json")
 CACHE_ROOT = os.path.join(".cache")
 TEST_SECONDS = float(os.environ.get("SMOKE_SECONDS", "6"))
 
@@ -55,8 +59,11 @@ def main() -> int:
             print(f"  [{p.stage}] {p.done}/{p.total} "
                   f"({p.frac:.0%}) eta {p.eta_s:.0f}s  {p.message}")
 
+    with open(LAYOUT, encoding="utf-8") as f:
+        smoke_replicates = json.load(f)["replicates"]
     key = run_pipeline(VIDEO, cfg, CACHE_ROOT, duration_s=TEST_SECONDS,
-                       progress=on_progress, cache_key_suffix="_smoke")
+                       progress=on_progress, cache_key_suffix="_smoke",
+                       replicates=smoke_replicates)
     elapsed = time.perf_counter() - t0
 
     cache = cache_mod.open_cache(CACHE_ROOT, key)
@@ -79,6 +86,8 @@ def main() -> int:
         fps=cache.fps, block_size=cache.block_size,
         bands={b: cache.read(b) for b in cache.feature_names
                if b.startswith("bandpower_")},
+        regions=[tuple(t["atlas_bbox"])
+                 for t in cache.meta.get("replicate_tiles", [])] or None,
     )
 
     print("\n{:<26} {:>10} {:>10} {:>10} {:>10} {:>8}".format(

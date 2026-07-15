@@ -28,7 +28,8 @@ from core.config import (Band, FeatureConfig, FlowConfig, PipelineConfig,
                          PreprocessConfig)
 from core.pipeline import Progress, run_pipeline
 from core.preprocess import Preprocessor
-from core.video import VideoSource
+from core.replicates import build_layout, geometry_hash
+from core.video import ReplicateVideoSource, VideoSource
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,7 +102,8 @@ def config(normalize: str, block: int) -> PipelineConfig:
 
 
 def ensure_cache(video: str, normalize: str,
-                 args: argparse.Namespace) -> tuple[str, float | None]:
+                 args: argparse.Namespace,
+                 reps: list[dict]) -> tuple[str, float | None]:
     cfg = config(normalize, args.block)
     src = VideoSource(video)
     try:
@@ -109,7 +111,7 @@ def ensure_cache(video: str, normalize: str,
     finally:
         src.release()
     suffix = f"_stdval_{normalize}_{int(round(args.duration))}s_b{args.block}"
-    key = cfg.cache_key(video_hash) + suffix
+    key = cfg.cache_key(video_hash, geometry_hash(reps)) + suffix
     if args.regenerate and cache_mod.cache_exists(args.cache_root, key):
         cache_mod.delete_cache(args.cache_root, key)
     if cache_mod.cache_is_complete(args.cache_root, key):
@@ -129,7 +131,7 @@ def ensure_cache(video: str, normalize: str,
     started = time.perf_counter()
     key = run_pipeline(video, cfg, args.cache_root,
                        duration_s=args.duration, progress=progress,
-                       cache_key_suffix=suffix)
+                       cache_key_suffix=suffix, replicates=reps)
     return key, time.perf_counter() - started
 
 
@@ -141,6 +143,15 @@ def frac_slice(frac: list[float], grid: tuple[int, int]) -> tuple[slice, slice]:
     by0 = max(0, min(ny - 1, int(round(y0 * ny))))
     by1 = max(by0 + 1, min(ny, int(round(y1 * ny))))
     return slice(by0, by1), slice(bx0, bx1)
+
+
+def atlas_slice(rep_id: int, cache) -> tuple[slice, slice]:
+    tile = next((t for t in cache.meta.get("replicate_tiles", [])
+                 if int(t["id"]) == int(rep_id)), None)
+    if tile is None:
+        raise KeyError(f"Replicate {rep_id} is absent from cache layout")
+    y0, x0, y1, x1 = tile["atlas_bbox"]
+    return slice(y0, y1), slice(x0, x1)
 
 
 def auc(y: np.ndarray, score: np.ndarray) -> float | None:
@@ -189,20 +200,31 @@ def intensity_summary(video: str, normalize: str, reps: list[dict],
     """Per-box intensity/contrast drift after the cache-time preprocessing."""
     src = VideoSource(video)
     try:
-        pre = Preprocessor(PreprocessConfig(normalize=normalize),
-                           src.info.width, src.info.height)
+        info = src.info
         n = min(src.info.frame_count, max(2, int(round(duration_s * src.info.fps))))
-        grid = (pre.height, pre.width)
+        cfg = PreprocessConfig(normalize=normalize)
+        scale = cfg.resolve_downsample(info.width)
+        roi_cfg = PreprocessConfig(normalize=normalize, downsample=scale)
+        layout = build_layout(reps, info.width, info.height, scale, block_size=4)
+        preprocessors = {}
+        for tile in layout.tiles:
+            x0, y0, x1, y1 = tile.source_box
+            preprocessors[tile.replicate_id] = Preprocessor(
+                roi_cfg, x1 - x0, y1 - y0)
+        decoder = ReplicateVideoSource(video, layout, n)
         means = [[] for _ in reps]
         contrasts = [[] for _ in reps]
-        for _, frame in src.iter_frames(0, n):
-            gray = pre.apply(frame)
-            for i, rep in enumerate(reps):
-                ys, xs = frac_slice(rep["frac"], grid)
-                region = gray[ys, xs]
+        by_id = {int(r["id"]): i for i, r in enumerate(reps)}
+        for _, atlas in decoder.iter_frames():
+            for tile in layout.tiles:
+                i = by_id[tile.replicate_id]
+                region = preprocessors[tile.replicate_id].apply(
+                    decoder.crop(atlas, tile.replicate_id))
                 means[i].append(float(region.mean()))
                 contrasts[i].append(float(region.std()))
     finally:
+        if "decoder" in locals():
+            decoder.release()
         src.release()
 
     rows = []
@@ -234,15 +256,15 @@ def summarize(cache_root: str, key: str, reps: list[dict],
         speed = cache.read("speed").astype(np.float32)
         fb = cache.read("fb_error_p90").astype(np.float32)
         texture = cache.read("texture_min_eigen").astype(np.float32)
-        median_speed = np.empty_like(speed)
-        for t in range(speed.shape[0]):
-            median_speed[t] = cv2.medianBlur(speed[t], 3)
-
         per_rep = []
         for rep in reps:
-            ys, xs = frac_slice(rep["frac"], cache.grid)
+            ys, xs = atlas_slice(rep["id"], cache)
             vals = speed[:, ys, xs].reshape(speed.shape[0], -1)
-            med_vals = median_speed[:, ys, xs].reshape(speed.shape[0], -1)
+            sub = speed[:, ys, xs]
+            med_sub = np.empty_like(sub)
+            for t in range(speed.shape[0]):
+                med_sub[t] = cv2.medianBlur(sub[t], 3)
+            med_vals = med_sub.reshape(speed.shape[0], -1)
             spatial_p25 = np.percentile(vals, 25, axis=1)
             observed_floor = spatial_p25[1:] if spatial_p25.size > 1 else spatial_p25
             auto_noise = float(np.percentile(observed_floor, 99))
@@ -306,7 +328,7 @@ def main() -> None:
     render_boxes(video, reps, args.boxes_image)
     results = []
     for normalize in args.normalizations:
-        key, runtime_s = ensure_cache(video, normalize, args)
+        key, runtime_s = ensure_cache(video, normalize, args, reps)
         result = summarize(args.cache_root, key, reps, runtime_s)
         result["preprocessed_intensity"] = intensity_summary(
             video, normalize, reps, args.duration)

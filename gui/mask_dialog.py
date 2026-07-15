@@ -1,9 +1,9 @@
-"""Draw a spatial ROI mask directly on a video frame.
+"""Draw an optional within-replicate mask directly on a video frame.
 
 The user draws one or more rectangles marking the regions to KEEP; everything
-outside them is excluded from flow computation. This is the common case for lab
-footage -- crop to the arena, drop the ceiling and shelving -- and drawing it is
-far faster than making a mask PNG in an external editor and loading it.
+outside them is suppressed after the replicate rectangles are decoded. Replicate
+boxes already provide the processing boundary; this tool is only for excluding a
+fixed nuisance inside one or more boxes.
 
 Writes a full-resolution white-on-black PNG (white = keep) that the preprocessor
 loads exactly like an externally-authored mask, so nothing downstream needs to
@@ -24,7 +24,7 @@ from gui.video_panel import FrameView
 class MaskDrawDialog(QDialog):
     def __init__(self, frame_bgr: np.ndarray, out_path: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Draw spatial mask — keep-regions")
+        self.setWindowTitle("Draw within-replicate mask — keep-regions")
         self.resize(1100, 780)
         self.out_path = out_path
         self.src_h, self.src_w = frame_bgr.shape[:2]
@@ -32,8 +32,9 @@ class MaskDrawDialog(QDialog):
 
         lay = QVBoxLayout(self)
         info = QLabel(
-            "Drag rectangles over the regions to KEEP. Everything outside every "
-            "box is excluded from flow computation. Draw as many as you need.")
+            "Drag rectangles over the pixels to KEEP inside your replicate "
+            "boxes. Everything else is suppressed, but cache size and processing "
+            "area do not change. Keep mask edges away from animal movement.")
         info.setWordWrap(True)
         lay.addWidget(info)
 

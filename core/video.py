@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
+import subprocess
 from dataclasses import dataclass
 
 import cv2
@@ -133,6 +135,118 @@ class VideoSource:
 
     def __exit__(self, *exc):
         self.release()
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+class ReplicateVideoSource:
+    """Sequential FFmpeg stream containing only scaled replicate-owned pixels.
+
+    FFmpeg decodes the compressed frame once, then crops, converts to grayscale,
+    downsamples, and vertically packs the exact replicate boxes before crossing
+    the process boundary. On 5.3K footage this avoids materializing a 48 MB BGR
+    frame in Python merely to retain ~8% of it.
+    """
+
+    def __init__(self, path: str, layout, n_frames: int):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise FileNotFoundError("ffmpeg is not available on PATH")
+        self.path = path
+        self.layout = layout
+        self.n_frames = int(n_frames)
+        self.width = max(t.work_width for t in layout.tiles)
+        self.height = sum(t.work_height for t in layout.tiles)
+        self.slices: dict[int, tuple[slice, slice]] = {}
+
+        if len(layout.tiles) == 1:
+            split = "[0:v]null[v0];"
+        else:
+            split = f"[0:v]split={len(layout.tiles)}" + \
+                "".join(f"[v{i}]" for i in range(len(layout.tiles))) + ";"
+        filters = []
+        outputs = []
+        y = 0
+        for i, tile in enumerate(layout.tiles):
+            x0, y0, x1, y1 = tile.source_box
+            filters.append(
+                f"[v{i}]crop={x1-x0}:{y1-y0}:{x0}:{y0},"
+                f"scale={tile.work_width}:{tile.work_height}:flags=area,"
+                f"format=gray,pad={self.width}:ih:0:0[p{i}]")
+            outputs.append(f"[p{i}]")
+            self.slices[tile.replicate_id] = (
+                slice(y, y + tile.work_height),
+                slice(0, tile.work_width),
+            )
+            y += tile.work_height
+        stack = (f"{outputs[0]}null[out]" if len(outputs) == 1 else
+                 "".join(outputs) + f"vstack=inputs={len(outputs)}[out]")
+        graph = split + ";".join(filters) + ";" + stack
+        cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-i", path,
+            "-filter_complex", graph, "-map", "[out]",
+            "-frames:v", str(self.n_frames), "-fps_mode", "passthrough",
+            "-f", "rawvideo", "-pix_fmt", "gray", "-",
+        ]
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        self.proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+        self.frame_bytes = self.width * self.height
+
+    def crop(self, atlas: np.ndarray, replicate_id: int) -> np.ndarray:
+        return atlas[self.slices[int(replicate_id)]]
+
+    def iter_frames(self):
+        if self.proc.stdout is None:
+            return
+        for i in range(self.n_frames):
+            chunks = []
+            remaining = self.frame_bytes
+            while remaining:
+                chunk = self.proc.stdout.read(remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if remaining:
+                rc = self.proc.wait()
+                detail = self.proc.stderr.read().decode(errors="replace") \
+                    if self.proc.stderr is not None else ""
+                if rc != 0:
+                    raise RuntimeError(
+                        f"FFmpeg ROI decode failed at frame {i}: {detail.strip()}")
+                return
+            frame = np.frombuffer(b"".join(chunks), dtype=np.uint8).reshape(
+                self.height, self.width)
+            yield i, frame
+        rc = self.proc.wait()
+        if rc != 0:
+            detail = self.proc.stderr.read().decode(errors="replace") \
+                if self.proc.stderr is not None else ""
+            raise RuntimeError(f"FFmpeg ROI decode failed: {detail.strip()}")
+
+    def release(self) -> None:
+        proc = getattr(self, "proc", None)
+        if proc is None:
+            return
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if proc.stderr is not None:
+            proc.stderr.close()
+        self.proc = None
 
     def __del__(self):
         try:

@@ -117,6 +117,8 @@ def export_hdf5(path: str, cache, ctx, rois: list[ROI], features: list[str],
         for roi in rois:
             g = f.create_group(f"roi_{roi.roi_id:03d}")
             g.attrs["bbox_blocks"] = np.array(roi.bbox)
+            if roi.source_frac is not None:
+                g.attrs["source_frac"] = np.array(roi.source_frac)
             g.attrs["note"] = roi.note
             for name in ("baseline_start_s", "baseline_end_s",
                          "pixels_per_mm", "body_length_mm"):

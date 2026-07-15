@@ -1,7 +1,8 @@
 """Configuration objects for the flow pipeline.
 
 Every config here is a frozen dataclass so it can be hashed. The feature cache
-on disk is keyed by (video_hash, preprocess_config, flow_config, feature_config)
+on disk is keyed by (video_hash, replicate_geometry, preprocess_config,
+flow_config, feature_config)
 so that retuning downstream histogram filters never triggers recomputation, but
 changing anything upstream does.
 
@@ -15,7 +16,7 @@ import json
 from dataclasses import dataclass, field, asdict, replace
 from typing import Literal
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 # The working resolution the downsample factor targets by default. Chosen so a
 # 5.3K GoPro frame lands near 1328px wide (factor 0.25) and a 1080p frame lands
@@ -41,7 +42,8 @@ class PreprocessConfig:
     Defaults are all-off except downsampling, so a first-time user can hit
     "Run test" immediately and get a result.
     """
-    # Spatial ROI mask: path to a PNG mask (white = keep). None = whole frame.
+    # Optional mask within replicate-owned rectangles (white = keep). This does
+    # not change ROI-first decode/cache geometry; None keeps every owned pixel.
     mask_path: str | None = None
 
     # Frame registration for camera motion.
@@ -189,10 +191,13 @@ class PipelineConfig:
             version=d.get("version", CONFIG_VERSION),
         )
 
-    def cache_key(self, video_hash: str) -> str:
-        """Stable hash over (video, preprocess, flow, features)."""
+    def cache_key(self, video_hash: str,
+                  replicate_geometry_hash: str | None = None) -> str:
+        """Stable hash over video, processing settings, and ROI geometry."""
         blob = json.dumps(
-            {"video": video_hash, **self.to_dict()}, sort_keys=True
+            {"video": video_hash,
+             "replicate_geometry": replicate_geometry_hash,
+             **self.to_dict()}, sort_keys=True
         ).encode()
         return hashlib.sha1(blob).hexdigest()[:16]
 

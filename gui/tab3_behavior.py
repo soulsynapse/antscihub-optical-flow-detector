@@ -1,13 +1,9 @@
-"""Tab 3: behavior classification.
+"""Behavior Classification tab.
 
 The behavior spec is edited as an explicit AND/OR tree. Selecting a range leaf
-shows that feature's histogram with the leaf's range on it -- but the histogram
-here is over the ROI TIME-SERIES distribution, not the pixel distribution of
-Tab 2. That distinction is not cosmetic: in Tab 2 a band-power histogram counts
-every block in every frame, most of which are empty background, so the mode sits
-at zero. Here it counts one value per ROI per window, so the mode sits wherever
-your ROIs actually are. Putting a threshold on the wrong one of those two
-distributions is the single easiest way to get a nonsense classifier.
+shows that feature's histogram with the leaf's range on it. The histogram is over
+replicate time-series values, so its thresholds describe the experimental units
+the behavior will actually classify.
 """
 from __future__ import annotations
 
@@ -52,7 +48,7 @@ class Tab3Behavior(QWidget):
         ll = QVBoxLayout(left)
         ll.setContentsMargins(2, 2, 2, 2)
         self.video = VideoPanel(state)
-        self.video.block_clicked.connect(self._on_block_clicked)
+        self.video.view.clicked.connect(self._on_view_clicked)
         ll.addWidget(self.video, 1)
 
         etho_row = QHBoxLayout()
@@ -474,7 +470,7 @@ class Tab3Behavior(QWidget):
         feats = self.state.available_features()
         labels = [REGISTRY[f].label if f in REGISTRY else f for f in feats]
         # Band power for an arbitrary pass-band is computed on demand from the
-        # cached speed series -- it does not have to have been cached in Tab 1.
+        # cached speed series -- it need not have been selected during processing.
         labels = [self._CUSTOM_BAND] + labels
         label, ok = QInputDialog.getItem(self, "Add range constraint", "Feature:",
                                          labels, 0, False)
@@ -552,7 +548,8 @@ class Tab3Behavior(QWidget):
 
         # The "filtered" curve here is the distribution restricted to samples
         # where every OTHER leaf of this behavior passes -- the same
-        # cross-filtering idea as Tab 2, but over ROI time-series values.
+        # cross-filtering idea used throughout the behavior tree, over replicate
+        # time-series values.
         mask = self._other_leaves_mask(node)
         filt, _ = np.histogram(col[mask] if mask is not None else col, bins=edges)
 
@@ -673,18 +670,29 @@ class Tab3Behavior(QWidget):
             for r in self.state.rois:
                 tr = self.state.traces.get((r.roi_id, self.current.name))
                 on = tr is not None and f < tr.size and bool(tr[f])
-                boxes.append((r.roi_id, r.bbox,
-                              self.current.color if on else "#555555"))
-            self.video.set_roi_boxes(boxes)
+                if r.source_frac is not None:
+                    boxes.append((*r.source_frac, r.note or f"#{r.roi_id}",
+                                  self.current.color if on else "#555555",
+                                  r.roi_id == self.state.selected_roi))
+            self.video.set_roi_boxes([])
+            self.video.set_frac_boxes(boxes)
 
     def _select_roi(self, roi_id: int):
         self.state.selected_roi = roi_id
         self._refresh_inspector()
         self._refresh_timeline()
 
-    def _on_block_clicked(self, by: int, bx: int):
+    def _on_view_clicked(self, pt):
+        frame = self.video._cache_frame
+        if frame is None:
+            return
+        h, w = frame.shape[:2]
+        fx, fy = pt.x() / max(1, w), pt.y() / max(1, h)
         for r in self.state.rois:
-            if r.mask is not None and r.mask[by, bx]:
+            if r.source_frac is None:
+                continue
+            x0, y0, x1, y1 = r.source_frac
+            if x0 <= fx <= x1 and y0 <= fy <= y1:
                 self._select_roi(r.roi_id)
                 return
 
@@ -762,7 +770,8 @@ class Tab3Behavior(QWidget):
     def _check_ready(self) -> bool:
         if not self.state.has_cache or not self.state.rois:
             QMessageBox.information(self, "Nothing to export",
-                                    "Extract ROIs in Tab 2 first.")
+                                    "Define replicates and open their matching "
+                                    "flow cache first.")
             return False
         return True
 

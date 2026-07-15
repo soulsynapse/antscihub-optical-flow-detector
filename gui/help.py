@@ -1,11 +1,11 @@
 """The (?) buttons.
 
-Every parameter in Tab 1 gets one. The handoff specifies what each must say:
+Every parameter in Preprocessing & Flow gets one. Each explanation covers:
 what the parameter does, the effect of raising or lowering it, why the default is
 the default, and -- the part that actually matters -- how to tell from the
-DOWNSTREAM histograms whether you have set it well. A help text that only explains
-the knob is useless; the user cannot see the knob's effect, they can only see what
-Tab 2 shows them afterwards.
+DOWNSTREAM evidence whether you have set it well. A help text that only explains
+the knob is useless; the user must be able to inspect its effect in the replicate
+inspector and Behavior Classification.
 """
 from __future__ import annotations
 
@@ -80,10 +80,10 @@ HELP: dict[str, tuple[str, str]] = {
         "The default targets a working width of about 1300 px, so it adapts to "
         "the footage: a 5.3K GoPro frame gets ~0.25, a 1080p frame gets ~0.5. A "
         "fixed factor would be wrong for one or the other.",
-        "In Tab 2, look at the <i>speed</i> histogram. If your animal's motion "
-        "sits indistinguishably on top of the near-zero noise mode, you have "
-        "downsampled too far and the motion is being averaged away. If the "
-        "histogram has a clear, separable shoulder above the noise, you are fine."),
+        "After a test pass, inspect the replicate's <i>speed</i> series and PSD, "
+        "then its feature histogram in Behavior Classification. If known motion "
+        "is indistinguishable from the quiet baseline, you have downsampled too "
+        "far. A stable, separable shoulder above baseline means the scale is useful."),
     ),
 
     "block_size": ("Block size", _h(
@@ -112,10 +112,9 @@ HELP: dict[str, tuple[str, str]] = {
         "Off, because much footage does not need it and it is not free.",
         "<b>This is the one that will silently ruin your results.</b> Camera "
         "shake is broadband and lands in the same frequency band as many "
-        "behaviors. If your band-power overlay in Tab 2 lights up the whole "
-        "frame -- including the substrate, the walls, things you know are not "
-        "moving -- that is camera motion, and you need this on. A correctly "
-        "registered clip has a band-power histogram whose bulk sits near zero."),
+        "behaviors. If multiple replicates show synchronized flow when their "
+        "animals are visibly still, that is camera motion and you need this on. "
+        "A correctly registered quiet interval stays close to its own baseline."),
     ),
 
     "denoise": ("Temporal denoising", _h(
@@ -248,8 +247,9 @@ HELP: dict[str, tuple[str, str]] = {
     ),
 
     "test_seconds": ("Test mode duration", _h(
-        "Processes only the first N seconds into a scratch cache, then drops you "
-        "into Tab 2 so you can see whether the settings are working before "
+        "Processes only the first N seconds into a scratch cache and opens that "
+        "cache without moving you away from Preprocessing &amp; Flow. Use the "
+        "Replicates or Behavior Classification tabs to inspect the result before "
         "committing to the full pass.",
         "Longer gives a more representative sample, particularly for band power, "
         "which needs several windows to be meaningful.",
@@ -259,18 +259,17 @@ HELP: dict[str, tuple[str, str]] = {
         "wrongly, that the settings are bad."),
     ),
 
-    "mask": ("Spatial ROI mask", _h(
-        "Restricts flow computation to a region of the frame. Load a white-on-"
-        "black PNG (white = keep), or click Draw to rubber-band the keep-regions "
+    "mask": ("Within-replicate mask", _h(
+        "Optionally excludes fixed subregions inside the replicate boxes. Load a "
+        "white-on-black PNG (white = keep), or click Draw to mark keep-regions "
         "directly on the video.",
-        "A tighter mask means less to compute and a smaller cache, and it keeps "
-        "irrelevant motion (a doorway, a fan, glare) out of your histograms. Too "
-        "tight and you clip the behavior.",
+        "Replicate boxes already define what is decoded and cached, so this mask "
+        "does not reduce processing time or cache size. It only suppresses pixels "
+        "inside those boxes.",
         "None. Most clips do not need one.",
-        "Use this when part of the frame generates motion you never care about. "
-        "On the reference footage, masking to just the tubes and dropping the "
-        "shelving and background would remove a lot of the camera-motion signal "
-        "that otherwise contaminates band power."),
+        "Use it for a fixed nuisance within an otherwise useful box, such as a "
+        "moving display or persistent reflection. Keep the hard mask edge away "
+        "from the animal: flow close to that artificial boundary is less reliable."),
     ),
 
     "cache_expand": ("Expanding the cache", _h(

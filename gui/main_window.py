@@ -32,14 +32,12 @@ class MainWindow(QMainWindow):
         self.tab1 = Tab1Flow(self.state)
         self.tab2 = Tab2Replicates(self.state)
         self.tab3 = Tab3Behavior(self.state)
-        self.tabs.addTab(self.tab1, "1 · Preprocessing && Flow")
-        self.tabs.addTab(self.tab2, "2 · Replicates")
+        self.tabs.addTab(self.tab2, "1 · Replicates")
+        self.tabs.addTab(self.tab1, "2 · Preprocessing && Flow")
         self.tabs.addTab(self.tab3, "3 · Behavior Classification")
         self.setCentralWidget(self.tabs)
 
-        # Tabs 2 and 3 are meaningless without a cache; leaving them clickable
-        # just invites confusing empty panels.
-        self.tabs.setTabEnabled(1, False)
+        # Replicates must be defined before flow. Behavior needs a cache.
         self.tabs.setTabEnabled(2, False)
 
         self.status = QLabel("Open a video to begin.")
@@ -92,7 +90,7 @@ class MainWindow(QMainWindow):
         sc("Ctrl+3", lambda: self.tabs.setCurrentIndex(2))
 
     def _toggle_play(self):
-        panel = {1: self.tab2.video, 2: self.tab3.video}.get(
+        panel = {0: self.tab2.video, 2: self.tab3.video}.get(
             self.tabs.currentIndex())
         if panel:
             panel.toggle_playback()
@@ -109,14 +107,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Could not open video", str(e))
 
     def _on_cache_opened(self):
+        self.tabs.setTabEnabled(0, True)
         self.tabs.setTabEnabled(1, True)
         self.tabs.setTabEnabled(2, True)
 
     def _on_video_loaded(self):
-        # A freshly loaded video has no cache yet (it was dropped in load_video),
-        # so Tabs 2 and 3 are meaningless until it is cached in Tab 1. Disable
-        # them and return to Tab 1, mirroring the initial state.
-        self.tabs.setTabEnabled(1, False)
+        # ROI-first workflow: draw/import ownership boxes before processing.
+        self.tabs.setTabEnabled(0, True)
+        self.tabs.setTabEnabled(1, True)
         self.tabs.setTabEnabled(2, False)
         self.tabs.setCurrentIndex(0)
 

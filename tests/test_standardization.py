@@ -8,7 +8,11 @@ import numpy as np
 from core import cache as cache_mod
 from core.config import FeatureConfig, PipelineConfig
 from core.features import FeatureContext, cached_feature_names
-from core.flow import (forward_backward_error, reduce_scalar_to_blocks)
+from core.flow import (forward_backward_error, reduce_scalar_to_blocks,
+                       reduce_to_blocks)
+from core.pipeline import (_flow_atlas_geometry, _pack_flow_atlas,
+                           _flow_support_pixels)
+from core.replicates import build_layout, geometry_hash, validate_replicates
 from core.roi import ROI, rect_roi, roi_block_values
 
 
@@ -45,6 +49,19 @@ class StandardizationMathTests(unittest.TestCase):
             90, axis=2)
         np.testing.assert_allclose(p90, expected)
 
+    def test_partial_blocks_keep_the_drawn_edge_pixels(self):
+        x = np.arange(15, dtype=np.float32).reshape(3, 5)
+        reduced = reduce_scalar_to_blocks(
+            x, 4, "mean", include_partial=True)
+        self.assertEqual(reduced.shape, (1, 2))
+        self.assertAlmostEqual(float(reduced[0, 0]), float(x[:, :4].mean()))
+        self.assertAlmostEqual(float(reduced[0, 1]), float(x[:, 4:].mean()))
+
+        flow = np.zeros((3, 5, 2), np.float32)
+        flow[..., 0] = x
+        u, _, _ = reduce_to_blocks(flow, 4, fps=1.0, include_partial=True)
+        np.testing.assert_allclose(u, reduced)
+
     def test_median_features_leave_raw_flow_untouched(self):
         u = np.zeros((1, 5, 5), np.float32)
         u[0, 2, 2] = 100.0
@@ -61,6 +78,24 @@ class StandardizationMathTests(unittest.TestCase):
         pct = ctx.get("texture_percentile")
         np.testing.assert_allclose(pct[0], [[0.25, 0.5], [0.75, 1.0]])
         np.testing.assert_allclose(pct[1], [[1.0, 0.75], [0.5, 0.25]])
+
+    def test_spatial_features_do_not_cross_packed_replicate_boundaries(self):
+        base = np.zeros((1, 1, 5), np.float32)
+        texture = np.array([[[1, 2, 0, 100, 200]]], np.float32)
+        regions = [(0, 0, 1, 2), (0, 3, 1, 5)]
+        ctx = FeatureContext(base, base, base, fps=10, block_size=1,
+                             bands={"texture_min_eigen": texture},
+                             regions=regions)
+        pct = ctx.get("texture_percentile")
+        np.testing.assert_allclose(pct, [[[0.5, 1.0, 0.0, 0.5, 1.0]]])
+
+        u = np.array([[[1, 2, 0, 100, 200]]], np.float32)
+        ctx2 = FeatureContext(u, base, np.abs(u), fps=10, block_size=1,
+                              regions=regions)
+        med = ctx2.get("median3_u")
+        self.assertLess(float(med[0, 0, 1]), 10.0)
+        self.assertGreater(float(med[0, 0, 3]), 50.0)
+        self.assertEqual(float(med[0, 0, 2]), 0.0)
 
 
 class ReplicateStandardizationTests(unittest.TestCase):
@@ -129,6 +164,56 @@ class CacheContractTests(unittest.TestCase):
         names = cached_feature_names(cfg)
         self.assertIn("fb_error_p90", names)
         self.assertIn("texture_min_eigen", names)
+
+
+class ROIProcessingGeometryTests(unittest.TestCase):
+    def setUp(self):
+        self.reps = [
+            {"id": 1, "label": "left", "frac": (0.0, 0.0, 0.4, 1.0)},
+            {"id": 2, "label": "right", "frac": (0.6, 0.0, 1.0, 1.0)},
+        ]
+
+    def test_overlapping_ownership_is_rejected_but_touching_is_allowed(self):
+        validate_replicates(self.reps)
+        touching = [
+            {"id": 1, "frac": (0.0, 0.0, 0.5, 1.0)},
+            {"id": 2, "frac": (0.5, 0.0, 1.0, 1.0)},
+        ]
+        validate_replicates(touching)
+        overlapping = [
+            {"id": 1, "frac": (0.0, 0.0, 0.6, 1.0)},
+            {"id": 2, "frac": (0.5, 0.0, 1.0, 1.0)},
+        ]
+        with self.assertRaisesRegex(ValueError, "1 and 2 overlap"):
+            validate_replicates(overlapping)
+
+    def test_only_geometry_invalidates_the_cache_identity(self):
+        original = geometry_hash(self.reps)
+        metadata_edit = [{**r, "label": "renamed", "pixels_per_mm": 12.0}
+                         for r in self.reps]
+        self.assertEqual(original, geometry_hash(metadata_edit))
+        moved = [{**r} for r in self.reps]
+        moved[0]["frac"] = (0.0, 0.0, 0.41, 1.0)
+        self.assertNotEqual(original, geometry_hash(moved))
+
+    def test_private_flow_atlas_contains_no_other_replicate_pixels(self):
+        cfg = PipelineConfig()
+        layout = build_layout(self.reps, 100, 40, scale=0.5, block_size=4)
+        support = _flow_support_pixels(cfg)
+        shape, cores = _flow_atlas_geometry(layout, support)
+        images = {
+            1: np.ones((20, 20), np.float32),
+            2: np.full((20, 20), 9.0, np.float32),
+        }
+        atlas = _pack_flow_atlas(images, layout, support, shape)
+        np.testing.assert_array_equal(atlas[cores[1]], 1.0)
+        np.testing.assert_array_equal(atlas[cores[2]], 9.0)
+        # Reflected support immediately around each core is derived only from
+        # that core; a zero guard separates the two supported tiles.
+        y1 = cores[1][0]
+        self.assertTrue(np.all(atlas[y1.start - support:y1.start, :40] <= 1.0))
+        y2 = cores[2][0]
+        self.assertTrue(np.all(atlas[y2.start - support:y2.start, :40] >= 9.0))
 
 
 if __name__ == "__main__":

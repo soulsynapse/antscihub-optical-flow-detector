@@ -23,14 +23,21 @@ from core.config import PreprocessConfig
 
 
 class Preprocessor:
-    def __init__(self, cfg: PreprocessConfig, src_width: int, src_height: int):
+    def __init__(self, cfg: PreprocessConfig, src_width: int, src_height: int,
+                 mask_image: np.ndarray | None = None):
         self.cfg = cfg
         self.scale = cfg.resolve_downsample(src_width)
         self.width = max(1, int(round(src_width * self.scale)))
         self.height = max(1, int(round(src_height * self.scale)))
 
         self._mask: np.ndarray | None = None
-        if cfg.mask_path:
+        if mask_image is not None:
+            m = np.asarray(mask_image)
+            if m.ndim == 3:
+                m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
+            self._mask = (cv2.resize(m, (self.width, self.height),
+                                     interpolation=cv2.INTER_NEAREST) > 127)
+        elif cfg.mask_path:
             m = cv2.imread(cfg.mask_path, cv2.IMREAD_GRAYSCALE)
             if m is None:
                 raise IOError(f"Could not read mask: {cfg.mask_path}")

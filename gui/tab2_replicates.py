@@ -1,4 +1,4 @@
-"""Tab 2: Replicates (manual bounding boxes).
+"""Replicates tab: manual experimental-unit bounding boxes.
 
 The histogram-driven automatic ROI discovery is shelved in
 gui/_shelved_tab2_roi_auto.py -- it worked, but on footage where the behavior is
@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout
                              QListWidget, QListWidgetItem, QMessageBox,
                              QPushButton, QVBoxLayout, QWidget)
 
-from core.roi import rect_roi, roi_psd
+from core.roi import packed_rect_roi, rect_roi, roi_psd
 from gui.inspector import PSDPlot, TimeSeriesPlot
 from gui.state import AppState
 from gui.video_panel import VideoPanel
@@ -71,13 +71,15 @@ class Tab2Replicates(QWidget):
         self.stamp_chk.setToolTip(
             "Draw one box to set the size, then click to drop identically-sized "
             "boxes. Same-size replicates make block counts comparable.")
+        self.stamp_chk.setChecked(True)
         bar.addWidget(self.stamp_chk)
+        self.draw_btn.setChecked(True)
         ll.addLayout(bar)
 
         self.hint = QLabel(
-            "Turn on Draw, then drag rectangles over each replicate (e.g. one "
-            "per tube). Click a box to select it. With Fixed-size stamp on, draw "
-            "one box then CLICK to place more of the same size.")
+            "Drag the first replicate box to set the stamp size (e.g. one per "
+            "tube), then CLICK to place more boxes of the same size. Drag again "
+            "at any time to change the stamp size.")
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color:#333; font-size:11px;")
         ll.addWidget(self.hint)
@@ -272,20 +274,37 @@ class Tab2Replicates(QWidget):
     def _rebuild_rois(self):
         """Materialize replicate boxes into rectangular ROIs on the current grid
         and hand them to shared state, so Tab 3 sees them as ROIs."""
+        self.state.set_replicate_specs(self.replicates)
         if not self.state.has_cache:
+            self.state.rois = []
+            self.state.invalidate_series()
+            self.state.rois_changed.emit()
             return
         grid = self.state.cache.grid
         n = self.state.cache.n_frames
+        packed = self.state.cache.meta.get("processing_scope") == "replicate"
+        tiles = {int(t["id"]): t
+                 for t in self.state.cache.meta.get("replicate_tiles", [])}
         rois = []
         for r in self.replicates:
             baseline = r.get("baseline_s")
-            rois.append(rect_roi(
-                r["id"], r["frac"], grid, n, r["label"],
+            common = dict(
+                label=r["label"],
                 baseline_start_s=float(baseline[0]) if baseline else None,
                 baseline_end_s=float(baseline[1]) if baseline else None,
                 pixels_per_mm=r.get("pixels_per_mm"),
                 body_length_mm=r.get("body_length_mm"),
-            ))
+            )
+            if packed:
+                tile = tiles.get(int(r["id"]))
+                if tile is None:
+                    continue
+                rois.append(packed_rect_roi(
+                    r["id"], tuple(r["frac"]),
+                    tuple(tile["atlas_bbox"]), grid, n, **common))
+            else:
+                rois.append(rect_roi(
+                    r["id"], r["frac"], grid, n, **common))
         self.state.rois = rois
         self.state.invalidate_series()
         self.state.rois_changed.emit()
@@ -361,8 +380,10 @@ class Tab2Replicates(QWidget):
         if self.state.source is None:
             return
         # pt is in source-frame pixels; convert to fractions.
-        w = self.state.source.info.width
-        h = self.state.source.info.height
+        frame = self.video._cache_frame
+        if frame is None:
+            return
+        h, w = frame.shape[:2]
         fx, fy = pt.x() / w, pt.y() / h
         for i, r in enumerate(self.replicates):
             x0, y0, x1, y1 = r["frac"]
@@ -478,4 +499,11 @@ class Tab2Replicates(QWidget):
                                     "Draw at least one box first.")
             return
         self._rebuild_rois()
+        if not self.state.has_cache:
+            QMessageBox.information(
+                self, "Processing required",
+                "These boxes do not yet have a matching per-replicate cache. "
+                "Run Test or Full processing in Preprocessing & Flow first.")
+            self.state.request_tab.emit(1)
+            return
         self.state.request_tab.emit(2)

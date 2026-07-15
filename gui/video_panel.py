@@ -366,8 +366,8 @@ class VideoPanel(QWidget):
         if not self.state.has_video or not self.isVisible():
             return
         idx = self.state.current_frame
-        # Decoding is centralised in AppState so the two VideoPanels (Tab 2 and
-        # Tab 3) share one decode per frame instead of fighting each other for
+        # Decoding is centralised in AppState so Replicates and Behavior
+        # Classification share one decode per frame instead of fighting for
         # the decoder position. See AppState.display_frame().
         frame = self.state.display_frame(idx)
         if frame is None:

@@ -1,4 +1,4 @@
-"""Tab 1: preprocessing, flow configuration, and the (expensive) cache pass.
+"""Preprocessing & Flow: configuration and the expensive cache pass.
 
 The design rule here is that the user should never be surprised by a two-hour
 compute or a 20 GB file. Every control that costs time or disk shows its own cost
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
@@ -22,17 +23,19 @@ from core.cache import estimate_cache_bytes, human_bytes
 from core.config import (Band, FeatureConfig, FlowConfig, PipelineConfig,
                          PreprocessConfig)
 from core.flow import backend_status
-from core.pipeline import Cancelled, run_pipeline
+from core.pipeline import (Cancelled, _flow_atlas_geometry,
+                           _flow_support_pixels, run_pipeline)
+from core.replicates import build_layout, geometry_hash, validate_replicates
 from gui.help import HelpButton, labelled
 from gui.state import AppState
 
-# Measured on the reference clip (5312x2988 @ 59.94 fps, Farneback, 1300px
-# working width): ~4.6 frames/s. Scaled by the square of the working width, since
-# flow cost is per-pixel. Used only for the ETA label -- being 30% off is fine,
-# being an order of magnitude off is not.
-_REF_FPS_AT_1300PX = 4.6
+# Calibrated from the ROI-first FFmpeg input path on the reference clip. At
+# 166,980 privately-supported solver pixels/frame, Farneback processed ~40.5
+# fps; normalized to the former 1300x731 reference area that is ~7.1 fps.
+# Used only for ETA; layout and backend still introduce run-to-run variation.
+_REF_FPS_AT_1300PX = 7.1
 _REF_WIDTH = 1300
-_BACKEND_SPEED = {"farneback": 1.0, "dis": 1.7, "raft": 6.0}
+_BACKEND_SPEED = {"farneback": 1.0, "dis": 2.25, "raft": 6.0}
 
 
 class PipelineWorker(QThread):
@@ -41,12 +44,14 @@ class PipelineWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, video_path: str, cfg: PipelineConfig, cache_root: str,
-                 duration_s: float | None, suffix: str = ""):
+                 duration_s: float | None, replicates: list[dict],
+                 suffix: str = ""):
         super().__init__()
         self.video_path = video_path
         self.cfg = cfg
         self.cache_root = cache_root
         self.duration_s = duration_s
+        self.replicates = replicates
         self.suffix = suffix
         self._cancel = False
 
@@ -61,6 +66,7 @@ class PipelineWorker(QThread):
                 progress=self.progress.emit,
                 should_cancel=lambda: self._cancel,
                 cache_key_suffix=self.suffix,
+                replicates=self.replicates,
             )
             self.finished_ok.emit(key)
         except Cancelled:
@@ -137,7 +143,7 @@ class Tab1Flow(QWidget):
         pre.addRow(labelled(self.normalize, "normalize"), QLabel("Normalization"))
 
         self._mask_path: str | None = None
-        self.mask_btn = QPushButton("No spatial mask")
+        self.mask_btn = QPushButton("No within-box mask")
         self.mask_btn.clicked.connect(self._pick_mask)
         draw_mask_btn = QPushButton("Draw…")
         draw_mask_btn.clicked.connect(self._draw_mask)
@@ -146,7 +152,7 @@ class Tab1Flow(QWidget):
         mask_row.setContentsMargins(0, 0, 0, 0)
         mask_row.addWidget(self.mask_btn, 1)
         mask_row.addWidget(draw_mask_btn)
-        pre.addRow(labelled(mask_w, "mask"), QLabel("Spatial ROI mask"))
+        pre.addRow(labelled(mask_w, "mask"), QLabel("Within-replicate mask"))
 
         form_lay.addWidget(pre_box)
 
@@ -231,13 +237,14 @@ class Tab1Flow(QWidget):
         feat.addRow(labelled(self.compression, "compression"), QLabel("Compression"))
 
         self.cache_fb_error = QCheckBox(
-            "DIAGNOSTIC: cache forward/backward error (about 2× flow compute)")
+            "DIAGNOSTIC: cache forward/backward error (~2.7× measured runtime)")
         self.cache_fb_error.setToolTip(
             "Computes backward flow while both frames are available, evaluates "
             "the exact pixelwise F(x)+B(x+F(x)) residual, and stores its p90 per "
             "block as a continuous feature. No rejection threshold is baked in. "
-            "This full-frame diagnostic is disabled by default and is not a "
-            "production setting for long recordings.")
+            "It runs inside each replicate and is disabled by default because "
+            "doubling dense-flow solves is not a production setting for long "
+            "recordings.")
         self.cache_fb_error.toggled.connect(self._refresh_estimates)
         feat.addRow(self.cache_fb_error)
 
@@ -371,6 +378,7 @@ class Tab1Flow(QWidget):
         right.addStretch(1)
 
         self.state.video_loaded.connect(self._on_video_loaded)
+        self.state.rois_changed.connect(self._refresh_estimates)
         self._on_backend_changed(self.backend.currentText())
         self._refresh_cache_list()
 
@@ -431,11 +439,11 @@ class Tab1Flow(QWidget):
         # remove is a trap.
         if self._mask_path:
             self._mask_path = None
-            self.mask_btn.setText("No spatial mask")
+            self.mask_btn.setText("No within-box mask")
             self._refresh_estimates()
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "Spatial ROI mask (white = keep)", "",
+            self, "Within-replicate mask (white = keep)", "",
             "Images (*.png *.jpg *.bmp)")
         if path:
             self._mask_path = path
@@ -464,6 +472,29 @@ class Tab1Flow(QWidget):
             return
         info = self.state.source.info
         cfg = self.build_config()
+        reps = self.state.replicate_specs
+
+        if not reps:
+            self.size_banner.setText(
+                "Define replicate boxes in the Replicates tab first")
+            self.size_banner.setStyleSheet(
+                "background:#fff176; color:#000; font-weight:bold; "
+                "padding:6px; border:1px solid #444;")
+            self.estimate_label.setText(
+                "ROI-first processing requires at least one replicate box.\n"
+                "Decode is shared, but preprocessing and flow run independently "
+                "inside each box.")
+            return
+
+        try:
+            layout = build_layout(
+                reps, info.width, info.height,
+                cfg.preprocess.resolve_downsample(info.width),
+                cfg.flow.block_size)
+        except ValueError as e:
+            self.size_banner.setText("Replicate geometry needs attention")
+            self.estimate_label.setText(str(e))
+            return
 
         warnings = cfg.features.validate_bands(info.fps)
         self.nyquist_label.setText(
@@ -477,19 +508,19 @@ class Tab1Flow(QWidget):
             "color:#000; background:#c8e6c9; padding:4px; border:1px solid #91b894;")
 
         sizes = estimate_cache_bytes(cfg, info.width, info.height,
-                                     info.frame_count, info.fps)
+                                     info.frame_count, info.fps, reps)
         total = sum(sizes.values())
 
-        scale = cfg.preprocess.resolve_downsample(info.width)
-        w = int(info.width * scale)
-        h = int(info.height * scale)
-        ny = h // cfg.flow.block_size
-        nx = w // cfg.flow.block_size
-
-        rate = (_REF_FPS_AT_1300PX * (_REF_WIDTH / max(1, w)) ** 2
+        scale = layout.scale
+        ny, nx = layout.atlas_grid
+        support = _flow_support_pixels(cfg)
+        flow_shape, _ = _flow_atlas_geometry(layout, support)
+        compute_pixels = flow_shape[0] * flow_shape[1]
+        reference_pixels = _REF_WIDTH * 731
+        rate = (_REF_FPS_AT_1300PX * reference_pixels / max(1, compute_pixels)
                 * _BACKEND_SPEED.get(cfg.flow.backend, 1.0))
         if cfg.features.cache_fb_error:
-            rate /= 2.0
+            rate /= 2.7
         full_s = info.frame_count / max(0.01, rate)
         test_s = min(info.frame_count, self.test_seconds.value() * info.fps) \
             / max(0.01, rate)
@@ -499,8 +530,12 @@ class Tab1Flow(QWidget):
         self._update_size_banner(total)
 
         lines = [
-            f"working res   {w} x {h}  (downsample {scale:.3f})",
-            f"block grid    {ny} x {nx}  ({ny * nx} blocks/frame)",
+            f"replicates    {len(layout.tiles)} independent exact crops",
+            f"decoder       {'FFmpeg ROI stream' if shutil.which('ffmpeg') else 'OpenCV full-frame FALLBACK'}",
+            f"owned pixels  {layout.work_pixels_per_frame:,}/frame "
+            f"(downsample {scale:.3f})",
+            f"flow pixels   {compute_pixels:,}/frame incl. private support",
+            f"packed grid   {ny} x {nx}  ({ny * nx} cells/frame)",
             f"frames        {info.frame_count}",
             "",
             "cache, uncompressed:",
@@ -517,8 +552,8 @@ class Tab1Flow(QWidget):
         if cfg.features.cache_fb_error:
             lines += [
                 "",
-                "WARNING: FB error is a full-frame diagnostic.",
-                "Disable it for production-scale cache generation.",
+                "WARNING: FB error doubles per-replicate flow solves.",
+                "Use it on sampled QC windows, not the full corpus.",
             ]
         self.estimate_label.setText("\n".join(lines))
 
@@ -568,6 +603,13 @@ class Tab1Flow(QWidget):
             return
         cfg = self.build_config()
         info = self.state.source.info
+        reps = self.state.replicate_specs
+        try:
+            validate_replicates(reps)
+        except ValueError as e:
+            QMessageBox.warning(self, "Replicate geometry required", str(e))
+            self.state.request_tab.emit(0)
+            return
 
         msg = self._status.get(cfg.flow.backend, "")
         if not msg.startswith("Available"):
@@ -592,7 +634,7 @@ class Tab1Flow(QWidget):
         # settings but different durations are NOT the same cache, and keying them
         # the same would silently hand you a 10 s cache when you asked for 30 s.
         suffix = f"_test{int(round(duration))}s" if test else ""
-        key = cfg.cache_key(info.video_hash) + suffix
+        key = cfg.cache_key(info.video_hash, geometry_hash(reps)) + suffix
 
         if cache_mod.cache_exists(self.state.cache_root, key) and \
                 not cache_mod.cache_is_complete(self.state.cache_root, key):
@@ -620,7 +662,6 @@ class Tab1Flow(QWidget):
                 QMessageBox.StandardButton.Yes)
             if r == QMessageBox.StandardButton.Yes:
                 self.state.open_cache(key)
-                self.state.request_tab.emit(1)
                 return
             # Falling through re-runs and overwrites it, which is what "No" means.
 
@@ -643,6 +684,7 @@ class Tab1Flow(QWidget):
         self.worker = PipelineWorker(
             info.path, cfg, self.state.cache_root,
             duration_s=duration,
+            replicates=[{**r, "frac": tuple(r["frac"])} for r in reps],
             suffix=suffix,
         )
         self.worker.progress.connect(self._on_progress)
@@ -677,12 +719,9 @@ class Tab1Flow(QWidget):
         self._set_running(False)
         self.progress_label.setText(
             f"Done in {(time.perf_counter() - self._t0) / 60:.1f} min. "
-            f"Opening cache and jumping to ROI Discovery.")
+            f"Cache opened; Behavior Classification is ready.")
         self._refresh_cache_list()
         self.state.open_cache(key)
-        # The handoff's test-mode contract: land the user in Tab 2 with the
-        # partial cache so they can decide whether to commit to the full pass.
-        self.state.request_tab.emit(1)
 
     def _on_failed(self, msg: str):
         self._set_running(False)
@@ -699,6 +738,9 @@ class Tab1Flow(QWidget):
             tag = " [test]" if c.get("test_mode") else ""
             if c.get("complete") is False:
                 tag += " [incomplete]"
+            n_reps = len(c.get("replicate_tiles", []))
+            if n_reps:
+                tag += f" [{n_reps} reps]"
             self.cache_list.addItem(
                 f"{c['key']}{tag}  {os.path.basename(c.get('video_path', '?'))}  "
                 f"{c.get('duration_s', 0):.0f}s  "
@@ -766,7 +808,6 @@ class Tab1Flow(QWidget):
             return
         try:
             self.state.open_cache(key)
-            self.state.request_tab.emit(1)
         except Exception as e:
             QMessageBox.critical(self, "Could not open cache", str(e))
 
@@ -812,7 +853,7 @@ class Tab1Flow(QWidget):
         self.normalize.setCurrentText(p.normalize)
         self._mask_path = p.mask_path
         self.mask_btn.setText(os.path.basename(p.mask_path) if p.mask_path
-                              else "No spatial mask")
+                              else "No within-box mask")
         self.backend.setCurrentText(f.backend)
         self.block.setValue(f.block_size)
         if ft.bands:

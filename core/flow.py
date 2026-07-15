@@ -136,7 +136,7 @@ def gpu_available() -> bool:
 
 
 def backend_status() -> dict[str, str]:
-    """Per-backend availability message, for the Tab 1 backend selector."""
+    """Per-backend availability message for Preprocessing & Flow."""
     status = {
         "farneback": "Available (CPU). Fast; coarse motion.",
         "dis": "Available (CPU). Better on subtle motion.",
@@ -200,7 +200,8 @@ def forward_backward_error(forward: np.ndarray,
 
 
 def reduce_scalar_to_blocks(values: np.ndarray, block: int,
-                            statistic: str = "mean") -> np.ndarray:
+                            statistic: str = "mean",
+                            include_partial: bool = False) -> np.ndarray:
     """Reduce one pixelwise scalar field to the same block grid as flow.
 
     ``p90`` is used for forward/backward error so a bad minority is not hidden by
@@ -210,14 +211,40 @@ def reduce_scalar_to_blocks(values: np.ndarray, block: int,
     if values.ndim != 2:
         raise ValueError("scalar field must have shape HxW")
     h, w = values.shape
-    ny, nx = h // block, w // block
+    ny = ((h + block - 1) // block) if include_partial else h // block
+    nx = ((w + block - 1) // block) if include_partial else w // block
     if ny == 0 or nx == 0:
         raise ValueError(
             f"Block size {block} is larger than the scalar field ({w}x{h}).")
-    x = values[:ny * block, :nx * block]
+    if include_partial and statistic == "p90":
+        # Use the fast partition implementation for every complete cell. Only
+        # the final row/column are ragged, so compute those few small percentiles
+        # directly instead of sending the whole plane through nanpercentile.
+        out = np.empty((ny, nx), np.float32)
+        full_y, full_x = h // block, w // block
+        if full_y and full_x:
+            out[:full_y, :full_x] = reduce_scalar_to_blocks(
+                values[:full_y * block, :full_x * block], block, "p90")
+        for by in range(ny):
+            for bx in range(nx):
+                if by < full_y and bx < full_x:
+                    continue
+                cell = values[by * block:min(h, (by + 1) * block),
+                              bx * block:min(w, (bx + 1) * block)]
+                out[by, bx] = np.percentile(cell, 90)
+        return out
+
+    if include_partial:
+        x = np.pad(values.astype(np.float32, copy=False),
+                   ((0, ny * block - h), (0, nx * block - w)),
+                   constant_values=np.nan)
+    else:
+        x = values[:ny * block, :nx * block]
     cells = x.reshape(ny, block, nx, block).transpose(0, 2, 1, 3)
     cells = cells.reshape(ny, nx, block * block)
     if statistic == "mean":
+        if include_partial:
+            return np.nanmean(cells, axis=2, dtype=np.float32).astype(np.float32)
         return cells.mean(axis=2, dtype=np.float32).astype(np.float32)
     if statistic == "p90":
         # np.percentile promotes/intermediates aggressively and drove the 5.3K
@@ -237,7 +264,8 @@ def reduce_scalar_to_blocks(values: np.ndarray, block: int,
 
 # -- block reduction ---------------------------------------------------------
 
-def reduce_to_blocks(flow: np.ndarray, block: int, fps: float
+def reduce_to_blocks(flow: np.ndarray, block: int, fps: float,
+                     include_partial: bool = False
                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reduce a per-pixel flow field to per-block statistics, in px/s.
 
@@ -263,22 +291,28 @@ def reduce_to_blocks(flow: np.ndarray, block: int, fps: float
        instead of paid cache expansions.
     """
     h, w = flow.shape[:2]
-    n_by, n_bx = h // block, w // block
+    n_by = ((h + block - 1) // block) if include_partial else h // block
+    n_bx = ((w + block - 1) // block) if include_partial else w // block
     if n_by == 0 or n_bx == 0:
         raise ValueError(
             f"Block size {block} is larger than the working frame ({w}x{h}). "
             f"Lower the block size or raise the downsample factor."
         )
 
-    # Crop the ragged right/bottom edge rather than padding it: a partial block
-    # would have a different pixel count and bias its own statistics.
-    f = flow[: n_by * block, : n_bx * block]
+    if include_partial:
+        f = np.pad(flow.astype(np.float32, copy=False),
+                   ((0, n_by * block - h), (0, n_bx * block - w), (0, 0)),
+                   constant_values=np.nan)
+    else:
+        # Full-frame legacy mode retains its historical crop semantics.
+        f = flow[: n_by * block, : n_bx * block]
     u = f[..., 0].reshape(n_by, block, n_bx, block)
     v = f[..., 1].reshape(n_by, block, n_bx, block)
 
-    u_mean = u.mean(axis=(1, 3))
-    v_mean = v.mean(axis=(1, 3))
-    speed_mean = np.sqrt(u * u + v * v).mean(axis=(1, 3))
+    reduce = np.nanmean if include_partial else np.mean
+    u_mean = reduce(u, axis=(1, 3))
+    v_mean = reduce(v, axis=(1, 3))
+    speed_mean = reduce(np.sqrt(u * u + v * v), axis=(1, 3))
 
     # px/frame -> px/s. Time is in seconds everywhere downstream.
     return (u_mean * fps).astype(np.float32), \

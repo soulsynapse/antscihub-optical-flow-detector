@@ -1,3 +1,13 @@
+# Archived standardization handoff
+
+> Archived on 2026-07-15 after implementation and validation. This proposal was
+> an input, not a mechanical checklist. The live design deliberately keeps CLAHE
+> opt-in, stores a forward/backward residual instead of complete backward flow,
+> stores block texture rather than full-resolution maps, uses one fixed
+> per-replicate noise reference, and performs spatial adjustments at analysis
+> time. See the [current README](../../README.md),
+> [design decisions](../decisions.md) and [next steps](../next-steps.md).
+
 # Handoff: Optical Flow Standardization Additions
 
 ## Context

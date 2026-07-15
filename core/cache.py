@@ -8,13 +8,19 @@ Layout, both backends:
 
     <cache_root>/<cache_key>/
         meta.json           config, video info, block grid, band time axis
-        u, v, speed, ...    (T, ny, nx) arrays, chunked along time
+        u, v, speed, ...    (T, atlas_ny, atlas_nx), chunked along time
+
+New caches are ROI-first. Each replicate is preprocessed independently and its
+block grid is packed into a sparse atlas with separator rows. Atlas coordinates
+are internal storage only; ``meta["replicate_tiles"]`` maps every tile back to
+its exact source-frame fractional box. This preserves one efficient regular
+array without treating neighboring replicates as one image.
 
 Chunking is time-major -- (T_chunk, ny, nx) with the full spatial grid in each
 chunk. Two access patterns have to be fast and they pull in opposite directions:
 
-  * Tab 2 scrubbing reads one frame, all blocks   -> wants whole spatial planes.
-  * Tab 3 reads one ROI's time series, all frames -> wants whole time columns.
+  * Video scrubbing reads one frame, all blocks       -> wants spatial planes.
+  * A replicate time series reads one ROI, all frames -> wants time columns.
 
 A full-spatial-plane chunk spanning many frames serves the first perfectly and
 the second acceptably (an ROI read touches every chunk, but only T/T_chunk of
@@ -320,7 +326,7 @@ _BACKENDS = {"zarr": ZarrCache, "hdf5": HDF5Cache}
 #   * The ROI time-series read is what actually separates them, and Zarr wins it
 #     by 2.3x (107 vs 245 ms). This is the one pattern that CANNOT be cached
 #     away: pulling one block's full time column touches every chunk in the clip
-#     by construction. Tab 3 does this on every ROI click.
+#     by construction. The replicate inspector does this on every ROI click.
 #
 # Two things the benchmark does not measure also point to Zarr, and they are the
 # reason this is not a close call:
@@ -503,13 +509,14 @@ def list_caches(cache_root: str) -> list[dict]:
     return out
 
 
-# -- size estimation (drives the Tab 1 "cost of this option" labels) ----------
+# -- size estimation (drives processing-option cost labels) -------------------
 
 def estimate_cache_bytes(cfg, width: int, height: int, n_frames: int,
-                         fps: float) -> dict[str, int]:
+                         fps: float,
+                         replicates: list[dict] | None = None) -> dict[str, int]:
     """Per-feature uncompressed byte estimate for a given config.
 
-    Tab 1 shows these inline next to each expansion checkbox, so the user sees
+    Preprocessing & Flow shows these beside each expansion checkbox, so the user sees
     the cost before committing to an hour of compute. Compression typically
     takes 2-4x off these numbers for flow data, but we quote the uncompressed
     figure as the conservative bound.
@@ -517,10 +524,15 @@ def estimate_cache_bytes(cfg, width: int, height: int, n_frames: int,
     from core.features import cached_feature_names
 
     scale = cfg.preprocess.resolve_downsample(width)
-    w = max(1, int(round(width * scale)))
-    h = max(1, int(round(height * scale)))
     block = cfg.flow.block_size
-    ny, nx = h // block, w // block
+    if replicates:
+        from core.replicates import build_layout
+        layout = build_layout(replicates, width, height, scale, block)
+        ny, nx = layout.atlas_grid
+    else:
+        w = max(1, int(round(width * scale)))
+        h = max(1, int(round(height * scale)))
+        ny, nx = h // block, w // block
     itemsize = 2 if cfg.features.dtype == "float16" else 4
 
     per_frame_plane = ny * nx * itemsize

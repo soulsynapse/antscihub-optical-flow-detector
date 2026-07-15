@@ -18,7 +18,7 @@ through a plain callback.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import cv2
@@ -29,8 +29,9 @@ from core.config import PipelineConfig
 from core.features import cached_feature_names
 from core.flow import (create_backend, forward_backward_error,
                        reduce_scalar_to_blocks, reduce_to_blocks)
-from core.preprocess import Preprocessor, sample_frames_for_background
-from core.video import VideoSource
+from core.preprocess import Preprocessor
+from core.replicates import ReplicateLayout, build_layout
+from core.video import ReplicateVideoSource, VideoSource
 
 ProgressFn = Callable[["Progress"], None]
 
@@ -59,6 +60,78 @@ class Cancelled(Exception):
     pass
 
 
+def _flow_support_pixels(cfg: PipelineConfig) -> int:
+    """Private synthetic edge support; never sourced outside the replicate."""
+    if cfg.flow.backend == "farneback":
+        return max(4, min(32, int(cfg.flow.fb_winsize)))
+    return 16
+
+
+def _flow_atlas_geometry(layout: ReplicateLayout, support: int
+                         ) -> tuple[tuple[int, int], dict[int, tuple[slice, slice]]]:
+    """Pack privately supported crops into one solver image.
+
+    Batching removes the large fixed overhead of invoking Farnebäck/DIS once per
+    replicate per frame. Every core is still separated from every other core by
+    its own reflected support on both sides plus an all-zero guard gap.
+    """
+    gap = max(2, 2 * support)
+    width = max(t.work_width + 2 * support for t in layout.tiles)
+    height = sum(t.work_height + 2 * support for t in layout.tiles) + \
+        gap * max(0, len(layout.tiles) - 1)
+    cores = {}
+    y = 0
+    for tile in layout.tiles:
+        cores[tile.replicate_id] = (
+            slice(y + support, y + support + tile.work_height),
+            slice(support, support + tile.work_width),
+        )
+        y += tile.work_height + 2 * support + gap
+    return (height, width), cores
+
+
+def _pack_flow_atlas(images: dict[int, np.ndarray], layout: ReplicateLayout,
+                     support: int, shape: tuple[int, int]) -> np.ndarray:
+    atlas = np.zeros(shape, dtype=np.float32)
+    gap = max(2, 2 * support)
+    y = 0
+    for tile in layout.tiles:
+        g = images[tile.replicate_id]
+        if g.shape != (tile.work_height, tile.work_width):
+            raise ValueError(
+                f"Replicate {tile.replicate_id} produced {g.shape}, expected "
+                f"{(tile.work_height, tile.work_width)}.")
+        border = cv2.BORDER_REFLECT_101 \
+            if g.shape[0] > 1 and g.shape[1] > 1 else cv2.BORDER_REPLICATE
+        padded = cv2.copyMakeBorder(
+            g, support, support, support, support, border)
+        atlas[y:y + padded.shape[0], :padded.shape[1]] = padded
+        y += padded.shape[0] + gap
+    return atlas
+
+
+def _region_divergence_curl(u: np.ndarray, v: np.ndarray,
+                            layout: ReplicateLayout
+                            ) -> tuple[np.ndarray, np.ndarray]:
+    """Spatial derivatives independently inside every packed replicate tile."""
+    div = np.zeros_like(u, dtype=np.float32)
+    curl = np.zeros_like(v, dtype=np.float32)
+    for tile in layout.tiles:
+        y0, x0, y1, x1 = tile.atlas_bbox
+        us = u[:, y0:y1, x0:x1]
+        vs = v[:, y0:y1, x0:x1]
+        # np.gradient needs at least two values on an axis. A one-block-wide
+        # replicate has no resolvable spatial derivative on that axis, so its
+        # contribution is correctly zero.
+        du_dx = np.gradient(us, axis=2) if us.shape[2] > 1 else np.zeros_like(us)
+        dv_dx = np.gradient(vs, axis=2) if vs.shape[2] > 1 else np.zeros_like(vs)
+        du_dy = np.gradient(us, axis=1) if us.shape[1] > 1 else np.zeros_like(us)
+        dv_dy = np.gradient(vs, axis=1) if vs.shape[1] > 1 else np.zeros_like(vs)
+        div[:, y0:y1, x0:x1] = du_dx + dv_dy
+        curl[:, y0:y1, x0:x1] = dv_dx - du_dy
+    return div, curl
+
+
 def run_pipeline(
     video_path: str,
     cfg: PipelineConfig,
@@ -68,6 +141,7 @@ def run_pipeline(
     should_cancel: Callable[[], bool] | None = None,
     backend: str | None = None,
     cache_key_suffix: str = "",
+    replicates: list[dict] | None = None,
 ) -> str:
     """Run the full pass and return the cache key.
 
@@ -93,26 +167,68 @@ def run_pipeline(
     if duration_s is not None:
         n_frames = min(n_frames, max(2, int(round(duration_s * fps))))
 
-    key = cfg.cache_key(info.video_hash) + cache_key_suffix
+    replicates = list(replicates or [])
+    block = cfg.flow.block_size
+    scale = cfg.preprocess.resolve_downsample(info.width)
+    layout = build_layout(replicates, info.width, info.height, scale, block)
+    key = cfg.cache_key(info.video_hash, layout.geometry_hash) + cache_key_suffix
 
-    pre = Preprocessor(cfg.preprocess, info.width, info.height)
+    # Preprocessing is stateful, so every replicate owns an independent
+    # instance. The explicit full-frame-derived scale preserves the same
+    # physical pixel scale across differently sized boxes.
+    pre_cfg = replace(cfg.preprocess, downsample=scale, mask_path=None)
+    source_mask = None
+    if cfg.preprocess.mask_path:
+        source_mask = cv2.imread(cfg.preprocess.mask_path, cv2.IMREAD_GRAYSCALE)
+        if source_mask is None:
+            raise IOError(f"Could not read mask: {cfg.preprocess.mask_path}")
+        if source_mask.shape != (info.height, info.width):
+            source_mask = cv2.resize(source_mask, (info.width, info.height),
+                                     interpolation=cv2.INTER_NEAREST)
+
+    preprocessors: dict[int, Preprocessor] = {}
+    for tile in layout.tiles:
+        x0, y0, x1, y1 = tile.source_box
+        mask_crop = source_mask[y0:y1, x0:x1] if source_mask is not None else None
+        preprocessors[tile.replicate_id] = Preprocessor(
+            pre_cfg, x1 - x0, y1 - y0, mask_image=mask_crop)
+
     if cfg.preprocess.bg_subtract == "median":
-        emit("background", 0, 1, "Sampling frames for background model")
-        pre.fit_background(
-            sample_frames_for_background(src, cfg.preprocess.bg_median_samples))
+        emit("background", 0, 1,
+             "Sampling a separate background model for each replicate")
+        sample_count = min(cfg.preprocess.bg_median_samples, info.frame_count)
+        sample_idxs = np.linspace(0, max(0, info.frame_count - 1),
+                                  num=sample_count, dtype=int)
+        samples = {tile.replicate_id: [] for tile in layout.tiles}
+        for idx in sample_idxs:
+            frame = src.frame_at(int(idx))
+            if frame is None:
+                continue
+            for tile in layout.tiles:
+                x0, y0, x1, y1 = tile.source_box
+                samples[tile.replicate_id].append(frame[y0:y1, x0:x1])
+        for tile in layout.tiles:
+            preprocessors[tile.replicate_id].fit_background(
+                samples[tile.replicate_id])
 
     if cfg.preprocess.registration != "off":
         ref = src.frame_at(src.time_to_frame(cfg.preprocess.registration_ref_time_s))
         if ref is not None:
-            pre.set_reference(ref)
+            for tile in layout.tiles:
+                x0, y0, x1, y1 = tile.source_box
+                preprocessors[tile.replicate_id].set_reference(ref[y0:y1, x0:x1])
 
-    block = cfg.flow.block_size
-    ny, nx = pre.height // block, pre.width // block
-    if ny == 0 or nx == 0:
-        raise ValueError(
-            f"Block size {block} exceeds the working frame "
-            f"({pre.width}x{pre.height}). Lower the block size."
-        )
+    ny, nx = layout.atlas_grid
+    support_px = _flow_support_pixels(cfg)
+    flow_atlas_shape, flow_core_slices = _flow_atlas_geometry(layout, support_px)
+    roi_decoder = None
+    decoder_name = "opencv-full-frame"
+    decoder_fallback = None
+    try:
+        roi_decoder = ReplicateVideoSource(video_path, layout, n_frames)
+        decoder_name = "ffmpeg-roi-gray"
+    except (FileNotFoundError, OSError, RuntimeError) as e:
+        decoder_fallback = f"{type(e).__name__}: {e}"
 
     # Flow is defined between consecutive frames, so N frames yield N-1 fields.
     # We prepend a zero field so the arrays are frame-aligned: index t is the
@@ -128,9 +244,10 @@ def run_pipeline(
         "n_frames": n_flow,
         "src_width": info.width,
         "src_height": info.height,
-        "work_width": pre.width,
-        "work_height": pre.height,
-        "downsample": pre.scale,
+        "work_width": nx * block,
+        "work_height": ny * block,
+        "work_pixels_per_frame": layout.work_pixels_per_frame,
+        "downsample": layout.scale,
         "block_size": block,
         "grid": [ny, nx],
         "dtype": dtype,
@@ -143,6 +260,15 @@ def run_pipeline(
         "config": cfg.to_dict(),
         "test_mode": duration_s is not None,
         "duration_s": n_flow / fps,
+        "processing_scope": "replicate",
+        "replicate_layout_version": 1,
+        "replicate_geometry_hash": layout.geometry_hash,
+        "replicate_tiles": [tile.to_meta() for tile in layout.tiles],
+        "synthetic_flow_support_px": support_px,
+        "flow_solver_atlas_shape": list(flow_atlas_shape),
+        "source_padding_px": 0,
+        "decoder": decoder_name,
+        "decoder_fallback": decoder_fallback,
     }
 
     cache = cache_mod.create_cache(cache_root, key, meta, backend=backend)
@@ -188,48 +314,72 @@ def run_pipeline(
                 cache.write("coherence", write_t0,
                             np.clip(coh, 0, 1).astype(dtype))
             if cfg.features.cache_divergence_curl:
-                div = np.gradient(u, axis=2) + np.gradient(v, axis=1)
-                curl = np.gradient(v, axis=2) - np.gradient(u, axis=1)
+                div, curl = _region_divergence_curl(u, v, layout)
                 cache.write("divergence", write_t0, div.astype(dtype))
                 cache.write("curl", write_t0, curl.astype(dtype))
             write_t0 += buf_at
             buf_at = 0
 
-        prev = None
+        previous_atlas = None
         try:
-            for i, frame in src.iter_frames(0, n_frames):
-                g = pre.apply(frame)
-
+            frame_iter = roi_decoder.iter_frames() if roi_decoder is not None \
+                else src.iter_frames(0, n_frames)
+            for i, frame in frame_iter:
+                # Clear separator/unused atlas cells before filling this frame.
+                buf_u[buf_at].fill(0)
+                buf_v[buf_at].fill(0)
+                buf_s[buf_at].fill(0)
                 if buf_texture is not None:
-                    # Use the same clipped 8-bit intensity representation that
-                    # the CPU flow backends see.  Cache a block-grid mean rather
-                    # than a per-pixel movie: the detector's atomic spatial unit
-                    # is already the block, and a full-resolution texture movie
-                    # would defeat the cache's size contract.
-                    g8 = np.clip(g, 0, 255).astype(np.uint8)
-                    eig = cv2.cornerMinEigenVal(g8, blockSize=3, ksize=3)
-                    buf_texture[buf_at] = reduce_scalar_to_blocks(
-                        eig, block, statistic="mean")
+                    buf_texture[buf_at].fill(0)
+                if buf_fb_error is not None:
+                    buf_fb_error[buf_at].fill(0)
 
-                if prev is None:
-                    # Frame 0 has no predecessor: zero flow, keeping arrays
-                    # aligned.  Its FB error is also zero/undefined; downstream
-                    # temporal criteria make this single sample immaterial.
-                    buf_u[buf_at] = 0.0
-                    buf_v[buf_at] = 0.0
-                    buf_s[buf_at] = 0.0
+                processed: dict[int, np.ndarray] = {}
+                for tile in layout.tiles:
+                    rid = tile.replicate_id
+                    x0, y0, x1, y1 = tile.source_box
+                    owned = roi_decoder.crop(frame, rid) \
+                        if roi_decoder is not None else frame[y0:y1, x0:x1]
+                    g = preprocessors[rid].apply(owned)
+                    processed[rid] = g
+                    ay0, ax0, ay1, ax1 = tile.atlas_bbox
+
+                    if buf_texture is not None:
+                        g8 = np.clip(g, 0, 255).astype(np.uint8)
+                        eig = cv2.cornerMinEigenVal(g8, blockSize=3, ksize=3)
+                        buf_texture[buf_at, ay0:ay1, ax0:ax1] = \
+                            reduce_scalar_to_blocks(
+                                eig, block, statistic="mean",
+                                include_partial=True)
+
+                current_atlas = _pack_flow_atlas(
+                    processed, layout, support_px, flow_atlas_shape)
+                if previous_atlas is not None:
+                    forward_atlas = flow_backend.compute(
+                        previous_atlas, current_atlas)
+                    error_atlas = None
                     if buf_fb_error is not None:
-                        buf_fb_error[buf_at] = 0.0
-                else:
-                    flow = flow_backend.compute(prev, g)
-                    u, v, s = reduce_to_blocks(flow, block, fps)
-                    buf_u[buf_at], buf_v[buf_at], buf_s[buf_at] = u, v, s
-                    if buf_fb_error is not None:
-                        backward = flow_backend.compute(g, prev)
-                        err = forward_backward_error(flow, backward)
-                        buf_fb_error[buf_at] = reduce_scalar_to_blocks(
-                            err, block, statistic="p90")
-                prev = g
+                        backward_atlas = flow_backend.compute(
+                            current_atlas, previous_atlas)
+                        error_atlas = forward_backward_error(
+                            forward_atlas, backward_atlas)
+
+                    for tile in layout.tiles:
+                        ay0, ax0, ay1, ax1 = tile.atlas_bbox
+                        core_sl = flow_core_slices[tile.replicate_id]
+                        flow = np.asarray(forward_atlas[core_sl], np.float32)
+                        u, v, s = reduce_to_blocks(
+                            flow, block, fps, include_partial=True)
+                        buf_u[buf_at, ay0:ay1, ax0:ax1] = u
+                        buf_v[buf_at, ay0:ay1, ax0:ax1] = v
+                        buf_s[buf_at, ay0:ay1, ax0:ax1] = s
+                        if buf_fb_error is not None and error_atlas is not None:
+                            fb_error = np.asarray(error_atlas[core_sl], np.float32)
+                            buf_fb_error[buf_at, ay0:ay1, ax0:ax1] = \
+                                reduce_scalar_to_blocks(
+                                    fb_error, block, statistic="p90",
+                                    include_partial=True)
+                previous_atlas = current_atlas
                 buf_at += 1
 
                 if buf_at == buf_u.shape[0]:
@@ -238,8 +388,10 @@ def run_pipeline(
                     extra = " + backward consistency" \
                         if cfg.features.cache_fb_error else ""
                     emit("flow", i + 1, n_frames,
-                         f"Optical flow ({cfg.flow.backend}{extra}) at "
-                         f"{pre.width}x{pre.height}")
+                         f"Per-replicate optical flow "
+                         f"({cfg.flow.backend}{extra}); {len(layout.tiles)} "
+                         f"replicates, {layout.work_pixels_per_frame:,} owned "
+                         f"working pixels/frame")
             flush()
         finally:
             flow_backend.close()
@@ -250,15 +402,18 @@ def run_pipeline(
             _compute_band_power(cache, cfg, fps, n_flow, ny, nx, dtype, emit)
 
     finally:
+        if roi_decoder is not None:
+            roi_decoder.release()
         src.release()
         cache.close()
 
     # meta.json exists from the moment construction starts so progress and
     # failures are inspectable.  Only mark it complete after every backend write
-    # has succeeded and the store has closed; Tab 1 will recompute a cache left
+    # has succeeded and the store has closed; Preprocessing & Flow will recompute a cache left
     # false by cancellation or an exception instead of trying to load missing
     # arrays from it.
     cache.meta["complete"] = True
+    cache.meta["runtime_s"] = time.perf_counter() - t_start
     cache.write_meta()
 
     return key

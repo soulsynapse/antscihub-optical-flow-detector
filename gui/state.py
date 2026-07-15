@@ -3,7 +3,7 @@
 One object owns the video, the config, the open cache, the filter state, the ROI
 list and the behavior library. The three tabs talk to each other only through its
 signals -- no tab holds a reference to another tab. That is what keeps "expand the
-cache in Tab 1 and everything downstream refreshes" from turning into a web of
+cache in Preprocessing & Flow and refresh downstream" from turning into a web of
 cross-tab calls.
 """
 from __future__ import annotations
@@ -49,6 +49,9 @@ class AppState(QObject):
         self.filter = FilterState()
         self.roi_params = ROIParams()
         self.rois: list[ROI] = []
+        # Geometry-only replicate specs are shared so Preprocessing & Flow can run
+        # ROI-first cache before any cache-backed ROI objects exist.
+        self.replicate_specs: list[dict] = []
         self.selected_roi: int | None = None
 
         self.library = BehaviorLibrary(os.path.join(project_dir, "behaviors"))
@@ -127,10 +130,10 @@ class AppState(QObject):
         self._disp_idx = -1
 
         # The previously open cache belongs to the OLD video (caches are keyed by
-        # video hash and only ever opened by hand in Tab 1). If we keep it, the
+        # video hash and only ever opened by hand in Preprocessing & Flow). If kept,
         # new clip's boxes get rebuilt onto the old grid and Tab 3 shows traces
         # computed from the old video's flow under the new video -- a stale
-        # detection. Drop it; the user re-caches the new clip in Tab 1 as usual.
+        # detection. Drop it; the user re-caches the new clip as usual.
         if self.cache is not None:
             self.cache.close()
         self.cache = None
@@ -143,6 +146,7 @@ class AppState(QObject):
         # would ghost onto the new clip until it is re-cached. The tabs reload
         # the new video's sidecars off video_loaded / cache_opened.
         self.rois = []
+        self.replicate_specs = []
         self.selected_roi = None
         self.traces = {}
         self.strengths = {}
@@ -186,6 +190,28 @@ class AppState(QObject):
     def has_cache(self) -> bool:
         return self.cache is not None and self.ctx is not None
 
+    def set_replicate_specs(self, replicates: list[dict]) -> None:
+        """Publish replicate geometry and invalidate a mismatched ROI-first cache."""
+        from core.replicates import geometry_hash
+        self.replicate_specs = [{**r, "frac": tuple(r["frac"])}
+                                for r in replicates]
+        if self.cache is not None and \
+                self.cache.meta.get("processing_scope") == "replicate":
+            expected = geometry_hash(self.replicate_specs) \
+                if self.replicate_specs else None
+            if expected != self.cache.meta.get("replicate_geometry_hash"):
+                self.cache.close()
+                self.cache = None
+                self.ctx = None
+                self.sampler = None
+                self.rois = []
+                self.traces = {}
+                self.strengths = {}
+                self.invalidate_series()
+                self.status.emit(
+                    "Replicate geometry changed; run Test/Full again to build "
+                    "a matching ROI-first cache.")
+
     # -- cache ---------------------------------------------------------------
 
     def open_cache(self, key: str) -> None:
@@ -196,6 +222,19 @@ class AppState(QObject):
         self.sampler = None
         cache = cache_mod.open_cache(self.cache_root, key)
         try:
+            if cache.meta.get("processing_scope") == "replicate":
+                from core.replicates import geometry_hash
+                if not self.replicate_specs:
+                    raise ValueError(
+                        "This is a per-replicate cache, but the current video "
+                        "has no replicate boxes. Load its ROI layout first.")
+                current = geometry_hash(self.replicate_specs)
+                cached = cache.meta.get("replicate_geometry_hash")
+                if current != cached:
+                    raise ValueError(
+                        "This cache was built for different replicate geometry. "
+                        "Restore those boxes or run a new cache for the current "
+                        "layout.")
             extras = {
                 name: cache.read(name)
                 for name in cache.feature_names
@@ -210,6 +249,8 @@ class AppState(QObject):
                 bands=extras,
                 band_window_s=float(cache.meta.get("band_window_s", 1.0)),
                 band_hop_s=float(cache.meta.get("band_hop_s", 0.25)),
+                regions=[tuple(t["atlas_bbox"])
+                         for t in cache.meta.get("replicate_tiles", [])] or None,
             )
         except Exception:
             cache.close()
@@ -230,7 +271,8 @@ class AppState(QObject):
         self.cache_opened.emit()
         self.status.emit(
             f"Cache open: {self.cache.n_frames} frames, "
-            f"{self.cache.grid[0]}x{self.cache.grid[1]} blocks, "
+            f"{len(self.cache.meta.get('replicate_tiles', [])) or 1} region(s), "
+            f"{self.cache.grid[0]}x{self.cache.grid[1]} packed blocks, "
             f"{cache_mod.human_bytes(self.cache.size_on_disk())} on disk"
         )
 

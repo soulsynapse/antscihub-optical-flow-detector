@@ -1,11 +1,11 @@
 """Declarative feature registry.
 
-Adding a feature is a matter of registering it here, not editing the UI. Tabs 2
-and 3 build their histogram panels by iterating the registry, so a new entry
-shows up as a new opt-in histogram automatically.
+Adding a feature is a matter of registering it here, not editing the UI. The
+inspectors and Behavior Classification build their feature choices from the
+registry, so a new entry becomes available automatically.
 
-Every feature declares whether it is CACHED (written to disk during the Tab 1
-pass) or DERIVED (recomputed on demand from cached arrays, memoized in RAM for
+Every feature declares whether it is CACHED (written during processing) or
+DERIVED (recomputed on demand from cached arrays, memoized in RAM for
 the session). The rule for which is which:
 
   Cache it if it is fundamental, or expensive to recompute from scratch.
@@ -42,8 +42,8 @@ class FeatureSpec:
     units: str
     kind: Kind
     # "spatial" features have a value per block per frame and are meaningful as
-    # a pixel-space overlay in Tab 2. "temporal" features characterize a time
-    # series and only mean something over a window (Tab 3's domain).
+    # a spatial overlay. "temporal" features characterize a time series and only
+    # mean something over a window (Behavior Classification's domain).
     domain: Domain
     compute: Callable[["FeatureContext"], np.ndarray] | None = None
     deps: tuple[str, ...] = ()
@@ -57,7 +57,7 @@ class FeatureSpec:
 class FeatureContext:
     """The cached arrays a derived feature is allowed to read.
 
-    Holds a (possibly partial) time slice so Tab 2 can compute a derived feature
+    Holds a (possibly partial) time slice so a view can compute a derived feature
     over just the frames it is showing, rather than the whole clip.
     """
 
@@ -66,7 +66,8 @@ class FeatureContext:
                  bands: dict[str, np.ndarray] | None = None,
                  band_times_s: np.ndarray | None = None,
                  t0: int = 0,
-                 band_window_s: float = 1.0, band_hop_s: float = 0.25):
+                 band_window_s: float = 1.0, band_hop_s: float = 0.25,
+                 regions: list[tuple[int, int, int, int]] | None = None):
         self.u = u.astype(np.float32, copy=False)
         self.v = v.astype(np.float32, copy=False)
         self.speed = speed.astype(np.float32, copy=False)
@@ -79,6 +80,7 @@ class FeatureContext:
         # custom band lands on the same window axis as any cached band.
         self.band_window_s = band_window_s
         self.band_hop_s = band_hop_s
+        self.regions = regions or [(0, 0, speed.shape[1], speed.shape[2])]
         self.n_band_windows = next(
             (arr.shape[0] for arr in self.bands.values()), None)
         self._memo: dict[str, np.ndarray] = {}
@@ -98,8 +100,8 @@ class FeatureContext:
 
         A feature that is present on disk always wins over its derived
         implementation, even if the registry marks it "derived". That is how the
-        opt-in cache expansions pay off: enabling `cache_coherence` in Tab 1 does
-        not change what coherence *means*, only where it comes from.
+        opt-in cache expansions pay off: caching a derived feature during the
+        processing pass does not change what it *means*, only where it comes from.
         """
         if name == "u":
             return self.u
@@ -115,8 +117,8 @@ class FeatureContext:
         # Band power for an arbitrary band, computed per block on demand from the
         # cached speed series and memoized. This is what makes band power behave
         # like every other derived feature -- you can ask for any pass-band in
-        # Tab 3 without having cached it in Tab 1. The per-block plane returned
-        # here is the single source of truth: the video overlay thresholds it,
+        # Behavior Classification without having cached it. The per-block plane
+        # returned here is the single source of truth: the video overlay thresholds it,
         # and a replicate's ROI series is the max of it over the box, so a box's
         # ethogram bar is on exactly when one of its blocks is lit on the video.
         band = _parse_band(name)
@@ -131,7 +133,7 @@ class FeatureContext:
         if spec.kind == "cached":
             raise KeyError(
                 f"Feature '{name}' can only come from the cache, and this cache "
-                f"does not contain it. Re-run Tab 1 with it enabled."
+                f"does not contain it. Re-run Preprocessing & Flow with it enabled."
             )
         if spec.kind == "roi":
             raise KeyError(
@@ -222,24 +224,26 @@ def _coherence(ctx: FeatureContext) -> np.ndarray:
     return (_net_speed(ctx) / (ctx.speed + _EPS)).clip(0.0, 1.0).astype(np.float32)
 
 
-def _median3(arr: np.ndarray) -> np.ndarray:
-    """Spatial 3x3 median on the block grid, kept explicit and inspectable."""
-    out = np.empty_like(arr, dtype=np.float32)
-    for t in range(arr.shape[0]):
-        out[t] = cv2.medianBlur(np.asarray(arr[t], np.float32), 3)
+def _median3(arr: np.ndarray, regions) -> np.ndarray:
+    """Spatial 3x3 median independently inside each replicate tile."""
+    out = np.zeros_like(arr, dtype=np.float32)
+    for y0, x0, y1, x1 in regions:
+        sub = np.asarray(arr[:, y0:y1, x0:x1], np.float32)
+        for t in range(arr.shape[0]):
+            out[t, y0:y1, x0:x1] = cv2.medianBlur(sub[t], 3)
     return out
 
 
 def _median3_u(ctx: FeatureContext) -> np.ndarray:
-    return _median3(ctx.u)
+    return _median3(ctx.u, ctx.regions)
 
 
 def _median3_v(ctx: FeatureContext) -> np.ndarray:
-    return _median3(ctx.v)
+    return _median3(ctx.v, ctx.regions)
 
 
 def _median3_speed(ctx: FeatureContext) -> np.ndarray:
-    return _median3(ctx.speed)
+    return _median3(ctx.speed, ctx.regions)
 
 
 def _median3_net_speed(ctx: FeatureContext) -> np.ndarray:
@@ -254,33 +258,43 @@ def _texture_percentile(ctx: FeatureContext) -> np.ndarray:
     continuous; no alpha or binary mask is baked into the cache.
     """
     texture = np.asarray(ctx.get("texture_min_eigen"), dtype=np.float32)
-    out = np.empty_like(texture, dtype=np.float32)
-    flat = texture.reshape(texture.shape[0], -1)
-    out_flat = out.reshape(out.shape[0], -1)
-    n = flat.shape[1]
-    if n == 0:
-        return out
-    for t in range(flat.shape[0]):
-        ordered = np.sort(flat[t])
-        # Right-sided empirical CDF matches the strict mask rule x < q_alpha:
-        # values tied at the quantile itself are retained rather than split by
-        # an arbitrary rank ordering.
-        out_flat[t] = np.searchsorted(ordered, flat[t], side="right") / n
+    out = np.zeros_like(texture, dtype=np.float32)
+    for y0, x0, y1, x1 in ctx.regions:
+        flat = texture[:, y0:y1, x0:x1].reshape(texture.shape[0], -1)
+        n = flat.shape[1]
+        if n == 0:
+            continue
+        for t in range(flat.shape[0]):
+            ordered = np.sort(flat[t])
+            # Right-sided empirical CDF matches the strict mask rule x < q_alpha:
+            # values tied at the quantile itself are retained rather than split.
+            ranks = np.searchsorted(ordered, flat[t], side="right") / n
+            out[t, y0:y1, x0:x1] = ranks.reshape(y1 - y0, x1 - x0)
     return out
 
 
 def _divergence(ctx: FeatureContext) -> np.ndarray:
     """du/dx + dv/dy on the block grid. Positive = expansion (looming/spreading)."""
-    du_dx = np.gradient(ctx.u, axis=2)
-    dv_dy = np.gradient(ctx.v, axis=1)
-    return (du_dx + dv_dy).astype(np.float32)
+    out = np.zeros_like(ctx.u, dtype=np.float32)
+    for y0, x0, y1, x1 in ctx.regions:
+        u = ctx.u[:, y0:y1, x0:x1]
+        v = ctx.v[:, y0:y1, x0:x1]
+        du_dx = np.gradient(u, axis=2) if u.shape[2] > 1 else np.zeros_like(u)
+        dv_dy = np.gradient(v, axis=1) if v.shape[1] > 1 else np.zeros_like(v)
+        out[:, y0:y1, x0:x1] = du_dx + dv_dy
+    return out
 
 
 def _curl(ctx: FeatureContext) -> np.ndarray:
     """dv/dx - du/dy on the block grid. Nonzero = rotation."""
-    dv_dx = np.gradient(ctx.v, axis=2)
-    du_dy = np.gradient(ctx.u, axis=1)
-    return (dv_dx - du_dy).astype(np.float32)
+    out = np.zeros_like(ctx.v, dtype=np.float32)
+    for y0, x0, y1, x1 in ctx.regions:
+        u = ctx.u[:, y0:y1, x0:x1]
+        v = ctx.v[:, y0:y1, x0:x1]
+        dv_dx = np.gradient(v, axis=2) if v.shape[2] > 1 else np.zeros_like(v)
+        du_dy = np.gradient(u, axis=1) if u.shape[1] > 1 else np.zeros_like(u)
+        out[:, y0:y1, x0:x1] = dv_dx - du_dy
+    return out
 
 
 def _rolling(arr: np.ndarray, win: int, fn: str) -> np.ndarray:
@@ -342,13 +356,18 @@ def _rel_speed(ctx: FeatureContext) -> np.ndarray:
     ratio keeps a still scene near 1 because its numerator never leaves background.
 
     Background is spatial and per-frame, so this is well-defined on the partial
-    time slices Tab 2 shows -- no dependence on window length or clip position.
+    time slices the UI shows -- no dependence on window length or clip position.
     """
     rm = ctx.get("rolling_mean_speed")            # (T, ny, nx)
     T = rm.shape[0]
-    bg = np.percentile(rm.reshape(T, -1), _REL_BG_PCT, axis=1).astype(np.float32)
-    denom = bg + np.float32(_REL_BG_FLOOR)
-    return (rm / denom[:, None, None]).astype(np.float32)
+    out = np.zeros_like(rm, dtype=np.float32)
+    for y0, x0, y1, x1 in ctx.regions:
+        sub = rm[:, y0:y1, x0:x1]
+        bg = np.percentile(sub.reshape(T, -1), _REL_BG_PCT,
+                           axis=1).astype(np.float32)
+        denom = bg + np.float32(_REL_BG_FLOOR)
+        out[:, y0:y1, x0:x1] = sub / denom[:, None, None]
+    return out
 
 
 def _welch_psd(x: np.ndarray, fps: float, nperseg: int

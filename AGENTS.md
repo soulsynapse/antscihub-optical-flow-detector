@@ -1,7 +1,8 @@
 # Notes for agents — working in this repo
 
-How to *interact with* this project. Says nothing about what the project does
-(it's changing too fast to document); see the code and `HANDOFF.md` for that.
+How to *interact with* this project. For the current architecture and rationale,
+see `README.md` and `docs/decisions.md`; historical handoffs are under
+`docs/archive/` and are not current implementation contracts.
 
 ## Running / driving the GUI
 
@@ -43,13 +44,14 @@ How to *interact with* this project. Says nothing about what the project does
   another's change, wire it through a state signal, not a direct call.
 - **Per-video data lives in sidecar files next to the video**, via
   `AppState.video_sidecar(kind)` → `<video-path-without-ext>.<kind>.json`
-  (returns `None` when no video loaded). Current kinds: `rois` (Tab 2 replicate
+  (returns `None` when no video loaded). Current kinds: `rois` (Tab 1 replicate
   boxes) and `marks` (Tab 3 manual ground-truth spans). Both auto-load on
   `video_loaded` and auto-save on edit. Root-level `marks.json` / `replicates.json`
   are legacy and no longer read.
 - **Feature caches** are separate from that: keyed by
-  `(video_hash, preprocessing, flow)` under `.cache/<key>/`, opened *by hand* in
-  Tab 1 (nothing auto-opens a cache on video load). `load_video` drops the prior
+  `(video_hash, replicate geometry, preprocessing, flow)` under `.cache/<key>/`,
+  opened *by hand* in Tab 2 (nothing auto-opens a cache on video load).
+  `load_video` drops the prior
   clip's cache so a new video starts uncached.
 
 ## Git conventions
