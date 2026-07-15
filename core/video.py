@@ -174,7 +174,12 @@ class ReplicateVideoSource:
         for i, tile in enumerate(layout.tiles):
             x0, y0, x1, y1 = tile.source_box
             filters.append(
-                f"[v{i}]crop={x1-x0}:{y1-y0}:{x0}:{y0},"
+                # exact=1 forbids FFmpeg from silently rounding an odd-coordinate
+                # crop to an even boundary. Without it, an odd x0/y0 shifts the
+                # window by up to a whole source pixel, and that sub-pixel offset
+                # -- inconsistent frame to frame -- is read by dense flow as real
+                # translation, which per-frame CLAHE at the box edge then amplifies.
+                f"[v{i}]crop={x1-x0}:{y1-y0}:{x0}:{y0}:exact=1,"
                 f"scale={tile.work_width}:{tile.work_height}:flags=area,"
                 f"format=gray,pad={self.width}:ih:0:0[p{i}]")
             outputs.append(f"[p{i}]")

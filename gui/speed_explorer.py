@@ -27,6 +27,8 @@ import os
 import cv2
 import numpy as np
 
+from core.replicates import block_weight_plane
+
 from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QKeySequence, QPainter, QPen, QPolygonF,
                          QShortcut)
@@ -587,19 +589,24 @@ class SpeedExplorer(QWidget):
         """
         thr = self.threshold
         largest = np.zeros(self.T, np.float32)
+        # Valid-area weights so a one-pixel-tall edge sliver is not counted as a
+        # full block -- mirrors the same discount in roi_detection.
+        weight_plane = block_weight_plane(self.meta)
         # Components may never bridge two packed replicate tiles. This mirrors
         # roi_detection, which applies its spatial gate inside one replicate.
         for region in self._active_regions():
             y0, x0, y1, x1 = region["atlas_bbox"]
+            w_flat = weight_plane[y0:y1, x0:x1].reshape(-1)
             for t in range(self.T):
                 m = (self.speed[t, y0:y1, x0:x1] > thr).astype(np.uint8)
                 if not m.any():
                     continue
-                n_lab, _, stats, _ = cv2.connectedComponentsWithStats(
+                n_lab, labels, _, _ = cv2.connectedComponentsWithStats(
                     m, connectivity=8)
                 if n_lab > 1:
-                    largest[t] = max(
-                        largest[t], float(stats[1:, cv2.CC_STAT_AREA].max()))
+                    areas = np.bincount(labels.reshape(-1), weights=w_flat,
+                                        minlength=n_lab)
+                    largest[t] = max(largest[t], float(areas[1:].max()))
         self.plots["clump"].set_series(largest)
 
     # -- control handlers ----------------------------------------------------

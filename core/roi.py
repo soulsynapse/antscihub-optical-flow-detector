@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from core.replicates import block_weight_plane
+
 
 @dataclass
 class ROIParams:
@@ -578,6 +580,14 @@ def roi_detection(cache, ctx, behavior, roi: ROI
     if total_blocks == 0:
         return np.zeros(n_t, bool), np.zeros(n_t, np.float32)
 
+    # Every block count below is in valid-area units: a full block weighs 1, a
+    # partial edge block only its fraction, so a row of one-pixel edge slivers no
+    # longer masquerades as a real clump. min_blocks/min_fraction are therefore
+    # read as full-block-equivalents -- the natural reading of "how much area".
+    weights = block_weight_plane(cache.meta)[y0:y1, x0:x1].astype(np.float32)
+    weights = weights * sub_mask
+    total_weight = max(float(weights.sum()), 1e-6)
+
     leaves = [c for c in behavior.spec.children
               if isinstance(c, RangeLeaf) and c.enabled]
     if not leaves:
@@ -598,8 +608,9 @@ def roi_detection(cache, ctx, behavior, roi: ROI
     passing &= sub_mask[None, :, :]
 
     sp = behavior.spatial
-    counts = passing.reshape(n_t, -1).sum(axis=1).astype(np.float32)
-    strength = counts / max(1, total_blocks)
+    counts = (passing * weights[None, :, :]).reshape(n_t, -1).sum(axis=1) \
+        .astype(np.float32)
+    strength = counts / total_weight
 
     # Spatial gate: largest merged clump must reach min_blocks.
     need_cc = sp.min_blocks > 1 or sp.merge_distance > 0
@@ -609,7 +620,8 @@ def roi_detection(cache, ctx, behavior, roi: ROI
             r = sp.merge_distance
             kernel = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-        largest = np.zeros(n_t, np.int32)
+        w_flat = weights.reshape(-1)
+        largest = np.zeros(n_t, np.float32)
         for t in range(n_t):
             pm = passing[t]
             if not pm.any():
@@ -617,12 +629,17 @@ def roi_detection(cache, ctx, behavior, roi: ROI
             m = pm.astype(np.uint8)
             if kernel is not None:
                 m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
-            n_lab, _, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+            n_lab, labels, _, _ = cv2.connectedComponentsWithStats(
+                m, connectivity=8)
             if n_lab > 1:
-                largest[t] = int(stats[1:, cv2.CC_STAT_AREA].max())
+                # Component "area" is the sum of its blocks' valid-area weights,
+                # not the raw block count -- a thin edge component is discounted.
+                areas = np.bincount(labels.reshape(-1), weights=w_flat,
+                                    minlength=n_lab)
+                largest[t] = float(areas[1:].max())
         clump_ok = largest >= sp.min_blocks
     else:
-        clump_ok = counts >= 1
+        clump_ok = counts > 0
 
     raw = clump_ok & (counts >= sp.min_blocks) & \
         (strength >= sp.min_fraction)

@@ -17,6 +17,8 @@ import hashlib
 import json
 from dataclasses import dataclass
 
+import numpy as np
+
 
 LAYOUT_VERSION = 1
 ATLAS_SEPARATOR_BLOCKS = 1
@@ -179,3 +181,43 @@ def build_layout(replicates: list[dict], src_width: int, src_height: int,
 
 def tiles_from_meta(meta: dict) -> list[dict]:
     return list(meta.get("replicate_tiles", []))
+
+
+def block_weight_plane(meta: dict) -> np.ndarray:
+    """Per-block valid-area weight over the atlas grid: (ny, nx) float32 in (0, 1].
+
+    ``build_layout`` rounds each replicate's block grid up (ceil), so the final
+    row/column of a box can be a fraction of a block tall/wide -- as little as one
+    working pixel. ``reduce_to_blocks`` already averages only the valid pixels, so
+    a sliver block carries a legitimate *value*; but every downstream area count
+    (clump size, passing-block count, strength denominator) treated each block as
+    a full unit of area, which let a row of one-pixel edge slivers masquerade as a
+    real clump. The weight is that block's valid pixel area over a full block, so a
+    full block is 1.0 and a 1-of-16-px-tall block is 1/16.
+
+    Cells outside any tile (atlas separators) get 0: they own no source pixels and
+    must never contribute area. Legacy full-frame caches have no replicate tiles
+    and no partial blocks, so every block weighs 1.
+    """
+    ny, nx = (int(v) for v in meta["grid"])
+    tiles = meta.get("replicate_tiles")
+    if not tiles:
+        return np.ones((ny, nx), np.float32)
+
+    block = int(meta["block_size"])
+    plane = np.zeros((ny, nx), np.float32)
+    for tile in tiles:
+        ty0, tx0, ty1, tx1 = (int(v) for v in tile["atlas_bbox"])
+        # Absent work dims (older/partial meta) mean we cannot know the remainder,
+        # so assume every block is full -- weight 1, the pre-weighting behaviour.
+        work_w = int(tile.get("work_width", (tx1 - tx0) * block))
+        work_h = int(tile.get("work_height", (ty1 - ty0) * block))
+        # Valid extent of each block row/column: full `block`, except the last,
+        # which spans only the remainder of the box's working dimension. Clip to
+        # [0, block] so malformed meta (more atlas cells than the grid covers)
+        # can never inject a negative weight into a clump-area sum.
+        hs = np.clip(work_h - np.arange(ty1 - ty0) * block, 0, block)
+        ws = np.clip(work_w - np.arange(tx1 - tx0) * block, 0, block)
+        plane[ty0:ty1, tx0:tx1] = \
+            np.outer(hs, ws).astype(np.float32) / float(block * block)
+    return plane
