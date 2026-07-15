@@ -52,9 +52,41 @@ Benchmarked head-to-head against HDF5 on full-clip-shaped data
 write and to cold-seek; **Zarr is 2.3× faster on the ROI time-series read**, which
 is the one access pattern that cannot be cached away (it touches every chunk by
 construction). Scrubbing is a non-issue on both once the read-through chunk cache
-is in place — under 0.1 ms. Zarr also allows reading a partially-written cache
-while the worker thread is still appending, which the test-mode workflow requires
-and HDF5's single-writer model does not. Full reasoning in `core/cache.py`.
+is in place — under 0.1 ms. Zarr also isolates interrupted writes to independent
+chunks; the GUI refuses to open an incomplete cache, but its surviving metadata
+and chunks remain diagnosable. Full reasoning in `core/cache.py`.
+
+### Standardization without destroying the raw signal
+
+The cache-time standardization options are deliberately limited to evidence that
+cannot be recovered without the frames:
+
+- **Forward/backward error is a diagnostic, not a production default.** It
+  computes forward and backward flow at full working
+  resolution, evaluates `||F(x) + B(x + F(x))||` pixelwise, and caches the p90
+  residual per block. It is continuous and unthresholded. Enabling it roughly
+  doubles the number of dense-flow solves; it does not replace `u`, `v`, or
+  `speed`. Leave it off for corpus-scale processing.
+- **Texture strength** runs `cornerMinEigenVal` on each preprocessed frame and
+  caches its block mean. The derived `texture_percentile` feature makes the
+  per-frame low-texture cutoff tunable (`>= 0.25` is the proposed starting point).
+
+Everything cheap remains analysis-time and explicitly named so raw and adjusted
+results can be compared: `median3_*` features and per-replicate speed divided by
+an explicit quiescent-baseline p99. When no clean baseline exists, the automatic
+fallback takes the spatial p25 in every frame and uses the temporal p99 of that
+series as one fixed reference for the whole replicate. It does not renormalize
+each frame independently or pretend the spatial p25 itself is a noise p99.
+
+Each replicate box can also carry source-pixels/mm, body length, and its own
+baseline interval in the per-video ROI sidecar. Physical-unit features account
+for cache downsampling at read time; cached pixel-space values are never modified.
+
+CLAHE remains an opt-in preprocessing mode. OpenCV CLAHE uses fixed parameters
+but derives local tile mappings from every frame; it is spatially local, not a
+time-fixed flat-field correction. This can help uneven/slowly drifting illumination
+but can also amplify low-texture noise, so it should be compared against `off` on
+representative footage instead of enabled blindly.
 
 Honest number: flow data in float16 only compresses **~1.3×**. The mantissa bits
 are near-random. Do not expect compression to rescue an over-large cache; fix that
@@ -97,6 +129,15 @@ per cycle — marginal but real. Anything genuinely faster needs a faster camera
 | Full pass | **~110 min** |
 | Cache on disk | **~550 MB** |
 
+The standardization validation intentionally enabled full-frame forward/backward
+error and texture at block size 4. On a 599-frame (10 s) sample it took 276.8 s
+(~2.2 source frames/s, ~28× slower than real time) and wrote ~289 MB. A naïve
+510-second projection is about 3.9 hours and 14.7 GB for that one video. That
+configuration exists to evaluate the diagnostics; it is not feasible for hundreds
+of hours. The six stored replicate boxes cover only 8.27% of the full frame, so a
+future production path should compute flow in padded replicate crops and keep
+full-frame forward/backward validation as a sampled quality-control pass.
+
 DIS is roughly 1.7× faster than Farnebäck at equal or better quality on subtle
 motion, and is worth trying first if the full pass is too slow.
 
@@ -124,6 +165,9 @@ is still the right fix.
     python scripts/gui_smoke_test.py     # drives the whole GUI offscreen
     python scripts/benchmark_storage.py  # HDF5 vs Zarr
     python scripts/render_tabs.py        # render each tab to screenshots/
+    .venv\Scripts\python.exe scripts\validate_standardization.py \
+      --video Videos\Stabilized\stab_GX010050c2_02_18_26.MP4 \
+      --layout replicates.json --duration 10 --block 4
 
 ## Adding a feature
 

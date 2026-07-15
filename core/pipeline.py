@@ -21,12 +21,14 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+import cv2
 import numpy as np
 
 from core import cache as cache_mod
 from core.config import PipelineConfig
 from core.features import cached_feature_names
-from core.flow import create_backend, reduce_to_blocks
+from core.flow import (create_backend, forward_backward_error,
+                       reduce_scalar_to_blocks, reduce_to_blocks)
 from core.preprocess import Preprocessor, sample_frames_for_background
 from core.video import VideoSource
 
@@ -152,12 +154,18 @@ def run_pipeline(
         if cfg.features.cache_divergence_curl:
             cache.create_array("divergence", (n_flow, ny, nx), dtype)
             cache.create_array("curl", (n_flow, ny, nx), dtype)
+        if cfg.features.cache_fb_error:
+            cache.create_array("fb_error_p90", (n_flow, ny, nx), dtype)
+        if cfg.features.cache_texture:
+            cache.create_array("texture_min_eigen", (n_flow, ny, nx), dtype)
 
         # -- stage 1: streaming flow -----------------------------------------
-        fb = create_backend(cfg.flow)
+        flow_backend = create_backend(cfg.flow)
         buf_u = np.zeros((cache_mod.DEFAULT_CHUNK_FRAMES, ny, nx), np.float32)
         buf_v = np.zeros_like(buf_u)
         buf_s = np.zeros_like(buf_u)
+        buf_fb_error = np.zeros_like(buf_u) if cfg.features.cache_fb_error else None
+        buf_texture = np.zeros_like(buf_u) if cfg.features.cache_texture else None
         buf_at = 0
         write_t0 = 0
 
@@ -169,6 +177,12 @@ def run_pipeline(
             cache.write("u", write_t0, u.astype(dtype))
             cache.write("v", write_t0, v.astype(dtype))
             cache.write("speed", write_t0, s.astype(dtype))
+            if buf_fb_error is not None:
+                cache.write("fb_error_p90", write_t0,
+                            buf_fb_error[:buf_at].astype(dtype))
+            if buf_texture is not None:
+                cache.write("texture_min_eigen", write_t0,
+                            buf_texture[:buf_at].astype(dtype))
             if cfg.features.cache_coherence:
                 coh = np.hypot(u, v) / (s + 1e-6)
                 cache.write("coherence", write_t0,
@@ -182,28 +196,53 @@ def run_pipeline(
             buf_at = 0
 
         prev = None
-        for i, frame in src.iter_frames(0, n_frames):
-            g = pre.apply(frame)
-            if prev is None:
-                # Frame 0 has no predecessor: zero flow, keeping arrays aligned.
-                buf_u[buf_at] = 0.0
-                buf_v[buf_at] = 0.0
-                buf_s[buf_at] = 0.0
-            else:
-                flow = fb.compute(prev, g)
-                u, v, s = reduce_to_blocks(flow, block, fps)
-                buf_u[buf_at], buf_v[buf_at], buf_s[buf_at] = u, v, s
-            prev = g
-            buf_at += 1
+        try:
+            for i, frame in src.iter_frames(0, n_frames):
+                g = pre.apply(frame)
 
-            if buf_at == buf_u.shape[0]:
-                flush()
-            if i % 20 == 0:
-                emit("flow", i + 1, n_frames,
-                     f"Optical flow ({cfg.flow.backend}) at "
-                     f"{pre.width}x{pre.height}")
-        flush()
-        fb.close()
+                if buf_texture is not None:
+                    # Use the same clipped 8-bit intensity representation that
+                    # the CPU flow backends see.  Cache a block-grid mean rather
+                    # than a per-pixel movie: the detector's atomic spatial unit
+                    # is already the block, and a full-resolution texture movie
+                    # would defeat the cache's size contract.
+                    g8 = np.clip(g, 0, 255).astype(np.uint8)
+                    eig = cv2.cornerMinEigenVal(g8, blockSize=3, ksize=3)
+                    buf_texture[buf_at] = reduce_scalar_to_blocks(
+                        eig, block, statistic="mean")
+
+                if prev is None:
+                    # Frame 0 has no predecessor: zero flow, keeping arrays
+                    # aligned.  Its FB error is also zero/undefined; downstream
+                    # temporal criteria make this single sample immaterial.
+                    buf_u[buf_at] = 0.0
+                    buf_v[buf_at] = 0.0
+                    buf_s[buf_at] = 0.0
+                    if buf_fb_error is not None:
+                        buf_fb_error[buf_at] = 0.0
+                else:
+                    flow = flow_backend.compute(prev, g)
+                    u, v, s = reduce_to_blocks(flow, block, fps)
+                    buf_u[buf_at], buf_v[buf_at], buf_s[buf_at] = u, v, s
+                    if buf_fb_error is not None:
+                        backward = flow_backend.compute(g, prev)
+                        err = forward_backward_error(flow, backward)
+                        buf_fb_error[buf_at] = reduce_scalar_to_blocks(
+                            err, block, statistic="p90")
+                prev = g
+                buf_at += 1
+
+                if buf_at == buf_u.shape[0]:
+                    flush()
+                if i % 20 == 0:
+                    extra = " + backward consistency" \
+                        if cfg.features.cache_fb_error else ""
+                    emit("flow", i + 1, n_frames,
+                         f"Optical flow ({cfg.flow.backend}{extra}) at "
+                         f"{pre.width}x{pre.height}")
+            flush()
+        finally:
+            flow_backend.close()
         emit("flow", n_frames, n_frames, "Flow complete")
 
         # -- stage 2: band-power ---------------------------------------------
@@ -213,6 +252,14 @@ def run_pipeline(
     finally:
         src.release()
         cache.close()
+
+    # meta.json exists from the moment construction starts so progress and
+    # failures are inspectable.  Only mark it complete after every backend write
+    # has succeeded and the store has closed; Tab 1 will recompute a cache left
+    # false by cancellation or an exception instead of trying to load missing
+    # arrays from it.
+    cache.meta["complete"] = True
+    cache.write_meta()
 
     return key
 

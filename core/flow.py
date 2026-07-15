@@ -161,6 +161,80 @@ def create_backend(cfg: FlowConfig) -> FlowBackend:
     return _BACKENDS[cfg.backend](cfg)
 
 
+# -- flow diagnostics -------------------------------------------------------
+
+def forward_backward_error(forward: np.ndarray,
+                           backward: np.ndarray) -> np.ndarray:
+    """Pixelwise forward/backward residual in working pixels per frame.
+
+    ``forward`` maps frame t -> t+1 and ``backward`` maps t+1 -> t.  The
+    backward vector must therefore be sampled at x + F(x) before the two vectors
+    are added.  Pixels whose forward endpoint leaves the image are assigned a
+    large finite error rather than NaN/inf so cached histograms remain usable.
+
+    This is deliberately a continuous diagnostic.  The absolute/relative
+    rejection threshold belongs at analysis time and is not baked into the raw
+    cached flow.
+    """
+    if forward.shape != backward.shape or forward.ndim != 3 \
+            or forward.shape[2] != 2:
+        raise ValueError("forward and backward flow must both have shape HxWx2")
+
+    h, w = forward.shape[:2]
+    yy, xx = np.mgrid[:h, :w].astype(np.float32)
+    map_x = xx + forward[..., 0].astype(np.float32, copy=False)
+    map_y = yy + forward[..., 1].astype(np.float32, copy=False)
+    inside = (map_x >= 0.0) & (map_x <= w - 1) & \
+             (map_y >= 0.0) & (map_y <= h - 1)
+
+    bx = cv2.remap(backward[..., 0].astype(np.float32, copy=False),
+                   map_x, map_y, cv2.INTER_LINEAR,
+                   borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+    by = cv2.remap(backward[..., 1].astype(np.float32, copy=False),
+                   map_x, map_y, cv2.INTER_LINEAR,
+                   borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+    err = np.hypot(forward[..., 0] + bx, forward[..., 1] + by).astype(np.float32)
+    cap = np.float32(max(h, w))
+    err[~inside] = cap
+    return np.minimum(err, cap).astype(np.float32, copy=False)
+
+
+def reduce_scalar_to_blocks(values: np.ndarray, block: int,
+                            statistic: str = "mean") -> np.ndarray:
+    """Reduce one pixelwise scalar field to the same block grid as flow.
+
+    ``p90`` is used for forward/backward error so a bad minority is not hidden by
+    a quiet block mean.  Structure tensor strength uses ``mean`` because it is a
+    continuous amount of local image evidence, not an outlier diagnostic.
+    """
+    if values.ndim != 2:
+        raise ValueError("scalar field must have shape HxW")
+    h, w = values.shape
+    ny, nx = h // block, w // block
+    if ny == 0 or nx == 0:
+        raise ValueError(
+            f"Block size {block} is larger than the scalar field ({w}x{h}).")
+    x = values[:ny * block, :nx * block]
+    cells = x.reshape(ny, block, nx, block).transpose(0, 2, 1, 3)
+    cells = cells.reshape(ny, nx, block * block)
+    if statistic == "mean":
+        return cells.mean(axis=2, dtype=np.float32).astype(np.float32)
+    if statistic == "p90":
+        # np.percentile promotes/intermediates aggressively and drove the 5.3K
+        # validation pass above 1 GB RSS. There are only block*block values, so
+        # select the two adjacent order statistics directly and linearly
+        # interpolate exactly as numpy's default percentile method does.
+        rank = 0.9 * (cells.shape[2] - 1)
+        lo, hi = int(np.floor(rank)), int(np.ceil(rank))
+        part = np.partition(cells, (lo, hi), axis=2)
+        if lo == hi:
+            return part[..., lo].astype(np.float32)
+        frac = np.float32(rank - lo)
+        return (part[..., lo] * (1.0 - frac) +
+                part[..., hi] * frac).astype(np.float32)
+    raise ValueError(f"Unknown block statistic: {statistic}")
+
+
 # -- block reduction ---------------------------------------------------------
 
 def reduce_to_blocks(flow: np.ndarray, block: int, fps: float

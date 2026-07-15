@@ -41,6 +41,10 @@ import numpy as np
 DEFAULT_CHUNK_FRAMES = 256
 
 
+class IncompleteCacheError(RuntimeError):
+    """A cache directory exists, but its pipeline run did not finish cleanly."""
+
+
 class FeatureCacheBase(ABC):
     """Common interface. Arrays are (T, ny, nx), time-major."""
 
@@ -174,8 +178,11 @@ class FeatureCacheBase(ABC):
         return total
 
     def write_meta(self) -> None:
-        with open(os.path.join(self.root, "meta.json"), "w") as f:
+        path = os.path.join(self.root, "meta.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.meta, f, indent=2)
+        os.replace(tmp, path)
 
     def __enter__(self):
         return self
@@ -318,12 +325,12 @@ _BACKENDS = {"zarr": ZarrCache, "hdf5": HDF5Cache}
 # Two things the benchmark does not measure also point to Zarr, and they are the
 # reason this is not a close call:
 #
-#   1. Concurrency. Zarr's directory store is a pile of independent chunk files:
-#      the Qt UI thread can read a partially-written cache while the worker
-#      thread is still appending to it. HDF5 is single-writer/single-process, and
-#      h5py serializes all access behind one global lock -- so a UI repaint would
-#      block on the writer. The handoff requires test mode to "jump directly into
-#      Tab 2 with the partial cache," which is exactly this pattern.
+#   1. Failure isolation. Zarr's directory store is a pile of independent chunk
+#      files, so one interrupted write does not truncate a monolithic container.
+#      The GUI opens only caches whose pipeline run completed, but their metadata
+#      and surviving chunks remain inspectable for diagnosis. HDF5 is
+#      single-writer/single-process and a killed writer can leave the whole file
+#      unreadable.
 #
 #   2. Partial-failure survival. If a long pass is killed halfway, a Zarr store
 #      is still readable up to the last written chunk. A truncated HDF5 file is
@@ -372,7 +379,11 @@ def create_cache(cache_root: str, cache_key: str, meta: dict,
     if os.path.exists(root):
         _rmtree_retry(root)
     os.makedirs(root, exist_ok=True)
-    meta = {**meta, "backend": backend}
+    # Presence of meta.json means "inspectable", not "safe to load".  A run can
+    # be cancelled after writing only u/v/speed while metadata already advertises
+    # a later band-power array.  The pipeline flips this only after all writes and
+    # the backend close have succeeded.
+    meta = {**meta, "backend": backend, "complete": False}
     cache = _BACKENDS[backend](root, meta, mode="w")
     cache.write_meta()
     return cache
@@ -383,10 +394,27 @@ def open_cache(cache_root: str, cache_key: str) -> FeatureCacheBase:
     meta_path = os.path.join(root, "meta.json")
     if not os.path.exists(meta_path):
         raise FileNotFoundError(f"No cache at {root}")
-    with open(meta_path) as f:
+    with open(meta_path, encoding="utf-8") as f:
         meta = json.load(f)
     backend = meta.get("backend", STORAGE_CHOICE)
     cache = _BACKENDS[backend](root, meta, mode="r")
+
+    missing = []
+    for name in meta.get("features", []):
+        try:
+            cache.n_frames_of(name)
+        except (KeyError, OSError):
+            missing.append(name)
+    # Caches made before the completion flag was introduced remain compatible
+    # when every advertised array is present.  Explicit false always means the
+    # producing run was cancelled/failed, even if it happened after arrays were
+    # created but before all chunks were written.
+    if meta.get("complete") is False or missing:
+        cache.close()
+        detail = f" Missing arrays: {', '.join(missing)}." if missing else ""
+        raise IncompleteCacheError(
+            f"Cache '{cache_key}' is incomplete and cannot be opened.{detail} "
+            "Run the same Test/Full pass again to replace it.")
 
     # Re-register the band-power features this cache actually holds, so the UI's
     # histogram list reflects the cache rather than the current config.
@@ -409,11 +437,25 @@ def cache_exists(cache_root: str, cache_key: str) -> bool:
     return os.path.exists(os.path.join(cache_dir(cache_root, cache_key), "meta.json"))
 
 
+def cache_is_complete(cache_root: str, cache_key: str) -> bool:
+    """Whether a cache is safe to offer as an alternative to recomputation.
+
+    Legacy caches have no explicit flag; for those, array presence is the best
+    available completion evidence.  New caches must carry ``complete: true``.
+    """
+    try:
+        cache = open_cache(cache_root, cache_key)
+    except (FileNotFoundError, IncompleteCacheError, KeyError, OSError, ValueError):
+        return False
+    cache.close()
+    return True
+
+
 def read_meta(cache_root: str, cache_key: str) -> dict | None:
     p = os.path.join(cache_dir(cache_root, cache_key), "meta.json")
     if not os.path.exists(p):
         return None
-    with open(p) as f:
+    with open(p, encoding="utf-8") as f:
         return json.load(f)
 
 

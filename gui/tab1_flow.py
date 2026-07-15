@@ -12,7 +12,7 @@ import os
 import time
 
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog,
+from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                              QFormLayout, QGroupBox, QHBoxLayout, QLabel,
                              QMessageBox, QProgressBar, QPushButton, QScrollArea,
                              QSpinBox, QVBoxLayout, QWidget)
@@ -230,17 +230,34 @@ class Tab1Flow(QWidget):
         self.compression.currentTextChanged.connect(self._refresh_estimates)
         feat.addRow(labelled(self.compression, "compression"), QLabel("Compression"))
 
+        self.cache_fb_error = QCheckBox(
+            "DIAGNOSTIC: cache forward/backward error (about 2× flow compute)")
+        self.cache_fb_error.setToolTip(
+            "Computes backward flow while both frames are available, evaluates "
+            "the exact pixelwise F(x)+B(x+F(x)) residual, and stores its p90 per "
+            "block as a continuous feature. No rejection threshold is baked in. "
+            "This full-frame diagnostic is disabled by default and is not a "
+            "production setting for long recordings.")
+        self.cache_fb_error.toggled.connect(self._refresh_estimates)
+        feat.addRow(self.cache_fb_error)
+
+        self.cache_texture = QCheckBox(
+            "Cache texture / cornerness evidence (+1 block plane)")
+        self.cache_texture.setToolTip(
+            "Caches the block mean of the structure tensor's smaller eigenvalue. "
+            "Tab 3 also exposes a per-frame texture percentile so q25 remains "
+            "tunable at analysis time.")
+        self.cache_texture.toggled.connect(self._refresh_estimates)
+        feat.addRow(self.cache_texture)
+
         form_lay.addWidget(feat_box)
 
-        # Coherence, divergence, curl, spectral flatness, direction oscillation,
-        # dominant frequency and band power for ANY band are all computed on
-        # demand in Tab 3 from the always-cached u/v/speed -- there is nothing to
-        # pre-enable here, so the old "expand cache" section is gone.
         note = QLabel(
             "The cache stores flow (u, v, speed) plus band power. Everything else "
             "— coherence, divergence, curl, spectral flatness, direction "
-            "oscillation, and band power for any pass-band — is derived on demand "
-            "in Tab 3. Nothing extra to enable here.")
+            "oscillation, spatial median views, relative-noise views, and band "
+            "power for any pass-band — is derived on demand. FB error and texture "
+            "are the exceptions because they require the original frames.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#555; font-size:11px; font-style:italic;")
         form_lay.addWidget(note)
@@ -378,6 +395,8 @@ class Tab1Flow(QWidget):
                 bands=(Band(self.band_lo.value(), self.band_hi.value()),),
                 window_s=self.window_s.value(),
                 hop_s=self.hop_s.value(),
+                cache_fb_error=self.cache_fb_error.isChecked(),
+                cache_texture=self.cache_texture.isChecked(),
                 dtype=self.dtype.currentText(),
                 compression=self.compression.currentText(),
             ),
@@ -469,6 +488,8 @@ class Tab1Flow(QWidget):
 
         rate = (_REF_FPS_AT_1300PX * (_REF_WIDTH / max(1, w)) ** 2
                 * _BACKEND_SPEED.get(cfg.flow.backend, 1.0))
+        if cfg.features.cache_fb_error:
+            rate /= 2.0
         full_s = info.frame_count / max(0.01, rate)
         test_s = min(info.frame_count, self.test_seconds.value() * info.fps) \
             / max(0.01, rate)
@@ -493,6 +514,12 @@ class Tab1Flow(QWidget):
             f"full pass     ~{full_s / 60:.0f} min",
             f"test pass     ~{test_s:.0f} s",
         ]
+        if cfg.features.cache_fb_error:
+            lines += [
+                "",
+                "WARNING: FB error is a full-frame diagnostic.",
+                "Disable it for production-scale cache generation.",
+            ]
         self.estimate_label.setText("\n".join(lines))
 
         test_frames = int(min(info.frame_count,
@@ -567,7 +594,11 @@ class Tab1Flow(QWidget):
         suffix = f"_test{int(round(duration))}s" if test else ""
         key = cfg.cache_key(info.video_hash) + suffix
 
-        if cache_mod.cache_exists(self.state.cache_root, key):
+        if cache_mod.cache_exists(self.state.cache_root, key) and \
+                not cache_mod.cache_is_complete(self.state.cache_root, key):
+            self.state.status.emit(
+                f"Replacing incomplete cache {key} from a cancelled/failed run.")
+        elif cache_mod.cache_exists(self.state.cache_root, key):
             meta = cache_mod.read_meta(self.state.cache_root, key) or {}
             size = human_bytes(sum(
                 os.path.getsize(os.path.join(dp, f))
@@ -666,6 +697,8 @@ class Tab1Flow(QWidget):
         total = 0
         for c in cache_mod.list_caches(self.state.cache_root):
             tag = " [test]" if c.get("test_mode") else ""
+            if c.get("complete") is False:
+                tag += " [incomplete]"
             self.cache_list.addItem(
                 f"{c['key']}{tag}  {os.path.basename(c.get('video_path', '?'))}  "
                 f"{c.get('duration_s', 0):.0f}s  "
@@ -789,4 +822,6 @@ class Tab1Flow(QWidget):
         self.hop_s.setValue(ft.hop_s)
         self.dtype.setCurrentText(ft.dtype)
         self.compression.setCurrentText(ft.compression)
+        self.cache_fb_error.setChecked(ft.cache_fb_error)
+        self.cache_texture.setChecked(ft.cache_texture)
         self._refresh_estimates()

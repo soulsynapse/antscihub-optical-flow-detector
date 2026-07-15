@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass, field, asdict, replace
 from typing import Literal
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 
 # The working resolution the downsample factor targets by default. Chosen so a
 # 5.3K GoPro frame lands near 1328px wide (factor 0.25) and a 1080p frame lands
@@ -114,6 +114,13 @@ class FeatureConfig:
     cache_divergence_curl: bool = False
     cache_spectral_flatness: bool = False
     cache_direction_oscillation: bool = False
+
+    # Standardization diagnostics that genuinely require frame access. Both are
+    # continuous, inspectable fields: analysis-time thresholds remain tunable.
+    # Forward/backward error roughly doubles flow compute, while texture adds one
+    # cheap structure-tensor pass and one block-grid plane to the cache.
+    cache_fb_error: bool = False
+    cache_texture: bool = False
 
     dtype: Literal["float16", "float32"] = "float16"
     compression: Literal["zstd", "lz4", "none"] = "zstd"

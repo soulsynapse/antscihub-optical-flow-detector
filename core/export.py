@@ -118,6 +118,11 @@ def export_hdf5(path: str, cache, ctx, rois: list[ROI], features: list[str],
             g = f.create_group(f"roi_{roi.roi_id:03d}")
             g.attrs["bbox_blocks"] = np.array(roi.bbox)
             g.attrs["note"] = roi.note
+            for name in ("baseline_start_s", "baseline_end_s",
+                         "pixels_per_mm", "body_length_mm"):
+                value = getattr(roi, name, None)
+                if value is not None:
+                    g.attrs[name] = float(value)
             g.create_dataset("mask", data=roi.mask.astype(np.uint8),
                              compression="gzip")
             for fe in features:

@@ -752,7 +752,7 @@ class Tab3Behavior(QWidget):
         feats = sorted(self.current.features())
         try:
             series = {f: self.state.roi_series(roi, f) for f in feats}
-        except KeyError:
+        except (KeyError, ValueError):
             return
         rows = self.current.constraint_status(series, self.state.current_frame)
         self.constraints.set_status(rows, self.current.name)
@@ -768,7 +768,10 @@ class Tab3Behavior(QWidget):
 
     def _features_for_export(self) -> list[str]:
         base = ["speed", "net_speed", "coherence", "angle", "rolling_std_speed"]
-        return base + self.state.band_features
+        if self.current:
+            base += sorted(self.current.features())
+        base += self.state.band_features
+        return list(dict.fromkeys(base))
 
     def _export_ts(self):
         if not self._check_ready():

@@ -18,9 +18,10 @@ import os
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QIcon, QPixmap
-from PyQt6.QtWidgets import (QCheckBox, QFileDialog, QGroupBox, QHBoxLayout,
-                             QInputDialog, QLabel, QListWidget, QListWidgetItem,
-                             QMessageBox, QPushButton, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+                             QGroupBox, QHBoxLayout, QInputDialog, QLabel,
+                             QListWidget, QListWidgetItem, QMessageBox,
+                             QPushButton, QVBoxLayout, QWidget)
 
 from core.roi import rect_roi, roi_psd
 from gui.inspector import PSDPlot, TimeSeriesPlot
@@ -116,6 +117,48 @@ class Tab2Replicates(QWidget):
         to3.clicked.connect(self._go_classify)
         bl.addWidget(to3)
         rl.addWidget(box)
+
+        std_box = QGroupBox("Selected replicate standardization")
+        sf = QFormLayout(std_box)
+        self.use_baseline = QCheckBox("Use an explicitly quiescent interval")
+        self.use_baseline.setToolTip(
+            "The 99th percentile of speed inside this box during the interval "
+            "becomes its noise reference. Pick a period with no real behavior.")
+        sf.addRow(self.use_baseline)
+        self.baseline_start = QDoubleSpinBox()
+        self.baseline_start.setRange(0.0, 1_000_000.0)
+        self.baseline_start.setDecimals(3)
+        self.baseline_start.setSuffix(" s")
+        sf.addRow("baseline start", self.baseline_start)
+        self.baseline_end = QDoubleSpinBox()
+        self.baseline_end.setRange(0.0, 1_000_000.0)
+        self.baseline_end.setDecimals(3)
+        self.baseline_end.setSuffix(" s")
+        sf.addRow("baseline end", self.baseline_end)
+
+        self.pixels_per_mm = QDoubleSpinBox()
+        self.pixels_per_mm.setRange(0.0, 1_000_000.0)
+        self.pixels_per_mm.setDecimals(4)
+        self.pixels_per_mm.setSpecialValueText("unset")
+        self.pixels_per_mm.setToolTip(
+            "Calibration in SOURCE-video pixels per millimetre. Cache "
+            "downsampling is accounted for automatically; raw cached values are "
+            "never converted in place.")
+        sf.addRow("source pixels / mm", self.pixels_per_mm)
+        self.body_length_mm = QDoubleSpinBox()
+        self.body_length_mm.setRange(0.0, 100_000.0)
+        self.body_length_mm.setDecimals(4)
+        self.body_length_mm.setSpecialValueText("unset")
+        sf.addRow("body length (mm)", self.body_length_mm)
+        for w in (self.use_baseline, self.baseline_start, self.baseline_end,
+                  self.pixels_per_mm, self.body_length_mm):
+            # Rebuilding every ROI trace on each intermediate spinbox keystroke
+            # is ruinous on a full clip; commit numeric metadata when editing
+            # finishes. The checkbox is already a discrete action.
+            signal = w.toggled if isinstance(w, QCheckBox) else w.editingFinished
+            signal.connect(self._standardization_changed)
+        rl.addWidget(std_box)
+        self._sync_standardization_controls(None)
 
         insp = QGroupBox("Replicate inspector")
         il = QVBoxLayout(insp)
@@ -233,8 +276,16 @@ class Tab2Replicates(QWidget):
             return
         grid = self.state.cache.grid
         n = self.state.cache.n_frames
-        rois = [rect_roi(r["id"], r["frac"], grid, n, r["label"])
-                for r in self.replicates]
+        rois = []
+        for r in self.replicates:
+            baseline = r.get("baseline_s")
+            rois.append(rect_roi(
+                r["id"], r["frac"], grid, n, r["label"],
+                baseline_start_s=float(baseline[0]) if baseline else None,
+                baseline_end_s=float(baseline[1]) if baseline else None,
+                pixels_per_mm=r.get("pixels_per_mm"),
+                body_length_mm=r.get("body_length_mm"),
+            ))
         self.state.rois = rois
         self.state.invalidate_series()
         self.state.rois_changed.emit()
@@ -255,6 +306,8 @@ class Tab2Replicates(QWidget):
             it.setIcon(QIcon(pm))
             self.list.addItem(it)
         self.list.blockSignals(False)
+        if self.list.currentItem() is None:
+            self._sync_standardization_controls(None)
 
     def _selected_rep(self) -> dict | None:
         it = self.list.currentItem()
@@ -266,8 +319,42 @@ class Tab2Replicates(QWidget):
     def _on_select(self, *_):
         rep = self._selected_rep()
         self.state.selected_roi = rep["id"] if rep else None
+        self._sync_standardization_controls(rep)
         self._redraw_boxes()
         self._refresh_inspector()
+
+    def _sync_standardization_controls(self, rep: dict | None):
+        widgets = (self.use_baseline, self.baseline_start, self.baseline_end,
+                   self.pixels_per_mm, self.body_length_mm)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            enabled = rep is not None
+            for w in widgets:
+                w.setEnabled(enabled)
+            baseline = rep.get("baseline_s") if rep else None
+            self.use_baseline.setChecked(bool(baseline))
+            self.baseline_start.setValue(float(baseline[0]) if baseline else 0.0)
+            self.baseline_end.setValue(float(baseline[1]) if baseline else 0.0)
+            self.pixels_per_mm.setValue(
+                float(rep.get("pixels_per_mm") or 0.0) if rep else 0.0)
+            self.body_length_mm.setValue(
+                float(rep.get("body_length_mm") or 0.0) if rep else 0.0)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+
+    def _standardization_changed(self, *_):
+        rep = self._selected_rep()
+        if rep is None:
+            return
+        rep["baseline_s"] = ([self.baseline_start.value(),
+                              self.baseline_end.value()]
+                             if self.use_baseline.isChecked() else None)
+        rep["pixels_per_mm"] = self.pixels_per_mm.value() or None
+        rep["body_length_mm"] = self.body_length_mm.value() or None
+        self._rebuild_rois()
+        self._autosave()
 
     def _on_view_clicked(self, pt):
         """Click a point on the video -> select the box under it."""

@@ -191,25 +191,31 @@ class AppState(QObject):
     def open_cache(self, key: str) -> None:
         if self.cache is not None:
             self.cache.close()
-        self.cache = cache_mod.open_cache(self.cache_root, key)
-
-        bands = {}
-        for name in self.cache.feature_names:
-            if name.startswith("bandpower_") or name in (
-                    "spectral_flatness", "direction_oscillation", "coherence",
-                    "divergence", "curl"):
-                bands[name] = self.cache.read(name)
-
-        self.ctx = FeatureContext(
-            u=self.cache.read("u"),
-            v=self.cache.read("v"),
-            speed=self.cache.read("speed"),
-            fps=self.cache.fps,
-            block_size=self.cache.block_size,
-            bands=bands,
-            band_window_s=float(self.cache.meta.get("band_window_s", 1.0)),
-            band_hop_s=float(self.cache.meta.get("band_hop_s", 0.25)),
-        )
+        self.cache = None
+        self.ctx = None
+        self.sampler = None
+        cache = cache_mod.open_cache(self.cache_root, key)
+        try:
+            extras = {
+                name: cache.read(name)
+                for name in cache.feature_names
+                if name not in ("u", "v", "speed")
+            }
+            ctx = FeatureContext(
+                u=cache.read("u"),
+                v=cache.read("v"),
+                speed=cache.read("speed"),
+                fps=cache.fps,
+                block_size=cache.block_size,
+                bands=extras,
+                band_window_s=float(cache.meta.get("band_window_s", 1.0)),
+                band_hop_s=float(cache.meta.get("band_hop_s", 0.25)),
+            )
+        except Exception:
+            cache.close()
+            raise
+        self.cache = cache
+        self.ctx = ctx
         self.sampler = FeatureSampler(self.cache, self.ctx)
 
         self.rois = []
@@ -237,11 +243,29 @@ class AppState(QObject):
     def available_features(self) -> list[str]:
         """Everything the current cache can serve, cached or derived."""
         from core.features import REGISTRY
+        from core.roi import roi_feature_available
         if not self.cache:
             return []
-        out = [n for n in ("speed", "u", "v") if n in self.cache.feature_names]
-        out += [n for n, s in REGISTRY.items() if s.kind == "derived"]
-        out += self.band_features
+        out = list(self.cache.feature_names)
+        available = set(out)
+
+        # Add derived features only when all of their cache-time dependencies are
+        # actually present. This keeps texture_percentile out of old caches that
+        # have no texture map, while ordinary u/v/speed derivatives remain free.
+        changed = True
+        while changed:
+            changed = False
+            for name, spec in REGISTRY.items():
+                if spec.kind != "derived" or name in available:
+                    continue
+                if all(dep in available for dep in spec.deps):
+                    out.append(name)
+                    available.add(name)
+                    changed = True
+
+        for name, spec in REGISTRY.items():
+            if spec.kind == "roi" and roi_feature_available(name, self.rois):
+                out.append(name)
         seen, uniq = set(), []
         for n in out:
             if n not in seen:
@@ -319,7 +343,7 @@ class AppState(QObject):
             for roi in self.rois:
                 try:
                     detected, strength = roi_detection(self.cache, self.ctx, b, roi)
-                except KeyError:
+                except (KeyError, ValueError):
                     continue
                 self.traces[(roi.roi_id, b.name)] = detected
                 self.strengths[(roi.roi_id, b.name)] = strength

@@ -13,7 +13,9 @@
       "Flying": "#ff4488",
       "Flying ": "#6ee06e",
       "Flying_wingbeat": "#ffcc33",
-      "Still": "#4ac6ff"
+      "Still": "#4ac6ff",
+      "Flying  ": "#4ac6ff",
+      "wingbeat": "#ffcc33"
     }
   }
 }

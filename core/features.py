@@ -28,9 +28,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Literal
 
+import cv2
 import numpy as np
 
-Kind = Literal["cached", "derived"]
+Kind = Literal["cached", "derived", "roi"]
 Domain = Literal["spatial", "temporal"]
 
 
@@ -132,6 +133,11 @@ class FeatureContext:
                 f"Feature '{name}' can only come from the cache, and this cache "
                 f"does not contain it. Re-run Tab 1 with it enabled."
             )
+        if spec.kind == "roi":
+            raise KeyError(
+                f"Feature '{name}' needs replicate-specific metadata and can "
+                "only be evaluated inside a replicate box."
+            )
         arr = spec.compute(self)
         self._memo[name] = arr
         return arr
@@ -214,6 +220,53 @@ def _coherence(ctx: FeatureContext) -> np.ndarray:
     or a boundary between two things moving oppositely).
     """
     return (_net_speed(ctx) / (ctx.speed + _EPS)).clip(0.0, 1.0).astype(np.float32)
+
+
+def _median3(arr: np.ndarray) -> np.ndarray:
+    """Spatial 3x3 median on the block grid, kept explicit and inspectable."""
+    out = np.empty_like(arr, dtype=np.float32)
+    for t in range(arr.shape[0]):
+        out[t] = cv2.medianBlur(np.asarray(arr[t], np.float32), 3)
+    return out
+
+
+def _median3_u(ctx: FeatureContext) -> np.ndarray:
+    return _median3(ctx.u)
+
+
+def _median3_v(ctx: FeatureContext) -> np.ndarray:
+    return _median3(ctx.v)
+
+
+def _median3_speed(ctx: FeatureContext) -> np.ndarray:
+    return _median3(ctx.speed)
+
+
+def _median3_net_speed(ctx: FeatureContext) -> np.ndarray:
+    return np.hypot(ctx.get("median3_u"), ctx.get("median3_v")).astype(np.float32)
+
+
+def _texture_percentile(ctx: FeatureContext) -> np.ndarray:
+    """Per-frame empirical percentile of block texture, in [0, 1].
+
+    This turns the handoff's ``texture < q_alpha(frame)`` rule into an ordinary,
+    tunable range constraint: keep ``texture_percentile >= alpha``.  It remains
+    continuous; no alpha or binary mask is baked into the cache.
+    """
+    texture = np.asarray(ctx.get("texture_min_eigen"), dtype=np.float32)
+    out = np.empty_like(texture, dtype=np.float32)
+    flat = texture.reshape(texture.shape[0], -1)
+    out_flat = out.reshape(out.shape[0], -1)
+    n = flat.shape[1]
+    if n == 0:
+        return out
+    for t in range(flat.shape[0]):
+        ordered = np.sort(flat[t])
+        # Right-sided empirical CDF matches the strict mask rule x < q_alpha:
+        # values tied at the quantile itself are retained rather than split by
+        # an arbitrary rank ordering.
+        out_flat[t] = np.searchsorted(ordered, flat[t], side="right") / n
+    return out
 
 
 def _divergence(ctx: FeatureContext) -> np.ndarray:
@@ -391,6 +444,18 @@ for _s in [
           help="Mean of per-pixel flow magnitude within the block: total motion "
                "energy, regardless of direction. High for anything moving. "
                "Compare against net_speed to tell translation from oscillation."),
+    _spec(name="fb_error_p90", label="Forward/backward error (block p90)",
+          units="working px/frame", kind="cached", domain="spatial",
+          help="90th percentile within each block of the exact pixelwise "
+               "||F(x)+B(x+F(x))|| residual. Lower is more trustworthy. This is "
+               "continuous and unthresholded; choose the acceptable error in "
+               "the behavior tree (<=1 working pixel/frame is a starting point). "
+               "Requires roughly 2x flow compute."),
+    _spec(name="texture_min_eigen", label="Texture strength (min eigenvalue)",
+          units="OpenCV response", kind="cached", domain="spatial",
+          help="Block mean of cv2.cornerMinEigenVal on the preprocessed frame. "
+               "Low values have weak two-dimensional texture and unreliable "
+               "flow. Prefer texture_percentile for cross-frame thresholds."),
 
     _spec(name="net_speed", label="Net flow magnitude", units="px/s",
           kind="derived", domain="spatial", compute=_net_speed, deps=("u", "v"),
@@ -407,6 +472,32 @@ for _s in [
           help="|mean vector| / mean |vector|. 1 = the whole block moves as one "
                "(translation). 0 = motion that cancels within the block "
                "(oscillation). Low coherence + high speed is the wingbeat corner."),
+    _spec(name="median3_u", label="Median 3x3 flow u", units="px/s",
+          kind="derived", domain="spatial", compute=_median3_u, deps=("u",),
+          help="A visible analysis-time 3x3 median on horizontal block flow. "
+               "Raw u remains available for comparison."),
+    _spec(name="median3_v", label="Median 3x3 flow v", units="px/s",
+          kind="derived", domain="spatial", compute=_median3_v, deps=("v",),
+          help="A visible analysis-time 3x3 median on vertical block flow. "
+               "Raw v remains available for comparison."),
+    _spec(name="median3_speed", label="Median 3x3 mean speed", units="px/s",
+          kind="derived", domain="spatial", compute=_median3_speed,
+          deps=("speed",),
+          help="Spatial median of the cached scalar mean-speed field. This is "
+               "separate from median3_net_speed because mean pixel speed and "
+               "magnitude of the mean vector are not interchangeable."),
+    _spec(name="median3_net_speed", label="Median 3x3 net flow magnitude",
+          units="px/s", kind="derived", domain="spatial",
+          compute=_median3_net_speed, deps=("u", "v"),
+          help="Magnitude after separately median-filtering u and v on the "
+               "block grid. Compare with raw net_speed to see what was removed."),
+    _spec(name="texture_percentile", label="Texture percentile within frame",
+          units="0-1", kind="derived", domain="spatial",
+          compute=_texture_percentile, deps=("texture_min_eigen",),
+          clip_pct=(0.0, 100.0),
+          help="Per-frame empirical percentile of cached texture strength. "
+               "Keeping >=0.25 implements the suggested q25 low-texture mask "
+               "without baking alpha into the cache."),
     _spec(name="divergence", label="Divergence", units="1/s", kind="derived",
           domain="spatial", compute=_divergence, deps=("u", "v"),
           help="du/dx + dv/dy. Positive = expansion, negative = contraction."),
@@ -432,7 +523,37 @@ for _s in [
                "scale changes with contrast. Flying is a few-x elevation (~3-4x) "
                "whether the animal is bright or backlit; a still region stays near "
                "1x. This is the feature to threshold when a speed cutoff won't "
-               "generalize across your boxes."),
+                "generalize across your boxes."),
+
+    # ROI-derived features are evaluated in core.roi because their denominator
+    # or physical calibration belongs to a particular replicate, not the whole
+    # frame. They are still registry entries so the behavior editor can expose
+    # them when the selected boxes carry the required metadata.
+    _spec(name="speed_over_baseline_p99",
+          label="Speed / quiescent baseline p99", units="x baseline p99",
+          kind="roi", domain="spatial", deps=("speed",),
+          help="Per-block speed divided by this replicate's 99th-percentile "
+               "speed during its explicitly selected quiescent baseline. A "
+               "threshold of 3x or 5x is directly interpretable."),
+    _spec(name="speed_over_auto_noise",
+          label="Speed / automatic replicate noise", units="x auto noise",
+          kind="roi", domain="spatial", deps=("speed",),
+          help="Fallback when no clean baseline exists. For each frame, measure "
+               "the spatial p25 across this replicate; its temporal p99 becomes "
+               "ONE fixed reference for the whole replicate. This adapts across "
+               "boxes without renormalizing behavior separately every frame."),
+    _spec(name="speed_mm_s", label="Speed", units="mm/s", kind="roi",
+          domain="spatial", deps=("speed",),
+          help="Cached speed converted at analysis time using this replicate's "
+               "source-pixels/mm calibration. Raw pixel-space speed is unchanged."),
+    _spec(name="net_speed_mm_s", label="Net flow magnitude", units="mm/s",
+          kind="roi", domain="spatial", deps=("net_speed",),
+          help="Net flow converted at analysis time using this replicate's "
+               "source-pixels/mm calibration."),
+    _spec(name="speed_body_lengths_s", label="Speed", units="body lengths/s",
+          kind="roi", domain="spatial", deps=("speed",),
+          help="Mean speed normalized by source-pixels/mm and this replicate's "
+               "body length. Both metadata values remain editable."),
 
     _spec(name="dominant_freq", label="Dominant frequency", units="Hz",
           kind="derived", domain="temporal", compute=_dominant_freq, deps=("speed",),
@@ -482,6 +603,10 @@ def cached_feature_names(cfg) -> list[str]:
         names.append("spectral_flatness")
     if cfg.features.cache_direction_oscillation:
         names.append("direction_oscillation")
+    if cfg.features.cache_fb_error:
+        names.append("fb_error_p90")
+    if cfg.features.cache_texture:
+        names.append("texture_min_eigen")
     return names
 
 

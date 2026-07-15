@@ -74,6 +74,12 @@ class ROI:
     mask: np.ndarray | None = None
     bbox: tuple[int, int, int, int] = (0, 0, 0, 0)  # y0, x0, y1, x1 in blocks
     note: str = ""
+    # Analysis-time standardization metadata. Pixel calibration is expressed in
+    # SOURCE pixels/mm; cache downsampling is accounted for during conversion.
+    baseline_start_s: float | None = None
+    baseline_end_s: float | None = None
+    pixels_per_mm: float | None = None
+    body_length_mm: float | None = None
 
     def duration_s(self, fps: float) -> float:
         return len(self.frames) / fps
@@ -93,11 +99,19 @@ class ROI:
             "first_s": self.first_s(fps),
             "last_s": self.last_s(fps),
             "note": self.note,
+            "baseline_start_s": self.baseline_start_s,
+            "baseline_end_s": self.baseline_end_s,
+            "pixels_per_mm": self.pixels_per_mm,
+            "body_length_mm": self.body_length_mm,
         }
 
 
 def rect_roi(roi_id: int, frac_box: tuple[float, float, float, float],
-             grid: tuple[int, int], n_frames: int, label: str = "") -> ROI:
+             grid: tuple[int, int], n_frames: int, label: str = "",
+             baseline_start_s: float | None = None,
+             baseline_end_s: float | None = None,
+             pixels_per_mm: float | None = None,
+             body_length_mm: float | None = None) -> ROI:
     """Build a rectangular ROI from a box given in frame fractions (x0,y0,x1,y1).
 
     Used by the manual replicate tab: the user draws a box over the video, and it
@@ -119,7 +133,11 @@ def rect_roi(roi_id: int, frac_box: tuple[float, float, float, float],
     mask = np.zeros((ny, nx), dtype=bool)
     mask[by0:by1, bx0:bx1] = True
     roi = ROI(roi_id=roi_id, frames=list(range(n_frames)), mask=mask,
-              bbox=(by0, bx0, by1, bx1), note=label)
+              bbox=(by0, bx0, by1, bx1), note=label,
+              baseline_start_s=baseline_start_s,
+              baseline_end_s=baseline_end_s,
+              pixels_per_mm=pixels_per_mm,
+              body_length_mm=body_length_mm)
     return roi
 
 
@@ -295,6 +313,85 @@ def _reassign_stable_ids(new: list[ROI], previous: list[ROI]) -> list[ROI]:
     return new
 
 
+ROI_FEATURES = {
+    "speed_over_baseline_p99",
+    "speed_over_auto_noise",
+    "speed_mm_s",
+    "net_speed_mm_s",
+    "speed_body_lengths_s",
+}
+
+
+def roi_feature_available(feature: str, rois: list[ROI]) -> bool:
+    """Whether every current replicate has metadata required by ``feature``."""
+    if feature not in ROI_FEATURES or not rois:
+        return False
+    if feature == "speed_over_auto_noise":
+        return True
+    if feature == "speed_over_baseline_p99":
+        return all(r.baseline_start_s is not None and
+                   r.baseline_end_s is not None and
+                   r.baseline_end_s > r.baseline_start_s for r in rois)
+    if feature in ("speed_mm_s", "net_speed_mm_s"):
+        return all(r.pixels_per_mm is not None and r.pixels_per_mm > 0
+                   for r in rois)
+    return all(r.pixels_per_mm is not None and r.pixels_per_mm > 0 and
+               r.body_length_mm is not None and r.body_length_mm > 0
+               for r in rois)
+
+
+def _roi_feature_plane(cache, ctx, roi: ROI, feature: str) -> np.ndarray:
+    """A whole-grid feature plane with replicate-specific scaling applied.
+
+    Scaling the whole plane (then cropping it to the box) preserves the spatial
+    shape needed by connected-component criteria while deriving the denominator
+    only from the replicate that owns it.
+    """
+    if feature not in ROI_FEATURES:
+        return ctx.get(feature)
+
+    base_name = "net_speed" if feature == "net_speed_mm_s" else "speed"
+    base = np.asarray(ctx.get(base_name), dtype=np.float32)
+    ys, xs = np.where(roi.mask)
+    if ys.size == 0:
+        return np.zeros_like(base)
+    inside = base[:, ys, xs]
+
+    if feature == "speed_over_baseline_p99":
+        if roi.baseline_start_s is None or roi.baseline_end_s is None or \
+                roi.baseline_end_s <= roi.baseline_start_s:
+            raise ValueError(
+                f"Replicate {roi.roi_id} has no valid quiescent baseline.")
+        i0 = max(0, int(np.floor(roi.baseline_start_s * ctx.fps)))
+        i1 = min(ctx.n_frames, int(np.ceil(roi.baseline_end_s * ctx.fps)))
+        if i1 <= i0:
+            raise ValueError(
+                f"Replicate {roi.roi_id}'s quiescent baseline is outside the clip.")
+        noise = float(np.percentile(inside[i0:i1], 99))
+        return (base / max(noise, 1e-6)).astype(np.float32)
+
+    if feature == "speed_over_auto_noise":
+        floor_by_frame = np.percentile(inside, 25, axis=1).astype(np.float32)
+        # Frame 0 is an alignment sentinel with defined-zero flow, not a noise
+        # observation. Collapse the remaining background series to one constant
+        # per replicate so real temporal changes are not divided away.
+        observed = floor_by_frame[1:] if floor_by_frame.size > 1 else floor_by_frame
+        noise = float(np.percentile(observed, 99)) if observed.size else 0.0
+        return (base / max(noise, 1e-6)).astype(np.float32)
+
+    if roi.pixels_per_mm is None or roi.pixels_per_mm <= 0:
+        raise ValueError(
+            f"Replicate {roi.roi_id} has no source-pixels/mm calibration.")
+    working_px_per_mm = roi.pixels_per_mm * float(cache.meta.get("downsample", 1.0))
+    mm_s = base / max(working_px_per_mm, 1e-12)
+    if feature == "speed_body_lengths_s":
+        if roi.body_length_mm is None or roi.body_length_mm <= 0:
+            raise ValueError(
+                f"Replicate {roi.roi_id} has no body-length calibration.")
+        mm_s = mm_s / roi.body_length_mm
+    return mm_s.astype(np.float32)
+
+
 def roi_time_series(cache, ctx, roi: ROI, feature: str) -> np.ndarray:
     """Mean of a feature over the ROI's blocks, per frame. (T,) float32.
 
@@ -302,17 +399,10 @@ def roi_time_series(cache, ctx, roi: ROI, feature: str) -> np.ndarray:
     series is defined everywhere and you can see what the feature was doing
     before and after the behavior, which is the whole point of the inspector.
     """
-    arr = ctx.get(feature)
-    ys, xs = np.where(roi.mask)
-    if ys.size == 0:
+    vals = roi_block_values(cache, ctx, roi, feature)
+    if vals.shape[1] == 0:
         return np.zeros(ctx.n_frames, np.float32)
-    vals = np.asarray(arr[:, ys, xs], dtype=np.float32).mean(axis=1)
-
-    if arr.shape[0] != ctx.n_frames:
-        # Window-axis feature: resample onto the frame axis for plotting.
-        w_idx = cache.band_frame_index(np.arange(ctx.n_frames))
-        vals = vals[np.clip(w_idx, 0, vals.shape[0] - 1)]
-    return vals.astype(np.float32)
+    return vals.mean(axis=1, dtype=np.float32).astype(np.float32)
 
 
 def _band_windows_to_frames(cache, ctx, n_win: int, n_frames: int) -> np.ndarray:
@@ -420,7 +510,7 @@ def roi_block_values(cache, ctx, roi: ROI, feature: str) -> np.ndarray:
     ys, xs = np.where(roi.mask)
     if ys.size == 0:
         return np.zeros((ctx.n_frames, 0), np.float32)
-    arr = ctx.get(feature)
+    arr = _roi_feature_plane(cache, ctx, roi, feature)
     if arr.shape[0] != ctx.n_frames:
         idx = _band_windows_to_frames(cache, ctx, arr.shape[0], ctx.n_frames)
         vals = arr[idx][:, ys, xs]
@@ -467,7 +557,7 @@ def roi_detection(cache, ctx, behavior, roi: ROI
     # for why not a bbox-restricted computation).
     passing = np.ones((n_t, y1 - y0, x1 - x0), dtype=bool)
     for leaf in leaves:
-        arr = ctx.get(leaf.feature)
+        arr = _roi_feature_plane(cache, ctx, roi, leaf.feature)
         if arr.shape[0] != n_t:
             idx = _band_windows_to_frames(cache, ctx, arr.shape[0], n_t)
             sub = np.asarray(arr[idx][:, y0:y1, x0:x1], np.float32)
