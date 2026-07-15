@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.cache/
+Videos/
+*.csv
+*.h5
+screenshots/
+HANDOFF.md

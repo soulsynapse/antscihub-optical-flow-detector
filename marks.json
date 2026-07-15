@@ -1,0 +1,19 @@
+{
+  "marks": {
+    "spans": {
+      "1": [
+        [
+          4.518622646944591,
+          4.905607961796269,
+          "Still"
+        ]
+      ]
+    },
+    "colors": {
+      "Flying": "#ff4488",
+      "Flying ": "#6ee06e",
+      "Flying_wingbeat": "#ffcc33",
+      "Still": "#4ac6ff"
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "name": "wingbeat",
+  "color": "#ffcc33",
+  "notes": "Bundled example. High band power at the wingbeat frequency, low angular coherence (the stroke reverses within the block), and low net flow (the animal is not walking). Retune the band-power threshold on the histogram for your footage -- it is in (px/s)^2/Hz and scales with resolution.",
+  "spec": {
+    "kind": "node",
+    "op": "and",
+    "children": [
+      {
+        "kind": "leaf",
+        "feature": "bandpower_12-24Hz",
+        "lo": 50.0,
+        "hi": Infinity,
+        "enabled": true
+      },
+      {
+        "kind": "leaf",
+        "feature": "coherence",
+        "lo": 0.0,
+        "hi": 0.5,
+        "enabled": true
+      },
+      {
+        "kind": "leaf",
+        "feature": "net_speed",
+        "lo": 0.0,
+        "hi": 15.0,
+        "enabled": true
+      }
+    ]
+  },
+  "criteria": {
+    "min_duration_s": 0.3,
+    "max_gap_s": 0.15,
+    "smooth_s": 0.0
+  },
+  "spatial": {
+    "min_blocks": 1,
+    "min_fraction": 0.0,
+    "merge_distance": 0
+  }
+}
