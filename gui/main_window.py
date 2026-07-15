@@ -47,6 +47,7 @@ class MainWindow(QMainWindow):
 
         self.state.status.connect(self.status.setText)
         self.state.cache_opened.connect(self._on_cache_opened)
+        self.state.video_loaded.connect(self._on_video_loaded)
         self.state.request_tab.connect(self.tabs.setCurrentIndex)
 
         self._menu()
@@ -110,6 +111,14 @@ class MainWindow(QMainWindow):
     def _on_cache_opened(self):
         self.tabs.setTabEnabled(1, True)
         self.tabs.setTabEnabled(2, True)
+
+    def _on_video_loaded(self):
+        # A freshly loaded video has no cache yet (it was dropped in load_video),
+        # so Tabs 2 and 3 are meaningless until it is cached in Tab 1. Disable
+        # them and return to Tab 1, mirroring the initial state.
+        self.tabs.setTabEnabled(1, False)
+        self.tabs.setTabEnabled(2, False)
+        self.tabs.setCurrentIndex(0)
 
     def _about(self):
         QMessageBox.about(

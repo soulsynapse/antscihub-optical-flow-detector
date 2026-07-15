@@ -131,8 +131,47 @@ class Tab2Replicates(QWidget):
 
         lay.addWidget(right, 1)
 
+        state.video_loaded.connect(self._on_video_loaded)
         state.cache_opened.connect(self._on_cache_opened)
         state.frame_changed.connect(self._on_frame_changed)
+
+    # -- per-video persistence ----------------------------------------------
+
+    def _on_video_loaded(self):
+        # A new clip: forget the previous clip's boxes and load THIS video's own
+        # sidecar (if any). This is what stops boxes ghosting across videos.
+        self._load_sidecar()
+
+    def _load_sidecar(self):
+        path = self.state.video_sidecar("rois")
+        self.replicates = []
+        self._next_id = 1
+        if path and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                self.replicates = [{**r, "frac": tuple(r["frac"])}
+                                   for r in data.get("replicates", [])]
+                self._next_id = max(
+                    [r["id"] for r in self.replicates], default=0) + 1
+            except (OSError, ValueError) as e:
+                self.state.status.emit(f"Could not read boxes: {e}")
+        self._rebuild_rois()
+        self._refresh_list()
+        self._redraw_boxes()
+
+    def _autosave(self):
+        """Persist the current boxes to this video's sidecar. Called on every
+        edit so the boxes are always attached to the clip -- there is no separate
+        'save' step to forget."""
+        path = self.state.video_sidecar("rois")
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                json.dump({"replicates": self.replicates}, f, indent=2)
+        except OSError as e:
+            self.state.status.emit(f"Could not save boxes: {e}")
 
     # -- cache ---------------------------------------------------------------
 
@@ -161,6 +200,7 @@ class Tab2Replicates(QWidget):
         self._rebuild_rois()
         self._refresh_list()
         self._redraw_boxes()
+        self._autosave()
         self.list.setCurrentRow(self.list.count() - 1)
 
     def _on_box_drawn(self, x0: float, y0: float, x1: float, y1: float):
@@ -254,6 +294,7 @@ class Tab2Replicates(QWidget):
             self._rebuild_rois()
             self._refresh_list()
             self._redraw_boxes()
+            self._autosave()
 
     def _delete(self):
         rep = self._selected_rep()
@@ -263,6 +304,7 @@ class Tab2Replicates(QWidget):
         self._rebuild_rois()
         self._refresh_list()
         self._redraw_boxes()
+        self._autosave()
 
     def _clear(self):
         if not self.replicates:
@@ -273,6 +315,7 @@ class Tab2Replicates(QWidget):
             self._rebuild_rois()
             self._refresh_list()
             self._redraw_boxes()
+            self._autosave()
 
     # -- inspector -----------------------------------------------------------
 
@@ -308,19 +351,26 @@ class Tab2Replicates(QWidget):
     # -- io ------------------------------------------------------------------
 
     def _save(self):
+        # Boxes already auto-save to this video's sidecar; this button EXPORTS a
+        # copy (e.g. a plate layout) to reuse on another clip. Default it next to
+        # the video so the common case is one click.
         if not self.replicates:
             QMessageBox.information(self, "Nothing to save", "Draw some boxes first.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save replicate boxes",
-                                              "replicates.json", "JSON (*.json)")
+        default = self.state.video_sidecar("rois") or "replicates.json"
+        path, _ = QFileDialog.getSaveFileName(self, "Export replicate boxes",
+                                              default, "JSON (*.json)")
         if not path:
             return
         with open(path, "w") as f:
             json.dump({"replicates": self.replicates}, f, indent=2)
-        self.state.status.emit(f"Saved {len(self.replicates)} boxes.")
+        self.state.status.emit(f"Exported {len(self.replicates)} boxes.")
 
     def _load(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Load replicate boxes", "",
+        # IMPORT a layout from another clip. It then belongs to THIS video, so we
+        # immediately auto-save it into this video's sidecar.
+        start = os.path.dirname(self.state.video_sidecar("rois") or "") or ""
+        path, _ = QFileDialog.getOpenFileName(self, "Import replicate boxes", start,
                                               "JSON (*.json)")
         if not path:
             return
@@ -332,6 +382,7 @@ class Tab2Replicates(QWidget):
         self._rebuild_rois()
         self._refresh_list()
         self._redraw_boxes()
+        self._autosave()
         self.state.status.emit(f"Loaded {len(self.replicates)} boxes.")
 
     def _go_classify(self):

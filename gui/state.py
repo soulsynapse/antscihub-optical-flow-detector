@@ -126,6 +126,28 @@ class AppState(QObject):
         self._disp_frame = None
         self._disp_idx = -1
 
+        # The previously open cache belongs to the OLD video (caches are keyed by
+        # video hash and only ever opened by hand in Tab 1). If we keep it, the
+        # new clip's boxes get rebuilt onto the old grid and Tab 3 shows traces
+        # computed from the old video's flow under the new video -- a stale
+        # detection. Drop it; the user re-caches the new clip in Tab 1 as usual.
+        if self.cache is not None:
+            self.cache.close()
+        self.cache = None
+        self.ctx = None
+        self.sampler = None
+
+        # ROIs and manual marks are scoped to a specific video (they live in
+        # sidecar files next to it, see video_sidecar). Switching videos must
+        # therefore drop the previous clip's ROIs/traces from memory, or they
+        # would ghost onto the new clip until it is re-cached. The tabs reload
+        # the new video's sidecars off video_loaded / cache_opened.
+        self.rois = []
+        self.selected_roi = None
+        self.traces = {}
+        self.strengths = {}
+        self.invalidate_series()
+
         # Propose a band the footage can actually resolve. A 15-30 Hz default on
         # 60 fps footage would sit on the Nyquist limit and alias.
         band = self.cfg.features.suggest_band(self.source.info.fps)
@@ -133,6 +155,22 @@ class AppState(QObject):
 
         self.video_loaded.emit()
         self.status.emit(self.source.info.describe())
+
+    def video_sidecar(self, kind: str) -> str | None:
+        """Path to a per-video sidecar file, living next to the video and named
+        after it -- e.g. ``.../Foo.mp4`` -> ``.../Foo.rois.json`` for kind
+        ``"rois"``. Returns None when no video is loaded.
+
+        This is what scopes ROIs and manual marks to one clip: open a different
+        video and you get a different sidecar, so nothing carries over from a
+        previous clip. It is deliberately keyed on the video PATH (not its
+        content hash) so a human can see which JSON belongs to which video in
+        the folder, and moving the clip carries its annotations with it.
+        """
+        if self.source is None:
+            return None
+        base, _ = os.path.splitext(self.source.info.path)
+        return f"{base}.{kind}.json"
 
     @property
     def fps(self) -> float:

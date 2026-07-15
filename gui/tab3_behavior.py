@@ -55,11 +55,33 @@ class Tab3Behavior(QWidget):
         self.video.block_clicked.connect(self._on_block_clicked)
         ll.addWidget(self.video, 1)
 
-        ll.addWidget(QLabel("Ethogram — behavior state per ROI"))
+        etho_row = QHBoxLayout()
+        etho_row.addWidget(QLabel(
+            "Ethogram — click a row to inspect; middle-drag a row to mark ground "
+            "truth for the label below:"), 1)
+        etho_row.addWidget(QLabel("Mark as:"))
+        self.mark_label_picker = QComboBox()
+        self.mark_label_picker.setEditable(True)
+        self.mark_label_picker.setMinimumWidth(120)
+        self.mark_label_picker.setToolTip(
+            "Which behavior your middle-drag spans are labelled as. Pick a saved "
+            "behavior, or type a new label (e.g. 'Still'). Each label draws in its "
+            "own colour, so you can lay down Flying spans, switch, and lay down "
+            "Still spans on the same rows.")
+        self.mark_label_picker.currentTextChanged.connect(self._on_mark_label)
+        etho_row.addWidget(self.mark_label_picker)
+        clear_marks_btn = QPushButton("Clear label")
+        clear_marks_btn.setToolTip(
+            "Remove ground-truth spans for the 'Mark as' label. Hold Shift to clear "
+            "ALL labels.")
+        clear_marks_btn.clicked.connect(self._clear_marks_clicked)
+        etho_row.addWidget(clear_marks_btn)
+        ll.addLayout(etho_row)
         self.timeline = TimelineStrip()
         self.timeline.seek_requested.connect(
             lambda t: self.state.set_frame(int(t * self.state.fps)))
         self.timeline.roi_clicked.connect(self._select_roi)
+        self.timeline.marks_changed.connect(self._save_marks)
         ll.addWidget(self.timeline)
         split.addWidget(left)
 
@@ -198,7 +220,98 @@ class Tab3Behavior(QWidget):
         state.cache_opened.connect(self._refresh_library)
         state.rois_changed.connect(self._recompute)
         state.frame_changed.connect(self._on_frame_changed)
+        state.video_loaded.connect(self._on_video_loaded)
         self._refresh_library()
+        self._load_marks()
+        self._refresh_mark_labels()
+
+    def _on_video_loaded(self):
+        # New clip -> load ITS marks (or clear to none if it has none yet) and
+        # drop the previous clip's ethogram rows (state.rois was cleared in
+        # load_video); the rows repopulate when the new video is cached.
+        self._load_marks()
+        self._refresh_timeline()
+
+    # -- ground-truth marks (persisted) --------------------------------------
+
+    # A fallback palette for labels that are not a saved behavior (so a typed
+    # "Still" still gets a stable, distinct colour).
+    _MARK_PALETTE = ["#ff4488", "#4ac6ff", "#ffd24a", "#6ee06e", "#c78bff",
+                     "#ff9d3a", "#00d0b0", "#ff6d6d"]
+
+    def _marks_path(self) -> str | None:
+        # Manual marks live next to the video and are scoped to it (see
+        # AppState.video_sidecar). With no video loaded there is nowhere to save,
+        # and -- importantly -- nothing to load, which is what stops marks from a
+        # previous clip ghosting onto whatever is open now.
+        return self.state.video_sidecar("marks")
+
+    def _save_marks(self):
+        import json
+        path = self._marks_path()
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                json.dump({"marks": self.timeline.marks_to_dict()}, f, indent=2)
+        except OSError as e:
+            self.state.status.emit(f"Could not save marks: {e}")
+
+    def _load_marks(self):
+        import json
+        # Always start from a clean slate: a new clip with no marks file must
+        # show NO marks, not the previous clip's.
+        self.timeline.set_marks_from_dict({})
+        path = self._marks_path()
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                self.timeline.set_marks_from_dict(json.load(f).get("marks", {}))
+        except (OSError, ValueError):
+            pass
+
+    def _label_color(self, label: str) -> str:
+        """A stable colour for a mark label: the behavior's own colour if it is a
+        saved/current behavior, else a palette colour keyed off the name."""
+        if self.current and label == self.current.name:
+            return self.current.color
+        if label in self.timeline.label_colors:
+            return self.timeline.label_colors[label]
+        try:
+            if label in self.state.library.list():
+                return self.state.library.load(label).color
+        except Exception:
+            pass
+        return self._MARK_PALETTE[abs(hash(label)) % len(self._MARK_PALETTE)]
+
+    def _refresh_mark_labels(self):
+        """Populate the 'Mark as' picker with saved behaviors (plus the current
+        one), keeping whatever the user has selected/typed."""
+        cur = self.mark_label_picker.currentText()
+        names = list(self.state.library.list())
+        if self.current and self.current.name not in names:
+            names.insert(0, self.current.name)
+        self.mark_label_picker.blockSignals(True)
+        self.mark_label_picker.clear()
+        self.mark_label_picker.addItems(names)
+        if cur:
+            self.mark_label_picker.setCurrentText(cur)
+        elif self.current:
+            self.mark_label_picker.setCurrentText(self.current.name)
+        self.mark_label_picker.blockSignals(False)
+        self._on_mark_label(self.mark_label_picker.currentText())
+
+    def _on_mark_label(self, label: str):
+        self.timeline.set_active_label(label, self._label_color(label))
+
+    def _clear_marks_clicked(self):
+        from PyQt6.QtWidgets import QApplication
+        mods = QApplication.keyboardModifiers()
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            self.timeline.clear_marks()                       # all labels
+        else:
+            self.timeline.clear_marks(self.mark_label_picker.currentText())
 
     # -- library -------------------------------------------------------------
 
@@ -211,6 +324,8 @@ class Tab3Behavior(QWidget):
         self.lib_picker.clear()
         self.lib_picker.addItems(self.state.library.list())
         self.lib_picker.blockSignals(False)
+        if hasattr(self, "mark_label_picker"):
+            self._refresh_mark_labels()
 
     def _new(self):
         name, ok = QInputDialog.getText(self, "New behavior", "Name:")
@@ -316,6 +431,12 @@ class Tab3Behavior(QWidget):
         self.min_dur.blockSignals(False)
         self.max_gap.blockSignals(False)
         self.smooth.blockSignals(False)
+
+        # Default new ground-truth marks to the behavior now being edited, so
+        # middle-drag "just works" for the obvious case (mark Flying while on
+        # Flying). The user can still switch the 'Mark as' label to something else.
+        if hasattr(self, "mark_label_picker"):
+            self.mark_label_picker.setCurrentText(self.current.name)
 
         root = self._build_item(self.current.spec)
         self.tree.addTopLevelItem(root)
