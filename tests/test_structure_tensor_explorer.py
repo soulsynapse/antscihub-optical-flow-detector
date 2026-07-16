@@ -114,20 +114,41 @@ class StructureTensorExplorerTests(unittest.TestCase):
         try:
             self.assertIn("Structure tensor explorer", explorer.windowTitle())
             self.assertEqual(explorer.n_blocks, 4)
-            # The selected detection channel expands and carries the band; all
-            # other plots stay at the shared base height without a band.
-            frac = explorer.plots["frac"]
-            self.assertTrue(frac.band_active)
-            self.assertEqual(frac.maximumHeight(), MiniPlot.EXPANDED_H)
+            # The selected detection channel (appearance ENERGY -- the fraction
+            # is a band-less diagnostic view) expands and carries the band; all
+            # other plots stay at their class's base height without a band.
+            appear_w = explorer.plots["appear_w"]
+            self.assertTrue(appear_w.band_active)
+            self.assertEqual(appear_w.maximumHeight(), MiniPlot.EXPANDED_H)
             self.assertTrue(all(
-                plot.maximumHeight() == MiniPlot.BASE_H and not plot.band_active
-                for key, plot in explorer.plots.items() if key != "frac"))
+                plot.maximumHeight() == type(plot).BASE_H
+                and not plot.band_active
+                for key, plot in explorer.plots.items() if key != "appear_w"))
             self.assertGreater(explorer.change_floor, 0.0)
             # A fresh band is wide open on both sides: an unset threshold accepts
             # every per-block value, including those above the plotted series max.
             self.assertEqual(explorer._band(), (float("-inf"), float("inf")))
+            # Density-heatmap channels expose the per-frame MAX over owned
+            # blocks as their readout series; the stub's owned blocks are
+            # uniform per frame, so these are also the exact channel values.
             np.testing.assert_allclose(
                 explorer.plots["variance"].y, [0.0, 1.0, 1.0, 1.0])
+            # appearance = change * 0.5 -> owned per-frame [0, 1, 2, 4];
+            # trailing W=2 windowed means give [0, 0.5, 1.5, 3].
+            np.testing.assert_allclose(
+                explorer.plots["appear_w"].y, [0.0, 0.5, 1.5, 3.0])
+            # The change floor comes from OWNED blocks only (median of the
+            # positive owned change values [2,4,8] = 4), never the 999 atlas
+            # separators, which would inflate it to 8 and gate everything.
+            self.assertEqual(explorer.change_floor, 4.0)
+            # Windowed change is [0, 1, 3, 6]: frames 0-2 sit below the floor
+            # and are blanked to NaN (never a solid row at 0); frame 3 passes
+            # and reads appearance/change = 3/6 = 0.5.
+            frac_m = explorer.plots["frac"].matrix
+            self.assertTrue(np.isnan(frac_m[:3]).all())
+            np.testing.assert_allclose(frac_m[3], 0.5, rtol=1e-5)
+            np.testing.assert_allclose(
+                explorer.plots["frac"].y, [0.0, 0.0, 0.0, 0.5], rtol=1e-5)
             np.testing.assert_allclose(
                 explorer.plots["tensor_speed"].y, [0.0, 1.0, 2.5, 3.0])
             np.testing.assert_allclose(
@@ -144,7 +165,7 @@ class StructureTensorExplorerTests(unittest.TestCase):
             self.assertFalse(hasattr(explorer, "thr_slider"))
             self.assertEqual(set(explorer.detect_checks), set(DETECT_TARGETS))
             self.assertTrue(
-                explorer.detect_checks["appearance fraction"].isChecked())
+                explorer.detect_checks["appearance energy"].isChecked())
         finally:
             explorer.close()
 
@@ -156,11 +177,11 @@ class StructureTensorExplorerTests(unittest.TestCase):
             explorer.detect_checks["change energy"].setChecked(True)
             self.assertEqual(explorer.detect, "change energy")
             self.assertFalse(
-                explorer.detect_checks["appearance fraction"].isChecked())
+                explorer.detect_checks["appearance energy"].isChecked())
             change_w = explorer.plots["change_w"]
             self.assertTrue(change_w.band_active)
             self.assertEqual(change_w.maximumHeight(), MiniPlot.EXPANDED_H)
-            self.assertFalse(explorer.plots["frac"].band_active)
+            self.assertFalse(explorer.plots["appear_w"].band_active)
 
             # Owned change energy is uniform per frame ([0, 2, 4, 8]); with the
             # default W=2 trailing window the block field is [0, 1, 3, 6].

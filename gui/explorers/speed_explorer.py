@@ -64,6 +64,7 @@ from gui.video_panel import FrameView
 BG = QColor(24, 24, 24)
 PLOT_BG = QColor(12, 12, 12)
 LINE = QColor(120, 215, 255)
+LINE2 = QColor(255, 170, 80)
 CURSOR = QColor(255, 210, 80)
 TXT = QColor(210, 210, 210)
 TXT_DIM = QColor(140, 140, 140)
@@ -505,20 +506,28 @@ class DensityPlot(MiniPlot):
         self.matrix = np.asarray(m, np.float32)          # (T, K)
         # A per-frame max feeds the cursor readout: for a distribution the
         # single most telling number is the fastest block right now, not a mean.
-        self.y = (self.matrix.max(1) if self.matrix.size
-                  else np.zeros(0, np.float32))
+        # NaN cells mean "this block is not part of the frame's distribution"
+        # (e.g. the tensor explorer's gated appearance-fraction blocks); an
+        # all-NaN frame reads 0 rather than leaking NaN into the readout.
+        if self.matrix.size:
+            y = np.zeros(self.matrix.shape[0], np.float32)
+            has = np.isfinite(self.matrix).any(1)
+            if has.any():
+                y[has] = np.nanmax(self.matrix[has], 1)
+            self.y = y
+        else:
+            self.y = np.zeros(0, np.float32)
         self._img = None
         self._ver += 1
         self.update()
 
     def _data_range(self) -> tuple[float, float]:
         m = self.matrix
-        if m.size == 0:
+        finite = m[np.isfinite(m)]
+        if finite.size == 0:
             return 0.0, 1.0
-        lo = float(np.nanmin(m))
-        hi = float(np.nanmax(m))
-        if not np.isfinite(lo) or not np.isfinite(hi):
-            lo, hi = 0.0, 1.0
+        lo = float(finite.min())
+        hi = float(finite.max())
         if hi <= lo:
             hi = lo + 1.0
         return lo, hi
@@ -532,8 +541,12 @@ class DensityPlot(MiniPlot):
         T, K = self.matrix.shape
         col = np.clip((np.arange(T) * w) // max(1, T), 0, w - 1)
         col_idx = np.repeat(col, K).astype(np.int64)
+        vals = self.matrix.ravel()
+        ok = np.isfinite(vals)
+        if not ok.all():                     # NaN cells are masked-out blocks
+            vals, col_idx = vals[ok], col_idx[ok]
         tlo, thi = self._fwd(lo), self._fwd(hi)
-        frac = (self._fwd(self.matrix.ravel()) - tlo) / max(1e-9, thi - tlo)
+        frac = (self._fwd(vals) - tlo) / max(1e-9, thi - tlo)
         # Row 0 is the top of the plot, so invert: the fastest blocks sit high.
         row = np.clip(((1.0 - frac) * (h - 1)).astype(np.int64), 0, h - 1)
         counts = np.bincount(row * w + col_idx,
