@@ -166,6 +166,11 @@ class StructureTensorExplorer(QWidget):
                          int(self.meta.get("work_height", 1)))
 
         self.win_frames = max(2, min(self.T - 1, int(round(self.fps))))
+        # Detection-sweep integration window (frames). The binary detection
+        # gate reads the trailing MEAN of "# blocks in band" over this window,
+        # so a single-frame spike of N blocks dilutes to N/D and cannot fake a
+        # sustained event. D = 1 reproduces the raw per-frame count.
+        self.sweep_win = max(1, min(self.T - 1, int(round(self.fps))))
         self.detect = "appearance energy"
         self.frame = int(state.current_frame) if state is not None else 0
         self.playing = False
@@ -373,6 +378,8 @@ class StructureTensorExplorer(QWidget):
 
         self.win_slider, self.win_lbl = self._add_slider(
             left, 2, max(3, self.T - 1), self.win_frames, self._on_window)
+        self.sweep_win_slider, self.sweep_win_lbl = self._add_slider(
+            left, 1, max(2, self.T - 1), self.sweep_win, self._on_sweep_window)
 
         note = QLabel(
             "Window W integrates temporal change: amplitude variance = "
@@ -478,6 +485,18 @@ class StructureTensorExplorer(QWidget):
         add("count", "# blocks in band", "blk", SWEEP_C, cls=PixelBarPlot)
         add("fracb", "Fraction of blocks in band", "", SWEEP_C)
         add("clump", "Largest connected clump in band", "blk", SWEEP_C)
+        # The binary gate: trailing mean of the in-band count over D, with its
+        # own always-active band. The min handle is the sustained-evidence
+        # threshold; the max handle can reject whole-replicate artifacts where
+        # every block goes in-band at once (a lighting flash, not a behavior).
+        add("count_w", "Windowed # blocks in band (mean over D)", "blk", SWEEP_C)
+        add("detect", "Positive detection (windowed count in band)", "0/1",
+            QColor(120, 255, 140))
+        count_w = self.plots["count_w"]
+        count_w.band_changed.connect(self._recompute_detect)
+        count_w.band_committed.connect(self._recompute_detect)
+        count_w.set_band_active(True)
+        count_w.set_expanded(True)
 
         section("Value of integration @ cursor (x axis = window length)")
         add("vw_var", "Amplitude variance vs W", "", VW_C, seek=False)
@@ -548,6 +567,42 @@ class StructureTensorExplorer(QWidget):
         count = mask.sum(1).astype(np.float32)
         self.plots["count"].set_series(count)
         self.plots["fracb"].set_series(count / max(1, self.n_blocks))
+        self._recompute_windowed_count(count)
+
+    def _recompute_windowed_count(self, count: np.ndarray | None = None):
+        """Trailing mean of the in-band count over the detection window D.
+
+        Same trailing-window convention as ``_window_bounds`` (the window
+        shortens at the clip start rather than reading the future), so a
+        1-frame spike of N blocks reads N/D once D frames have passed it --
+        sustained evidence is required to clear the min handle.
+        """
+        if count is None:
+            count = self.plots["count"].y
+        if count.size == 0:
+            self.plots["count_w"].set_series(count)
+            self._recompute_detect()
+            return
+        if self.sweep_win <= 1:
+            windowed = count.astype(np.float32)
+        else:
+            c = np.concatenate([[0.0], np.cumsum(count, dtype=np.float64)])
+            hi = np.arange(count.size) + 1
+            lo = np.maximum(0, hi - self.sweep_win)
+            windowed = ((c[hi] - c[lo]) / (hi - lo)).astype(np.float32)
+        self.plots["count_w"].set_series(windowed)
+        self._recompute_detect()
+
+    def _recompute_detect(self):
+        """Binary detection: windowed in-band count inside its own band.
+
+        Cheap (one comparison over a (T,) series), so it runs live while
+        either the channel band or the count band is being dragged.
+        """
+        blo, bhi = self.plots["count_w"].band()
+        y = self.plots["count_w"].y
+        self.plots["detect"].set_series(
+            ((y >= blo) & (y <= bhi)).astype(np.float32))
 
     def _recompute_sweep(self):
         self._recompute_sweep_counts()
@@ -619,6 +674,15 @@ class StructureTensorExplorer(QWidget):
         self.win_lbl.setText(
             f"Integration window W: {self.win_frames} fr "
             f"({self.win_frames * self.dt:.2f} s)")
+        self.sweep_win_lbl.setText(
+            f"Detection window D (count mean): {self.sweep_win} fr "
+            f"({self.sweep_win * self.dt:.2f} s)")
+
+    def _on_sweep_window(self, v):
+        self.sweep_win = max(1, int(v))
+        self._sync_labels()
+        # O(T) on an already-computed series: no debounce needed.
+        self._recompute_windowed_count()
 
     def _on_window(self, v):
         self.win_frames = max(2, int(v))
@@ -675,6 +739,11 @@ class StructureTensorExplorer(QWidget):
         # immediately, the rest lazily.
         for key in self.detect_plot_key.values():
             self.plots[key].band_lo = self.plots[key].band_hi = None
+        # The count band is in blocks and the scope's block count just changed;
+        # it re-seeds wide open on the same principle as the channel bands.
+        count_w = self.plots["count_w"]
+        count_w.band_lo = count_w.band_hi = None
+        count_w.set_band_active(True)
         self._apply_selected_plot_ui()
         self._recompute_sweep()
         self._recompute_value_curve()

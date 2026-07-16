@@ -1,6 +1,6 @@
 # Current design decisions
 
-Status: current as of 2026-07-15. This document describes the live configuration
+Status: current as of 2026-07-16. This document describes the live configuration
 version 3 workflow. The archived handoffs are historical inputs, not overrides.
 
 ## Replicates come before flow
@@ -149,6 +149,47 @@ wrote and cold-sought faster. Each replicate grid is packed into one regular
 time-major atlas so Zarr reads remain efficient. Metadata maps atlas tiles back
 to exact source-frame boxes, and every spatial feature respects those tile
 boundaries.
+
+## Explorers stay partitioned by measurement domain
+
+The three sibling explorers deliberately divide the signal space: the speed
+explorer reads per-frame motion magnitude, the coherent-flow explorer reads the
+flow vector integrated over a window, and the structure tensor explorer reads
+temporal intensity change integrated over a window. Porting speed detection
+into the structure tensor explorer was considered and rejected.
+
+Detection channels in an explorer are per-block density heatmaps with a
+draggable tail band, never spatial means: a replicate is mostly empty space, so
+a mean buries the sparse behaving blocks that are the signal. Bands belong on
+heavy-tailed nonnegative energies where "threshold the tail" is meaningful;
+bounded ratios (appearance fraction, speed disagreement) are kept as band-less
+diagnostic views because a ratio lets a barely-above-floor block at 1.0 outrank
+a real event at 0.7 with a hundred times the energy.
+
+A speed band in the tensor explorer would duplicate the speed explorer as a
+strictly worse copy — its clump sweep lacks the gap-bridged clustering — and
+would create two disconnected speed thresholds with no answer to which one is
+real. It also sits outside the explorer's organizing axis: everything
+detection-related there flows through the integration-window prefix sums, and
+per-frame speed would either silently ignore the window slider or become a
+windowed speed mean, a worse version of what the coherent-flow explorer already
+does by integrating the vector (so opposing motions cancel instead of averaging
+into fake sustained speed). The tensor explorer's existing speed channels
+(tensor vs cached speed and their disagreement) are validation reads that flag
+where brightness-constancy or large-displacement assumptions fail; they mark
+where to distrust the other channels, and overloading them as detection targets
+would blur that role. Processing cost was explicitly *not* a factor: cached
+speed is already loaded there, so a speed heatmap would be nearly free — the
+objection is redundancy and semantics, not compute.
+
+Cross-channel conjunctions ("high appearance energy AND low speed") are the
+behavior tree's job, not an explorer's: explorers calibrate individual
+`RangeLeaf` thresholds, and combination logic composes downstream. For joint
+inspection, the explorers already share AppState frame sync for side-by-side
+use, and frame-indexed CSV export covers offline joint analysis. The one
+accepted follow-up in this space is converting the speed-disagreement channel
+into a density heatmap — its per-block distribution exists nowhere else, unlike
+speed's.
 
 ## User-interface defaults follow the common path
 

@@ -120,10 +120,18 @@ class StructureTensorExplorerTests(unittest.TestCase):
             appear_w = explorer.plots["appear_w"]
             self.assertTrue(appear_w.band_active)
             self.assertEqual(appear_w.maximumHeight(), MiniPlot.EXPANDED_H)
+            # The windowed-count gate carries its own always-active band,
+            # independent of which channel is selected.
+            count_w = explorer.plots["count_w"]
+            self.assertTrue(count_w.band_active)
+            self.assertEqual(count_w.maximumHeight(), MiniPlot.EXPANDED_H)
             self.assertTrue(all(
                 plot.maximumHeight() == type(plot).BASE_H
                 and not plot.band_active
-                for key, plot in explorer.plots.items() if key != "appear_w"))
+                for key, plot in explorer.plots.items()
+                if key not in ("appear_w", "count_w")))
+            # Wide-open count band: every frame is a positive detection.
+            np.testing.assert_array_equal(explorer.plots["detect"].y, 1.0)
             self.assertGreater(explorer.change_floor, 0.0)
             # A fresh band is wide open on both sides: an unset threshold accepts
             # every per-block value, including those above the plotted series max.
@@ -195,6 +203,21 @@ class StructureTensorExplorerTests(unittest.TestCase):
             # pooled clump.
             np.testing.assert_array_equal(
                 explorer.plots["clump"].y, [0, 0, 2, 2])
+            # Detection window D=2 (fps): trailing mean of count [0, 0, 4, 4]
+            # is [0, 0, 2, 4] -- the first in-band frame is diluted by the
+            # quiet frame before it.
+            self.assertEqual(explorer.sweep_win, 2)
+            np.testing.assert_allclose(
+                explorer.plots["count_w"].y, [0.0, 0.0, 2.0, 4.0])
+            # A min handle above the diluted value demands SUSTAINED evidence:
+            # frame 2's momentary 4-block burst reads 2 after integration and
+            # is rejected; only frame 3, where the count has persisted a full
+            # window, detects.
+            count_w = explorer.plots["count_w"]
+            count_w.band_lo, count_w.band_hi = 3.0, float("inf")
+            explorer._recompute_detect()
+            np.testing.assert_array_equal(
+                explorer.plots["detect"].y, [0, 0, 0, 1])
         finally:
             explorer.close()
 
