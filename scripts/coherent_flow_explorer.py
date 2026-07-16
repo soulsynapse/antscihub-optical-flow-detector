@@ -1,6 +1,6 @@
 """Standalone launcher for the coherent-flow integration explorer.
 
-The UI lives in :mod:`gui.coherent_flow_explorer` so it can move into the main
+The UI lives in :mod:`gui.explorers.coherent_flow_explorer` so it can move into the main
 app as a tab without carrying cache-picking or QApplication ownership.
 
 Run:
@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PyQt6.QtWidgets import QApplication, QInputDialog
 
 from core import cache as cache_mod
-from gui.coherent_flow_explorer import CoherentFlowExplorer
+from gui.explorers.coherent_flow_explorer import CoherentFlowExplorer
 
 
 def _pick_cache(cache_root: str) -> str | None:

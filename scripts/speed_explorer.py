@@ -1,6 +1,6 @@
 """Standalone launcher for the embeddable speed-explorer widget.
 
-The UI lives in :mod:`gui.speed_explorer` so it can move into the main app
+The UI lives in :mod:`gui.explorers.speed_explorer` so it can move into the main app
 without keeping cache-picking or QApplication ownership in the eventual tab.
 
 Run:
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PyQt6.QtWidgets import QApplication, QInputDialog
 
 from core import cache as cache_mod
-from gui.speed_explorer import SpeedExplorer
+from gui.explorers.speed_explorer import SpeedExplorer
 
 
 def _pick_cache(cache_root: str) -> str | None:

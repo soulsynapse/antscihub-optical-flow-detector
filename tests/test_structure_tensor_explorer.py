@@ -12,7 +12,9 @@ os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
 
 from PyQt6.QtWidgets import QApplication
 
-from gui.structure_tensor_explorer import StructureTensorExplorer
+from gui.explorers.structure_tensor_explorer import StructureTensorExplorer
+from gui.explorers.speed_explorer import MiniPlot
+from gui.explorers.variance_explorer import DETECT_TARGETS
 from core.tensor_channels import extract_channels
 
 
@@ -106,17 +108,24 @@ class StructureTensorExplorerTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_constructs_and_uses_only_owned_blocks(self):
-        with patch("gui.variance_explorer.load_or_extract_channels",
+        with patch("gui.explorers.variance_explorer.load_or_extract_channels",
                    return_value=_channels()):
             explorer = StructureTensorExplorer(_CacheStub())
         try:
             self.assertIn("Structure tensor explorer", explorer.windowTitle())
             self.assertEqual(explorer.n_blocks, 4)
+            # The selected detection channel expands and carries the band; all
+            # other plots stay at the shared base height without a band.
+            frac = explorer.plots["frac"]
+            self.assertTrue(frac.band_active)
+            self.assertEqual(frac.maximumHeight(), MiniPlot.EXPANDED_H)
             self.assertTrue(all(
-                plot.minimumHeight() == 66 and plot.maximumHeight() == 66
-                for plot in explorer.plots.values()))
+                plot.maximumHeight() == MiniPlot.BASE_H and not plot.band_active
+                for key, plot in explorer.plots.items() if key != "frac"))
             self.assertGreater(explorer.change_floor, 0.0)
-            self.assertTrue(np.isfinite(explorer.threshold))
+            # A fresh band is wide open on both sides: an unset threshold accepts
+            # every per-block value, including those above the plotted series max.
+            self.assertEqual(explorer._band(), (float("-inf"), float("inf")))
             np.testing.assert_allclose(
                 explorer.plots["variance"].y, [0.0, 1.0, 1.0, 1.0])
             np.testing.assert_allclose(
@@ -131,8 +140,57 @@ class StructureTensorExplorerTests(unittest.TestCase):
             tensor_scale = explorer._overlay_scale()
             explorer.overlay_mode.setCurrentText("Cached flow speed")
             self.assertEqual(explorer._overlay_scale(), tensor_scale)
-            self.assertEqual(
-                explorer.detect_combo.currentText(), "appearance fraction")
+            self.assertFalse(hasattr(explorer, "detect_combo"))
+            self.assertFalse(hasattr(explorer, "thr_slider"))
+            self.assertEqual(set(explorer.detect_checks), set(DETECT_TARGETS))
+            self.assertTrue(
+                explorer.detect_checks["appearance fraction"].isChecked())
+        finally:
+            explorer.close()
+
+    def test_detect_checkbox_switches_channel_and_band_gates_detection(self):
+        with patch("gui.explorers.variance_explorer.load_or_extract_channels",
+                   return_value=_channels()):
+            explorer = StructureTensorExplorer(_CacheStub())
+        try:
+            explorer.detect_checks["change energy"].setChecked(True)
+            self.assertEqual(explorer.detect, "change energy")
+            self.assertFalse(
+                explorer.detect_checks["appearance fraction"].isChecked())
+            change_w = explorer.plots["change_w"]
+            self.assertTrue(change_w.band_active)
+            self.assertEqual(change_w.maximumHeight(), MiniPlot.EXPANDED_H)
+            self.assertFalse(explorer.plots["frac"].band_active)
+
+            # Owned change energy is uniform per frame ([0, 2, 4, 8]); with the
+            # default W=2 trailing window the block field is [0, 1, 3, 6].
+            self.assertEqual(explorer.win_frames, 2)
+            change_w.band_lo = 2.0
+            change_w.band_hi = 1e9
+            explorer._recompute_sweep()
+            np.testing.assert_array_equal(
+                explorer.plots["count"].y, [0, 0, 4, 4])
+            # The two replicate tiles are separate 1x2 components, never one
+            # pooled clump.
+            np.testing.assert_array_equal(
+                explorer.plots["clump"].y, [0, 0, 2, 2])
+        finally:
+            explorer.close()
+
+    def test_region_change_reseeds_band_to_new_scope(self):
+        with patch("gui.explorers.variance_explorer.load_or_extract_channels",
+                   return_value=_channels()):
+            explorer = StructureTensorExplorer(_CacheStub())
+        try:
+            explorer.detect_checks["change energy"].setChecked(True)
+            explorer.plots["change_w"].band_lo = 123.0
+            explorer.plots["change_w"].band_hi = 456.0
+            idx = explorer.region_combo.findData(0)
+            explorer.region_combo.setCurrentIndex(idx)
+            # The frozen band must not survive into the new scope; it re-seeds
+            # wide open rather than staying on the old scale.
+            self.assertEqual(explorer._band(),
+                             (float("-inf"), float("inf")))
         finally:
             explorer.close()
 

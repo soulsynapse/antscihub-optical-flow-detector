@@ -56,7 +56,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QHBoxLayout,
 from gui.video_panel import FrameView
 # Reuse the speed explorer's sparkline, region normalisation and palette so the
 # two tools stay visually and behaviourally identical where they overlap.
-from gui.speed_explorer import (MiniPlot, _regions_from_meta, DISPLAY_MAX_W,
+from gui.explorers.speed_explorer import (MiniPlot, _regions_from_meta, DISPLAY_MAX_W,
                                 LINE, LINE2, CURSOR)
 
 DRIFT_C = QColor(150, 200, 255)     # integrated / drift series

@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import QApplication, QInputDialog
 
 from core import cache as cache_mod
 from core.tensor_channels import CHANNEL_VERSION
-from gui.structure_tensor_explorer import StructureTensorExplorer
+from gui.explorers.structure_tensor_explorer import StructureTensorExplorer
 
 
 def _pick_cache(cache_root: str) -> str | None:

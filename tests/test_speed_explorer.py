@@ -14,7 +14,8 @@ from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication
 
-from gui.speed_explorer import SpeedExplorer, _regions_from_meta
+from gui.explorers.speed_explorer import (DensityPlot, MiniPlot, SpeedExplorer,
+                                          _cluster_inband, _regions_from_meta)
 from gui.video_panel import FrameView
 
 
@@ -87,7 +88,9 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             self.assertEqual(explorer.n_blocks, 4)
             np.testing.assert_array_equal(explorer.plots["max"].y, [4, 5])
 
-            explorer.threshold = 0.5
+            # A band that spans the whole value range accepts every owned block.
+            explorer.plots["mean"].band_lo = 0.0
+            explorer.plots["mean"].band_hi = 1e9
             explorer._recompute_threshold_series()
             explorer._recompute_clump()
             np.testing.assert_array_equal(explorer.plots["count"].y, [4, 4])
@@ -96,36 +99,16 @@ class SpeedExplorerRegionTests(unittest.TestCase):
         finally:
             explorer.close()
 
-    def test_detection_minimum_drops_blocks_before_windowed_detection(self):
-        explorer = SpeedExplorer(_CacheStub())
-        try:
-            explorer.detection_min = 3.0
-            explorer.win_frames = 2
-            explorer._recompute_temporal_series()
-
-            # Rejected blocks are zero before the same trailing-window mean used
-            # by the per-block detector. The effective windows are [frame 0]
-            # and [frames 0, 1].
-            np.testing.assert_allclose(
-                explorer.plots["roll_mean"].y, [1.75, 2.375])
-
-            explorer.threshold = 0.5
-            explorer._recompute_threshold_series()
-            explorer._recompute_clump()
-            np.testing.assert_array_equal(explorer.plots["count"].y, [2, 3])
-            np.testing.assert_array_equal(explorer.plots["clump"].y, [2, 2])
-        finally:
-            explorer.close()
-
     def test_temporal_signal_matches_structure_tensor_window_contract(self):
         explorer = SpeedExplorer(_CacheStub())
         try:
-            explorer.detection_min = 3.0
             explorer.win_frames = 2
             explorer._recompute_temporal_series()
 
+            # Spatial means are 2.5 then 3.5; the trailing W=2 window averages
+            # [frame 0] then [frames 0, 1].
             np.testing.assert_allclose(
-                explorer.plots["roll_mean"].y, [1.75, 2.375])
+                explorer.plots["roll_mean"].y, [2.5, 3.0])
             self.assertEqual(explorer.plots["roll_mean"].unit, "px/s")
             owned = explorer._active_block_values(explorer.speed)
             fields = np.stack(list(explorer._iter_windowed_fields(owned)))
@@ -174,17 +157,20 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             self.assertEqual(explorer.plot_col.getItemPosition(plot_index)[1], 1)
             self.assertTrue(explorer.detect_checks["per_frame"].isChecked())
             self.assertFalse(explorer.detect_checks["windowed"].isChecked())
-            explorer.detection_min = 3.0
             explorer.win_frames = 2
 
-            explorer.threshold = 3.6
+            # Per-frame channel: the band gates the raw per-block speeds.
+            explorer.plots["mean"].band_lo = 3.6
+            explorer.plots["mean"].band_hi = 1e9
             explorer._recompute_threshold_series()
             explorer._recompute_clump()
             np.testing.assert_array_equal(explorer.plots["count"].y, [1, 2])
             np.testing.assert_array_equal(explorer.plots["clump"].y, [1, 2])
 
+            # Windowed channel: the band gates the trailing-window block field.
             explorer.detect_checks["windowed"].setChecked(True)
-            explorer.threshold = 3.6
+            explorer.plots["roll_mean"].band_lo = 3.6
+            explorer.plots["roll_mean"].band_hi = 1e9
             explorer._recompute_threshold_series()
             explorer._recompute_clump()
 
@@ -194,7 +180,182 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             np.testing.assert_array_equal(explorer.plots["count"].y, [1, 1])
             np.testing.assert_array_equal(explorer.plots["clump"].y, [1, 1])
             self.assertEqual(explorer.plots["cond_mean"].unit, "px/s")
-            self.assertAlmostEqual(explorer.thr_vmax, explorer.vmax)
+        finally:
+            explorer.close()
+
+    def test_selected_plot_owns_the_band_and_expands(self):
+        explorer = SpeedExplorer(_CacheStub())
+        try:
+            mean = explorer.plots["mean"]
+            roll = explorer.plots["roll_mean"]
+            # The initially selected channel is expanded and carries the band,
+            # seeded to its own data range; unselected plots do not.
+            self.assertTrue(mean.band_active)
+            self.assertEqual(mean.maximumHeight(), MiniPlot.EXPANDED_H)
+            self.assertEqual(roll.maximumHeight(), MiniPlot.BASE_H)
+            self.assertFalse(roll.band_active)
+            # A fresh band is wide open: unbounded on both sides, so per-block
+            # values above the plotted mean series' max are still accepted.
+            self.assertEqual(explorer._band(), (float("-inf"), float("inf")))
+
+            # A non-sweep sparkline never grows a band.
+            self.assertFalse(explorer.plots["count"].band_active)
+
+            # Switching channel moves the band + expansion to the new plot.
+            explorer.detect_checks["windowed"].setChecked(True)
+            self.assertFalse(mean.band_active)
+            self.assertEqual(mean.maximumHeight(), MiniPlot.BASE_H)
+            self.assertTrue(roll.band_active)
+            self.assertEqual(roll.maximumHeight(), MiniPlot.EXPANDED_H)
+            self.assertIs(explorer._selected_plot(), roll)
+        finally:
+            explorer.close()
+
+    def test_dragging_a_band_line_updates_detection(self):
+        explorer = SpeedExplorer(_CacheStub())
+        try:
+            mean = explorer.plots["mean"]
+            mean.resize(200, MiniPlot.EXPANDED_H)
+            committed = QSignalSpy(mean.band_committed)
+
+            # Grab the maximum handle at its current pixel row and drag it down
+            # to just above the fastest per-block speed's neighbourhood.
+            r = mean._plot_rect()
+            data_lo, data_hi = mean._data_range()
+            _, yhi, _ = mean._line_ys()
+            QTest.mousePress(mean, Qt.MouseButton.LeftButton,
+                             pos=QPoint(int(r.right()) - 2, int(yhi)))
+            target = mean._y_of(3.0, r, data_lo, data_hi)
+            QTest.mouseMove(mean, pos=QPoint(int(r.right()) - 2, int(target)))
+            QTest.mouseRelease(mean, Qt.MouseButton.LeftButton,
+                               pos=QPoint(int(r.right()) - 2, int(target)))
+
+            self.assertEqual(len(committed), 1)
+            lo, hi = explorer._band()
+            self.assertAlmostEqual(hi, 3.0, delta=0.2)
+            self.assertLessEqual(lo, hi)
+            # Detection now reflects the dragged band, applied to per-block speed.
+            selected = explorer._active_block_values(explorer.speed)
+            np.testing.assert_array_equal(
+                explorer.plots["count"].y,
+                ((selected >= lo) & (selected <= hi)).sum(1))
+        finally:
+            explorer.close()
+
+    def test_handle_at_plot_edge_means_unbounded_side(self):
+        explorer = SpeedExplorer(_CacheStub())
+        try:
+            mean = explorer.plots["mean"]
+            mean.resize(200, MiniPlot.EXPANDED_H)
+            r = mean._plot_rect()
+            data_lo, data_hi = mean._data_range()
+
+            # Fresh band accepts the fastest per-block speeds (4 and 5) even
+            # though the plotted mean series tops out at 3.5 -- the original
+            # bug clamped hi to the plot max and silently rejected them.
+            explorer._recompute_threshold_series()
+            np.testing.assert_array_equal(explorer.plots["count"].y, [4, 4])
+
+            # Drag the lo handle up into the plot: a finite lower threshold.
+            x = int(r.right()) - 2
+            ylo, _, _ = mean._line_ys()
+            QTest.mousePress(mean, Qt.MouseButton.LeftButton,
+                             pos=QPoint(x, int(ylo)))
+            target = mean._y_of(3.0, r, data_lo, data_hi)
+            QTest.mouseMove(mean, pos=QPoint(x, int(target)))
+            QTest.mouseRelease(mean, Qt.MouseButton.LeftButton,
+                               pos=QPoint(x, int(target)))
+            lo, hi = explorer._band()
+            self.assertAlmostEqual(lo, 3.0, delta=0.2)
+            # The untouched hi handle stays unbounded: the top region includes
+            # the absolute highest values.
+            self.assertEqual(hi, float("inf"))
+            selected = explorer._active_block_values(explorer.speed)
+            np.testing.assert_array_equal(
+                explorer.plots["count"].y, (selected >= lo).sum(1))
+
+            # Dragging lo off the bottom edge re-opens that side.
+            ylo, _, _ = mean._line_ys()
+            QTest.mousePress(mean, Qt.MouseButton.LeftButton,
+                             pos=QPoint(x, int(ylo)))
+            QTest.mouseMove(mean, pos=QPoint(x, int(r.bottom()) + 1))
+            QTest.mouseRelease(mean, Qt.MouseButton.LeftButton,
+                               pos=QPoint(x, int(r.bottom()) + 1))
+            self.assertEqual(explorer._band(),
+                             (float("-inf"), float("inf")))
+        finally:
+            explorer.close()
+
+    def test_density_plot_spans_the_matrix_and_reads_out_the_max(self):
+        pl = DensityPlot("dist", "px/s")
+        pl.resize(120, MiniPlot.EXPANDED_H)
+        # (T=3, K=4): a low-speed bulk with one fast block per frame, exactly the
+        # sparse-signal case a spatial mean would bury.
+        m = np.array([[0.0, 0.1, 0.2, 8.0],
+                      [0.0, 0.1, 0.2, 9.0],
+                      [0.0, 0.1, 0.2, 5.0]], np.float32)
+        pl.set_matrix(m)
+        # The value axis spans the whole per-block range, not the mean's range.
+        self.assertEqual(pl._data_range(), (0.0, 9.0))
+        # The cursor readout tracks the fastest block per frame, not the mean.
+        np.testing.assert_array_equal(pl.y, [8.0, 9.0, 5.0])
+        # The heatmap renders as an image at the plot's pixel size (binned, so it
+        # never scales with T*K), and is cached until the data changes.
+        r = pl._plot_rect()
+        img = pl._density_image(int(r.width()), int(r.height()), 0.0, 9.0)
+        self.assertIsNotNone(img)
+        self.assertEqual((img.width(), img.height()),
+                         (int(r.width()), int(r.height())))
+        self.assertIs(pl._density_image(int(r.width()), int(r.height()),
+                                        0.0, 9.0), img)
+        # It is a real detection channel: seeding the band opens it wide.
+        pl.set_band_active(True)
+        self.assertEqual(pl.band(), (float("-inf"), float("inf")))
+
+    def test_cluster_inband_bridges_gaps_without_inflating_size(self):
+        # Three in-band blocks with a one-block gap between each: . lets us tell
+        # single-link Chebyshev clustering apart from morphological dilation.
+        mask = np.array([[1, 0, 1, 0, 1]], dtype=bool)
+        w = np.ones_like(mask, dtype=float)
+
+        # gap=1 is plain 8-connectivity: the blocks are Chebyshev distance 2
+        # apart, so they stay three separate size-1 clumps. (Dilation-by-1 would
+        # wrongly merge them at the 2*gap overlap -- this guards that.)
+        _, sizes = _cluster_inband(mask, w, 1)
+        self.assertEqual(sorted(sizes.values()), [1.0, 1.0, 1.0])
+
+        # gap=2 bridges all three into one clump, but the size counts only the
+        # three real in-band blocks, never the two bridged gaps (=5 if dilated).
+        _, sizes = _cluster_inband(mask, w, 2)
+        self.assertEqual(list(sizes.values()), [3.0])
+
+        # Valid-area weights are honoured: a half-area block counts as 0.5.
+        w2 = np.array([[1.0, 0, 0.5, 0, 1.0]])
+        _, sizes = _cluster_inband(mask, w2, 2)
+        self.assertAlmostEqual(sum(sizes.values()), 2.5)
+
+    def test_size_gate_drives_positive_detection_channel(self):
+        explorer = SpeedExplorer(_CacheStub())
+        try:
+            # Wide-open band: each 1x2 tile is one gap=1 clump of weighted size 2,
+            # in both frames, so the largest-clump series is a flat 2.
+            explorer._recompute_clump()
+            np.testing.assert_array_equal(explorer.plots["clump"].y, [2, 2])
+
+            # Size gate at 2 fires every frame; at 3 nothing reaches it. Moving
+            # the gate only re-gates -- it never re-clusters.
+            explorer.clump_min = 2
+            explorer._recompute_detect()
+            np.testing.assert_array_equal(explorer.plots["detect"].y, [1, 1])
+            explorer.clump_min = 3
+            explorer._recompute_detect()
+            np.testing.assert_array_equal(explorer.plots["detect"].y, [0, 0])
+
+            # The gate is a spatial channel: it vanishes on a scalar detection.
+            explorer.detect_checks["scalar:p90"].setChecked(True)
+            self.assertTrue(explorer.plots["detect"].isHidden())
+            self.assertFalse(explorer.gap_slider.isEnabled())
+            self.assertFalse(explorer.size_slider.isEnabled())
         finally:
             explorer.close()
 
@@ -209,10 +370,11 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             self.assertEqual(set(explorer.detect_checks), expected_targets)
 
             explorer.detect_checks["scalar:p90"].setChecked(True)
-            explorer.threshold = 4.0
+            explorer.plots["p90"].band_lo = 4.0
+            explorer.plots["p90"].band_hi = 1e9
             explorer._recompute_threshold_series()
 
-            # P90 is 3.7 then 4.7 across the four owned blocks.
+            # P90 is 3.7 then 4.7 across the four owned blocks; only 4.7 is in band.
             np.testing.assert_array_equal(explorer.plots["count"].y, [0, 1])
             self.assertEqual(explorer.plots["count"].unit, "0/1")
             self.assertIn("90th pct speed", explorer.plots["count"].title)
@@ -240,29 +402,15 @@ class SpeedExplorerRegionTests(unittest.TestCase):
         finally:
             explorer.close()
 
-    def test_detection_minimum_removes_rejected_blocks_from_heatmap(self):
+    def test_replicate_click_focuses_data_and_reseeds_band_to_that_scope(self):
         explorer = SpeedExplorer(_CacheStub())
         try:
-            explorer.hi_chk.setChecked(False)
-            explorer.detection_min = 3.0
-            explorer._redraw_video()
-
-            image = explorer.video_view._pix.toImage()
-            # Frame 0's left replicate contains speeds [1, 2], so its heatmap
-            # is entirely absent and the black raw frame remains visible.
-            self.assertEqual(image.pixelColor(25, 25).getRgb()[:3], (0, 0, 0))
-            # The right replicate contains retained speeds [3, 4].
-            self.assertNotEqual(
-                image.pixelColor(75, 25).getRgb()[:3], (0, 0, 0))
-        finally:
-            explorer.close()
-
-    def test_replicate_click_focuses_data_and_right_click_returns_to_overview(self):
-        explorer = SpeedExplorer(_CacheStub())
-        try:
-            explorer.thr_slider.setValue(400)
-            threshold = explorer.threshold
             speed_scale = explorer.vmax
+            unbounded = (float("-inf"), float("inf"))
+            # The overview band seeds wide open; place a finite threshold so the
+            # focus switch below demonstrably wipes it.
+            self.assertEqual(explorer._band(), unbounded)
+            explorer.plots["mean"].band_lo = 3.0
 
             explorer._redraw_video()
             explorer._on_video_clicked(QPoint(25, 25))
@@ -270,15 +418,18 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             self.assertEqual(explorer.n_blocks, 2)
             self.assertEqual(explorer.video_view.focus_frac,
                              (0.0, 0.0, 0.5, 1.0))
-            self.assertEqual(explorer.thr_slider.value(), 400)
-            self.assertEqual(explorer.threshold, threshold)
+            # Focusing a replicate discards the pooled-scope threshold: the band
+            # reseeds wide open rather than staying frozen on the old scale.
+            self.assertEqual(explorer._band(), unbounded)
             self.assertEqual(explorer.vmax, speed_scale)
             np.testing.assert_array_equal(explorer.plots["max"].y, [2, 3])
             selected = explorer._active_block_values(explorer.speed)
             np.testing.assert_array_equal(
                 selected, explorer.speed[:, 0:1, 0:2].reshape(2, -1))
+            lo, hi = explorer._band()
             np.testing.assert_array_equal(
-                explorer.plots["count"].y, (selected > threshold).sum(1))
+                explorer.plots["count"].y,
+                ((selected >= lo) & (selected <= hi)).sum(1))
 
             explorer.focus_mode.setCurrentIndex(1)
             flow_preview = explorer._base_frame()
@@ -290,8 +441,8 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             self.assertEqual(explorer.active_region_index, -1)
             self.assertEqual(explorer.n_blocks, 4)
             self.assertIsNone(explorer.video_view.focus_frac)
-            self.assertEqual(explorer.thr_slider.value(), 400)
-            self.assertEqual(explorer.threshold, threshold)
+            # Returning to the overview re-seeds wide open again.
+            self.assertEqual(explorer._band(), unbounded)
             self.assertEqual(explorer.vmax, speed_scale)
         finally:
             explorer.close()

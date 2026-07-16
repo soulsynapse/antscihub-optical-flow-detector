@@ -1,6 +1,6 @@
 """Standalone launcher for the temporal-variance / appearance explorer (tool 3).
 
-The UI lives in :mod:`gui.variance_explorer` so it can move into the main app as
+The UI lives in :mod:`gui.explorers.variance_explorer` so it can move into the main app as
 a tab without carrying cache-picking or QApplication ownership. On first open it
 precomputes the temporal channels from the video (slow) and writes a sidecar next
 to the cache, so re-opens are instant.
@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import QApplication, QInputDialog
 
 from core import cache as cache_mod
 from core.tensor_channels import CHANNEL_VERSION
-from gui.variance_explorer import TemporalVarianceExplorer
+from gui.explorers.variance_explorer import TemporalVarianceExplorer
 
 
 def _pick_cache(cache_root: str) -> str | None:

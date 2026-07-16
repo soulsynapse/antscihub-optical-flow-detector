@@ -131,4 +131,4 @@ reasons:
   passing-block count and strength treated a one-pixel-tall edge sliver as a full
   block, letting a row of slivers masquerade as a real clump. Fixed with
   valid-area weighting (`core.replicates.block_weight_plane`) in
-  `core/roi.py:roi_detection` and the `gui/speed_explorer.py` clump readout.
+  `core/roi.py:roi_detection` and the `gui/explorers/speed_explorer.py` clump readout.

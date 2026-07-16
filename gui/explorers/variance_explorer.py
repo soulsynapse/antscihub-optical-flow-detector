@@ -35,13 +35,14 @@ from core.tensor_channels import load_or_extract_channels
 
 from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QHBoxLayout,
-                             QLabel, QProgressDialog, QPushButton, QScrollArea,
-                             QSlider, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
+                             QGridLayout, QHBoxLayout, QLabel, QProgressDialog,
+                             QPushButton, QScrollArea, QSlider, QVBoxLayout,
+                             QWidget)
 
 from gui.video_panel import FrameView
-from gui.speed_explorer import (MiniPlot, _regions_from_meta, DISPLAY_MAX_W,
-                                LINE, LINE2)
+from gui.explorers.speed_explorer import (MiniPlot, _regions_from_meta,
+                                          DISPLAY_MAX_W, LINE, LINE2)
 
 VAR_C = QColor(120, 215, 255)      # amplitude variance
 CHANGE_C = QColor(255, 170, 80)    # change energy
@@ -51,7 +52,6 @@ VW_C = QColor(255, 150, 90)        # value-vs-window
 TENSOR_SPEED_C = QColor(255, 205, 80)
 CACHE_SPEED_C = QColor(80, 205, 255)
 SPEED_DIFF_C = QColor(255, 105, 135)
-PLOT_HEIGHT = 66  # Match the shared MiniPlot height used by the other explorers.
 EPS = 1e-6
 
 # Which precomputed channel each detection target derives from, and how the
@@ -63,8 +63,8 @@ class StructureTensorExplorer(QWidget):
     """Explore the temporal-change reads from the structure-tensor POC.
 
     The widget deliberately follows the same cache-backed, replicate-aware UI
-    contract as :class:`gui.speed_explorer.SpeedExplorer` and
-    :class:`gui.coherent_flow_explorer.CoherentFlowExplorer`.
+    contract as :class:`gui.explorers.speed_explorer.SpeedExplorer` and
+    :class:`gui.explorers.coherent_flow_explorer.CoherentFlowExplorer`.
     """
 
     def __init__(self, cache=None, video_path: str | None = None, *, state=None,
@@ -157,13 +157,11 @@ class StructureTensorExplorer(QWidget):
 
         self._rebuild_owned_prefixes()
         # Appearance fraction gates division by a real-change floor.  The floor
-        # must exist before _detect_scale() asks _owned_windowed() for the default
-        # appearance field; the old order made every first launch fail here.
+        # must exist before the windowed series (and hence the seeded detection
+        # band) can be computed.
         positive_change = self.change[self.change > 0]
         self.change_floor = float(np.percentile(positive_change, 50)) \
             if positive_change.size else 0.0
-        self.thr_vmax = self._detect_scale()
-        self.threshold = self.thr_vmax * 0.5
 
         self._build_ui()
         self._event_filter_app = QApplication.instance()
@@ -180,6 +178,10 @@ class StructureTensorExplorer(QWidget):
             state.frame_changed.connect(self._on_state_frame_changed)
 
         self._recompute_series()
+        # Seed the selected channel's band from its now-populated series, and
+        # expand that plot. Must follow series computation so the band is
+        # absolute in the channel's own units.
+        self._apply_selected_plot_ui()
         self._recompute_sweep()
         self._recompute_value_curve()
         self._apply_frame(self.frame)
@@ -247,10 +249,23 @@ class StructureTensorExplorer(QWidget):
             return w["change"]
         return w["frac"]
 
-    def _detect_scale(self) -> float:
-        vals = self._detect_field(self._owned_windowed(self.win_frames))
-        finite = vals[np.isfinite(vals)]
-        return max(float(np.percentile(finite, 99.0)) if finite.size else 1.0, 1e-4)
+    def _selected_plot_key(self) -> str:
+        return self.detect_plot_key.get(self.detect, "frac")
+
+    def _selected_plot(self) -> "MiniPlot":
+        return self.plots[self._selected_plot_key()]
+
+    def _band(self) -> tuple[float, float]:
+        """Current (lo, hi) detection band in the selected channel's Y units."""
+        return self._selected_plot().band()
+
+    def _apply_selected_plot_ui(self):
+        """Expand + activate the band on the selected plot; reset the others."""
+        for target, key in self.detect_plot_key.items():
+            selected = (target == self.detect)
+            pl = self.plots[key]
+            pl.set_band_active(selected)
+            pl.set_expanded(selected)
 
     # -- layout ---------------------------------------------------------------
 
@@ -305,25 +320,24 @@ class StructureTensorExplorer(QWidget):
         self.overlay_mode.setCurrentText("Appearance fraction")
         self.overlay_mode.currentTextChanged.connect(lambda _: self._redraw_video())
         orow.addWidget(self.overlay_mode, 1)
-        self.hi_chk = QCheckBox("Highlight blocks > threshold")
+        self.hi_chk = QCheckBox("Highlight blocks in detection band")
         self.hi_chk.setChecked(True)
         self.hi_chk.stateChanged.connect(lambda _: self._redraw_video())
         orow.addWidget(self.hi_chk)
         left.addLayout(orow)
 
-        drow = QHBoxLayout()
-        drow.addWidget(QLabel("Detect on:"))
-        self.detect_combo = QComboBox()
-        self.detect_combo.addItems(DETECT_TARGETS)
-        self.detect_combo.setCurrentText(self.detect)
-        self.detect_combo.currentTextChanged.connect(self._on_detect_changed)
-        drow.addWidget(self.detect_combo, 1)
-        left.addLayout(drow)
+        # Detection thresholds no longer live on a horizontal slider: they are
+        # the min/max handles of the band on whichever plot is the selected
+        # channel (same UI contract as the speed explorer).
+        band_hint = QLabel(
+            "Detection thresholds: drag the min/max handles on the selected "
+            "plot (checked ✓) at right.")
+        band_hint.setStyleSheet("color:#888;")
+        band_hint.setWordWrap(True)
+        left.addWidget(band_hint)
 
         self.win_slider, self.win_lbl = self._add_slider(
             left, 2, max(3, self.T - 1), self.win_frames, self._on_window)
-        self.thr_slider, self.thr_lbl = self._add_slider(
-            left, 0, 1000, 500, self._on_threshold)
 
         note = QLabel(
             "Window W integrates temporal change: amplitude variance = "
@@ -356,27 +370,51 @@ class StructureTensorExplorer(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         holder = QWidget()
-        self.plot_col = QVBoxLayout(holder)
+        self.plot_col = QGridLayout(holder)
         self.plot_col.setSpacing(3)
+        self.plot_col.setColumnMinimumWidth(0, 20)
+        self.plot_col.setColumnStretch(1, 1)
         scroll.setWidget(holder)
         scroll.setMinimumWidth(440)
         root.addWidget(scroll, 2)
 
         self.plots: dict[str, MiniPlot] = {}
+        self.detect_checks: dict[str, QCheckBox] = {}
+        # detect target -> plot key, so the selected channel's band handles are
+        # found on the right plot.
+        self.detect_plot_key: dict[str, str] = {}
+        self.detect_group = QButtonGroup(self)
+        self.detect_group.setExclusive(True)
+        self._plot_row = 0
 
         def section(text):
             lbl = QLabel(text)
             lbl.setStyleSheet("color:#7fd7ff; font-weight:bold; padding-top:6px;")
-            self.plot_col.addWidget(lbl)
+            self.plot_col.addWidget(lbl, self._plot_row, 0, 1, 2)
+            self._plot_row += 1
 
-        def add(key, title, unit, color=LINE, seek=True):
+        def add(key, title, unit, color=LINE, seek=True,
+                detect_target: str | None = None):
             pl = MiniPlot(title, unit, color)
-            pl.setMinimumHeight(PLOT_HEIGHT)
-            pl.setMaximumHeight(PLOT_HEIGHT)
             if seek:
                 pl.seek_requested.connect(self._seek)
             self.plots[key] = pl
-            self.plot_col.addWidget(pl)
+            self.plot_col.addWidget(pl, self._plot_row, 1)
+            if detect_target is not None:
+                self.detect_plot_key[detect_target] = key
+                pl.band_changed.connect(self._on_band_changed)
+                pl.band_committed.connect(self._on_band_committed)
+                check = QCheckBox()
+                check.setAccessibleName(f"Detect on {title}")
+                check.setToolTip(
+                    f"Use {title} as the detection channel and drag its band")
+                check.setProperty("detect_target", detect_target)
+                self.detect_group.addButton(check)
+                self.detect_checks[detect_target] = check
+                check.setChecked(detect_target == self.detect)
+                self.plot_col.addWidget(
+                    check, self._plot_row, 0, Qt.AlignmentFlag.AlignCenter)
+            self._plot_row += 1
 
         section("Tensor speed vs cached optical flow (no temporal integration)")
         add("tensor_speed", "Mean tensor-derived speed", "px/s", TENSOR_SPEED_C)
@@ -390,19 +428,23 @@ class StructureTensorExplorer(QWidget):
         add("appear_pf", "Per-frame appearance energy", "", APPEAR_C)
 
         section("Integrated over window W (time axis)")
-        add("variance", "Amplitude variance <(I-mean)^2>", "", VAR_C)
-        add("change_w", "Mean change energy over W", "", CHANGE_C)
-        add("frac", "Appearance fraction (residual/change)", "", APPEAR_C)
+        add("variance", "Amplitude variance <(I-mean)^2>", "", VAR_C,
+            detect_target="amplitude variance")
+        add("change_w", "Mean change energy over W", "", CHANGE_C,
+            detect_target="change energy")
+        add("frac", "Appearance fraction (residual/change)", "", APPEAR_C,
+            detect_target="appearance fraction")
 
-        section("Detection sweep on selected channel (threshold slider)")
-        add("count", "# blocks > threshold", "blk", SWEEP_C)
-        add("fracb", "Fraction of blocks", "", SWEEP_C)
-        add("clump", "Largest connected clump", "blk", SWEEP_C)
+        section("Detection sweep on selected channel (drag band handles)")
+        add("count", "# blocks in band", "blk", SWEEP_C)
+        add("fracb", "Fraction of blocks in band", "", SWEEP_C)
+        add("clump", "Largest connected clump in band", "blk", SWEEP_C)
 
         section("Value of integration @ cursor (x axis = window length)")
         add("vw_var", "Amplitude variance vs W", "", VW_C, seek=False)
         add("vw_frac", "Appearance fraction vs W", "", VW_C, seek=False)
-        self.plot_col.addStretch(1)
+        self.plot_col.setRowStretch(self._plot_row, 1)
+        self.detect_group.buttonToggled.connect(self._on_detect_plot_toggled)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -410,10 +452,12 @@ class StructureTensorExplorer(QWidget):
         self._win_debounce.setSingleShot(True)
         self._win_debounce.setInterval(120)
         self._win_debounce.timeout.connect(self._apply_window_change)
+        # Debounce for the cheap in-band counts so dragging a band handle stays
+        # smooth; the expensive clump refreshes only on release.
         self._sweep_debounce = QTimer(self)
         self._sweep_debounce.setSingleShot(True)
         self._sweep_debounce.setInterval(120)
-        self._sweep_debounce.timeout.connect(self._recompute_sweep)
+        self._sweep_debounce.timeout.connect(self._recompute_sweep_counts)
         self._sync_labels()
 
     def _add_slider(self, layout, lo, hi, val, handler):
@@ -449,17 +493,22 @@ class StructureTensorExplorer(QWidget):
         self.plots["frac"].set_series(w["frac"].mean(1))
         self._w_cache = w
 
-    def _recompute_sweep(self):
+    def _recompute_sweep_counts(self):
+        lo, hi = self._band()
         field = self._detect_field(self._w_cache)
-        mask = field > self.threshold
+        mask = (field >= lo) & (field <= hi)
         count = mask.sum(1).astype(np.float32)
         self.plots["count"].set_series(count)
         self.plots["fracb"].set_series(count / max(1, self.n_blocks))
+
+    def _recompute_sweep(self):
+        self._recompute_sweep_counts()
         self._recompute_clump()
 
     def _recompute_clump(self):
         W = self.win_frames
         hi, lo, neff = self._window_bounds(W)
+        band_lo, band_hi = self._band()
         weight_plane = block_weight_plane(self.meta)
         largest = np.zeros(self.T, np.float32)
         for region in self._active_regions():
@@ -467,7 +516,8 @@ class StructureTensorExplorer(QWidget):
             w_flat = weight_plane[y0:y1, x0:x1].reshape(-1)
             field = self._detect_field_full(y0, x0, y1, x1, hi, lo, neff)
             for t in range(self.T):
-                m = (field[t] > self.threshold).astype(np.uint8)
+                m = ((field[t] >= band_lo) &
+                     (field[t] <= band_hi)).astype(np.uint8)
                 if not m.any():
                     continue
                 n_lab, labels, _, _ = cv2.connectedComponentsWithStats(
@@ -522,8 +572,6 @@ class StructureTensorExplorer(QWidget):
         self.win_lbl.setText(
             f"Integration window W: {self.win_frames} fr "
             f"({self.win_frames * self.dt:.2f} s)")
-        self.thr_lbl.setText(
-            f"Threshold ({self.detect}): {self.threshold:.4g}")
 
     def _on_window(self, v):
         self.win_frames = max(2, int(v))
@@ -537,17 +585,23 @@ class StructureTensorExplorer(QWidget):
         self._recompute_value_curve()
         self._redraw_video()
 
-    def _on_threshold(self, v):
-        self.threshold = v / 1000.0 * self.thr_vmax
-        self._sync_labels()
+    def _on_band_changed(self):
+        """A band handle is being dragged: cheap series debounced, overlay live."""
         self._sweep_debounce.start()
+        self._redraw_video()          # highlight overlay follows immediately
+
+    def _on_band_committed(self):
+        """Handle released: flush the cheap series and refresh the clump."""
+        self._sweep_debounce.stop()
+        self._recompute_sweep()
         self._redraw_video()
 
-    def _on_detect_changed(self, text):
-        self.detect = text
-        self.thr_vmax = self._detect_scale()
-        self.threshold = self.thr_vmax * (self.thr_slider.value() / 1000.0)
-        self._sync_labels()
+    def _on_detect_plot_toggled(self, button, checked: bool):
+        if not checked:
+            return
+        data = button.property("detect_target")
+        self.detect = str(data) if data is not None else DETECT_TARGETS[-1]
+        self._apply_selected_plot_ui()
         self._recompute_sweep()
         self._redraw_video()
 
@@ -560,6 +614,13 @@ class StructureTensorExplorer(QWidget):
         self._sync_video_boxes()
         self._rebuild_owned_prefixes()
         self._recompute_series()
+        # Each scope lives on its own value scale, so a band frozen from the
+        # previous scope would sit off this scope's plot entirely. Re-seed every
+        # channel's band to the new scope's range; the active plot reseeds
+        # immediately, the rest lazily.
+        for key in self.detect_plot_key.values():
+            self.plots[key].band_lo = self.plots[key].band_hi = None
+        self._apply_selected_plot_ui()
         self._recompute_sweep()
         self._recompute_value_curve()
         self._sync_labels()
@@ -773,13 +834,14 @@ class StructureTensorExplorer(QWidget):
             hi_i = self.frame + 1
             lo_i = max(0, hi_i - self.win_frames)
             neff = np.array([max(1, hi_i - lo_i)], np.float32)
+            band_lo, band_hi = self._band()
             for ri in list(active):
                 region = self.regions[ri]
                 y0, x0, y1, x1 = region["atlas_bbox"]
                 dx0, dy0, dx1, dy1 = self._display_bbox(region, cw, ch)
                 fld = self._detect_field_full(
                     y0, x0, y1, x1, np.array([hi_i]), np.array([lo_i]), neff)[0]
-                m = (fld > self.threshold).astype(np.uint8)
+                m = ((fld >= band_lo) & (fld <= band_hi)).astype(np.uint8)
                 mm = cv2.resize(m, (dx1 - dx0, dy1 - dy0),
                                 interpolation=cv2.INTER_NEAREST)
                 roi = out[dy0:dy1, dx0:dx1]
@@ -840,5 +902,5 @@ class StructureTensorExplorer(QWidget):
 
 
 # Compatibility for the early tool-3 draft and its original launcher.  New code
-# should import StructureTensorExplorer from gui.structure_tensor_explorer.
+# should import StructureTensorExplorer from gui.explorers.structure_tensor_explorer.
 TemporalVarianceExplorer = StructureTensorExplorer
