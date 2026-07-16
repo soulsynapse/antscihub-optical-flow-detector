@@ -113,7 +113,7 @@ class StructureTensorExplorerTests(unittest.TestCase):
             self.assertIn("Structure tensor explorer", explorer.windowTitle())
             self.assertEqual(explorer.n_blocks, 4)
             self.assertTrue(all(
-                plot.minimumHeight() == 132 and plot.maximumHeight() == 132
+                plot.minimumHeight() == 66 and plot.maximumHeight() == 66
                 for plot in explorer.plots.values()))
             self.assertGreater(explorer.change_floor, 0.0)
             self.assertTrue(np.isfinite(explorer.threshold))

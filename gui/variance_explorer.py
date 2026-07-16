@@ -51,7 +51,7 @@ VW_C = QColor(255, 150, 90)        # value-vs-window
 TENSOR_SPEED_C = QColor(255, 205, 80)
 CACHE_SPEED_C = QColor(80, 205, 255)
 SPEED_DIFF_C = QColor(255, 105, 135)
-PLOT_HEIGHT = 132  # 2x the shared MiniPlot default; this explorer has dense traces.
+PLOT_HEIGHT = 66  # Match the shared MiniPlot height used by the other explorers.
 EPS = 1e-6
 
 # Which precomputed channel each detection target derives from, and how the

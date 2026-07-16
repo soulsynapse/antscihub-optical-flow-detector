@@ -15,6 +15,8 @@ Left panel  : the video with replicate-aware optical-flow overlay + transport.
 Right panel : a long scrollable column of speed-only time readouts. The
               threshold slider drives the "above threshold" group live, so you can
               watch the block-count signal reshape itself as you sweep the cutoff.
+              A separate detection minimum drops quieter blocks before the
+              detection signal is averaged over a trailing time window.
 
 Current caches process each replicate independently and pack their block grids
 into a sparse storage atlas.  This explorer maps those tiles back to their real
@@ -33,8 +35,8 @@ from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QKeySequence, QPainter, QPen, QPolygonF,
                          QShortcut)
 from PyQt6.QtCore import QPointF, QRectF
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QHBoxLayout,
-                             QLabel, QPushButton, QScrollArea,
+from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
+                             QGridLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
                              QSlider, QVBoxLayout, QWidget)
 
 from gui.video_panel import FrameView
@@ -285,8 +287,11 @@ class SpeedExplorer(QWidget):
         # which gives the slider one stable absolute px/s mapping.  Focusing a
         # replicate must not silently reinterpret or reset an analysis threshold.
         self.vmax = self._active_speed_scale()
-        self.threshold = self.vmax * 0.5
-        self.roll_win_s = 0.5
+        self.detection_min = 0.0
+        self.win_frames = max(2, min(self.T - 1, int(round(self.fps))))
+        self.detect_on = "per_frame"
+        self.thr_vmax = self.vmax
+        self.threshold = self.thr_vmax * 0.5
 
         self.frame = int(state.current_frame) if state is not None else 0
         self.playing = False
@@ -413,15 +418,44 @@ class SpeedExplorer(QWidget):
         thr_row.addWidget(self.thr_slider, 1)
         left.addLayout(thr_row)
 
-        # rolling window slider
+        # Detection minimum: values quieter than this floor are absent from all
+        # detection-facing calculations. Raw distribution plots stay raw so the
+        # user can still see the signal being rejected and choose the floor.
+        min_row = QHBoxLayout()
+        self.min_lbl = QLabel()
+        self.min_lbl.setMinimumWidth(190)
+        min_row.addWidget(self.min_lbl)
+        self.min_slider = QSlider(Qt.Orientation.Horizontal)
+        self.min_slider.setRange(0, 1000)
+        self.min_slider.setValue(0)
+        self.min_slider.setToolTip(
+            "Blocks below this speed are dropped from the windowed detection "
+            "signal, threshold/clump detection, and video overlays. Raw "
+            "distribution plots remain unchanged.")
+        self.min_slider.valueChanged.connect(self._on_detection_min)
+        self.min_slider.sliderReleased.connect(self._recompute_clump)
+        min_row.addWidget(self.min_slider, 1)
+        left.addLayout(min_row)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Temporal aggregation:"))
+        self.temporal_mode_lbl = QLabel(
+            "Trailing-window mean (same contract as structure tensor)")
+        self.temporal_mode_lbl.setToolTip(
+            "Each frame uses that frame and up to W-1 preceding frames. At the "
+            "start of the clip, only the available history is averaged.")
+        mode_row.addWidget(self.temporal_mode_lbl, 1)
+        left.addLayout(mode_row)
+
         rw_row = QHBoxLayout()
         self.rw_lbl = QLabel()
         self.rw_lbl.setMinimumWidth(190)
         rw_row.addWidget(self.rw_lbl)
         self.rw_slider = QSlider(Qt.Orientation.Horizontal)
-        self.rw_slider.setRange(0, 40)         # 0.0 .. 2.0 s in 0.05 steps
-        self.rw_slider.setValue(10)
+        self.rw_slider.setRange(2, max(3, self.T - 1))
+        self.rw_slider.setValue(self.win_frames)
         self.rw_slider.valueChanged.connect(self._on_roll_win)
+        self.rw_slider.sliderReleased.connect(self._on_roll_win_released)
         rw_row.addWidget(self.rw_slider, 1)
         left.addLayout(rw_row)
 
@@ -438,39 +472,64 @@ class SpeedExplorer(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         holder = QWidget()
-        self.plot_col = QVBoxLayout(holder)
+        self.plot_col = QGridLayout(holder)
         self.plot_col.setSpacing(3)
+        self.plot_col.setColumnMinimumWidth(0, 20)
+        self.plot_col.setColumnStretch(1, 1)
         scroll.setWidget(holder)
-        scroll.setMinimumWidth(430)
+        scroll.setMinimumWidth(500)
         root.addWidget(scroll, 2)
 
         self.plots: dict[str, MiniPlot] = {}
+        self.detect_checks: dict[str, QCheckBox] = {}
+        self.detect_group = QButtonGroup(self)
+        self.detect_group.setExclusive(True)
+        self._plot_row = 0
 
         def section(text: str):
             lbl = QLabel(text)
             lbl.setStyleSheet("color:#7fd7ff; font-weight:bold; padding-top:6px;")
-            self.plot_col.addWidget(lbl)
+            self.plot_col.addWidget(lbl, self._plot_row, 0, 1, 2)
+            self._plot_row += 1
+            return lbl
 
-        def add(key: str, title: str, unit: str, color=LINE):
+        def add(key: str, title: str, unit: str, color=LINE,
+                detect_target: str | None = None):
             pl = MiniPlot(title, unit, color)
             pl.seek_requested.connect(self._seek)
             self.plots[key] = pl
-            self.plot_col.addWidget(pl)
+            self.plot_col.addWidget(pl, self._plot_row, 1)
+            if detect_target is not None:
+                check = QCheckBox()
+                check.setAccessibleName(f"Detect on {title}")
+                check.setToolTip(f"Use {title} as the per-block detection field")
+                check.setProperty("detect_target", detect_target)
+                self.detect_group.addButton(check)
+                self.detect_checks[detect_target] = check
+                check.setChecked(detect_target == self.detect_on)
+                self.plot_col.addWidget(
+                    check, self._plot_row, 0, Qt.AlignmentFlag.AlignCenter)
+            self._plot_row += 1
 
-        section("Selected-block speed distribution (per frame)")
-        add("mean", "Mean speed", "px/s")
-        add("median", "Median speed", "px/s")
-        add("p90", "90th pct speed", "px/s")
-        add("p99", "99th pct speed", "px/s")
-        add("max", "Max speed (single fastest block)", "px/s")
-        add("sstd", "Spatial std of speed", "px/s")
-        add("peak", "Max - median (peakedness)", "px/s")
+        section("Raw selected-block speed distribution (per frame)")
+        add("mean", "Mean speed", "px/s", detect_target="per_frame")
+        add("median", "Median speed", "px/s", detect_target="scalar:median")
+        add("p90", "90th pct speed", "px/s", detect_target="scalar:p90")
+        add("p99", "99th pct speed", "px/s", detect_target="scalar:p99")
+        add("max", "Max speed (single fastest block)", "px/s",
+            detect_target="scalar:max")
+        add("sstd", "Spatial std of speed", "px/s", detect_target="scalar:sstd")
+        add("peak", "Max - median (peakedness)", "px/s",
+            detect_target="scalar:peak")
 
-        section("Temporal smoothing of mean speed (rolling-window slider)")
-        add("roll_mean", "Rolling mean of mean speed", "px/s", LINE2)
-        add("roll_std", "Rolling std of mean speed", "px/s", LINE2)
+        section("Trailing-window detection signal (minimum + window)")
+        add("roll_mean", "Mean retained speed over trailing window", "px/s", LINE2,
+            detect_target="windowed")
+        add("roll_std", "Rolling std of retained-block speed", "px/s", LINE2,
+            detect_target="scalar:roll_std")
 
-        section("Speed-threshold sweep over selected blocks (slider)")
+        self.detection_section_lbl = section(
+            "Detection sweep on selected channel (threshold slider)")
         add("count", "# blocks > threshold", "blk", QColor(110, 230, 120))
         add("frac", "Fraction of blocks > threshold", "", QColor(110, 230, 120))
         add("clump", "Largest connected clump > threshold", "blk",
@@ -479,7 +538,8 @@ class SpeedExplorer(QWidget):
             QColor(110, 230, 120))
         add("energy", "Total speed summed over blocks > threshold", "px/s",
             QColor(110, 230, 120))
-        self.plot_col.addStretch(1)
+        self.plot_col.setRowStretch(self._plot_row, 1)
+        self.detect_group.buttonToggled.connect(self._on_detect_plot_toggled)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -490,6 +550,11 @@ class SpeedExplorer(QWidget):
         self._thr_debounce.setSingleShot(True)
         self._thr_debounce.setInterval(120)
         self._thr_debounce.timeout.connect(self._recompute_threshold_series)
+
+        self._min_debounce = QTimer(self)
+        self._min_debounce.setSingleShot(True)
+        self._min_debounce.setInterval(120)
+        self._min_debounce.timeout.connect(self._recompute_temporal_series)
 
         self._sync_labels()
 
@@ -540,41 +605,181 @@ class SpeedExplorer(QWidget):
         self.plots["max"].set_series(s.max(1))
         self.plots["sstd"].set_series(s.std(1))
         self.plots["peak"].set_series(s.max(1) - np.median(s, 1))
-        self._mean_series = s.mean(1)
-        self._recompute_rolling()
+        self._recompute_temporal_series()
 
-    def _recompute_rolling(self):
-        win = max(1, int(round(self.roll_win_s * self.fps)))
-        x = self._mean_series
-        if win <= 1:
-            self.plots["roll_mean"].set_series(x)
-            self.plots["roll_std"].set_series(np.zeros_like(x))
-            return
-        pad = win // 2
-        xp = np.pad(x, (pad, win - 1 - pad), mode="edge")
-        cs = np.concatenate([[0.0], np.cumsum(xp, dtype=np.float64)])
-        rmean = (cs[win:] - cs[:-win]) / win
-        cs2 = np.concatenate([[0.0], np.cumsum(xp.astype(np.float64) ** 2)])
-        rmsq = (cs2[win:] - cs2[:-win]) / win
+    def _detection_input_series(self) -> np.ndarray:
+        """Spatial mean of the per-block field used as window input.
+
+        Blocks below the detection minimum become zero before temporal averaging.
+        Keeping the full block denominator makes this series exactly the spatial
+        mean of the per-block windowed field that detection thresholds.
+        """
+        values = self._active_block_values(self.speed)
+        return np.where(values >= self.detection_min, values, 0.0).mean(
+            1, dtype=np.float64).astype(np.float32)
+
+    def _window_bounds(self, W: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Structure-tensor-compatible trailing [lo, hi) window bounds."""
+        hi = np.arange(self.T) + 1
+        lo = np.maximum(0, hi - W)
+        return hi, lo, (hi - lo).astype(np.float32)
+
+    def _recompute_temporal_series(self):
+        win = self._temporal_window_frames()
+        x = self._detection_input_series()
+        hi, lo, neff = self._window_bounds(win)
+        cs = np.concatenate([[0.0], np.cumsum(x, dtype=np.float64)])
+        cs2 = np.concatenate([[0.0], np.cumsum(x.astype(np.float64) ** 2)])
+        rmean = (cs[hi] - cs[lo]) / neff
+        rmsq = (cs2[hi] - cs2[lo]) / neff
         rstd = np.sqrt(np.maximum(rmsq - rmean ** 2, 0.0))
         self.plots["roll_mean"].set_series(rmean.astype(np.float32))
         self.plots["roll_std"].set_series(rstd.astype(np.float32))
 
     # -- threshold-dependent series ------------------------------------------
 
+    def _temporal_window_frames(self) -> int:
+        return max(1, int(self.win_frames))
+
+    def _iter_windowed_fields(self, values: np.ndarray):
+        """Yield the selected temporal field one frame at a time.
+
+        Keeping only one block plane plus running sums avoids allocating another
+        full ``(T, ny, nx)`` array beside the already-large speed cache.
+        """
+        win = self._temporal_window_frames()
+        total = np.zeros(values.shape[1:], np.float64)
+
+        def update(index: int, sign: int):
+            sample = values[index]
+            retained = sample >= self.detection_min
+            if sign > 0:
+                np.add(total, sample, out=total, where=retained)
+            else:
+                np.subtract(total, sample, out=total, where=retained)
+
+        for frame in range(self.T):
+            update(frame, 1)
+            outgoing = frame - win
+            if outgoing >= 0:
+                update(outgoing, -1)
+            field = np.zeros(values.shape[1:], np.float32)
+            np.multiply(total, 1.0 / min(frame + 1, win), out=field,
+                        casting="unsafe")
+            yield field
+
+    def _iter_detection_fields(self, values: np.ndarray):
+        if self.detect_on == "windowed":
+            yield from self._iter_windowed_fields(values)
+            return
+        for frame in values:
+            yield np.where(frame >= self.detection_min, frame, 0.0)
+
+    def _detection_field_at(self, frame: int, values: np.ndarray) -> np.ndarray:
+        """Selected per-block detection field at one frame."""
+        if self.detect_on != "windowed":
+            current = values[frame]
+            return np.where(current >= self.detection_min, current, 0.0)
+
+        win = self._temporal_window_frames()
+        lo = max(0, frame + 1 - win)
+        indices = np.arange(lo, frame + 1)
+        samples = values[indices]
+        retained = samples >= self.detection_min
+        total = np.where(retained, samples, 0.0).sum(0, dtype=np.float64)
+        return (total / len(indices)).astype(np.float32)
+
+    def _scalar_detection_key(self) -> str | None:
+        prefix = "scalar:"
+        return self.detect_on[len(prefix):] if self.detect_on.startswith(prefix) \
+            else None
+
+    def _scalar_detection_series(self) -> np.ndarray | None:
+        key = self._scalar_detection_key()
+        return self.plots[key].y if key in self.plots else None
+
+    def _detection_scale(self) -> float:
+        series = self._scalar_detection_series()
+        if series is not None:
+            finite = series[np.isfinite(series)]
+            vmax = float(np.percentile(finite, 99.9)) if finite.size else 1.0
+            return max(vmax, 1e-4)
+        if self.detect_on == "windowed":
+            return self.vmax
+        return self.vmax
+
+    def _detection_label(self) -> str:
+        key = self._scalar_detection_key()
+        if key in self.plots:
+            return self.plots[key].title
+        if self.detect_on != "windowed":
+            return "per-frame speed"
+        return "trailing-window mean speed"
+
+    def _detection_unit(self) -> str:
+        key = self._scalar_detection_key()
+        if key in self.plots:
+            return self.plots[key].unit
+        return "px/s"
+
+    def _sync_detection_plot_labels(self):
+        label = self._detection_label()
+        unit = self._detection_unit()
+        scalar = self._scalar_detection_key() is not None
+        self.detection_section_lbl.setText(
+            "Scalar detection on selected plot (binary threshold)" if scalar
+            else "Detection sweep on selected channel (threshold slider)")
+        for key in ("frac", "clump", "cond_mean", "energy"):
+            self.plots[key].setHidden(scalar)
+        if scalar:
+            self.plots["count"].title = f"{label} > threshold"
+            self.plots["count"].unit = "0/1"
+            self.plots["count"].update()
+            return
+        self.plots["count"].title = "# blocks > threshold"
+        self.plots["count"].unit = "blk"
+        self.plots["cond_mean"].title = \
+            f"Mean {label} OF blocks > threshold"
+        self.plots["cond_mean"].unit = unit
+        self.plots["energy"].title = \
+            f"Total {label} summed over blocks > threshold"
+        self.plots["energy"].unit = unit
+        self.plots["cond_mean"].update()
+        self.plots["energy"].update()
+        self.plots["count"].update()
+
     def _recompute_threshold_series(self):
         thr = self.threshold
-        values = self._active_block_values(self.speed)  # (T, owned blocks)
-        mask = values > thr
-        count = mask.sum(1).astype(np.float32)
+        scalar_series = self._scalar_detection_series()
+        if scalar_series is not None:
+            detected = (scalar_series > thr).astype(np.float32)
+            self.plots["count"].set_series(detected)
+            self._sync_detection_plot_labels()
+            return
+        if self.detect_on == "per_frame":
+            values = self._active_block_values(self.speed)
+            mask = (values >= self.detection_min) & (values > thr)
+            count = mask.sum(1).astype(np.float32)
+            energy = np.where(mask, values, 0.0).sum(1, dtype=np.float64)
+        else:
+            count = np.zeros(self.T, np.float32)
+            energy = np.zeros(self.T, np.float64)
+            for region in self._active_regions():
+                y0, x0, y1, x1 = region["atlas_bbox"]
+                values = self.speed[:, y0:y1, x0:x1]
+                for frame, field in enumerate(
+                        self._iter_windowed_fields(values)):
+                    mask = field > thr
+                    count[frame] += float(mask.sum())
+                    energy[frame] += float(field[mask].sum(dtype=np.float64))
         self.plots["count"].set_series(count)
         self.plots["frac"].set_series(count / max(1, self.n_blocks))
 
-        energy = np.where(mask, values, 0.0).sum(1)
         self.plots["energy"].set_series(energy.astype(np.float32))
         with np.errstate(invalid="ignore", divide="ignore"):
             cond = np.where(count > 0, energy / np.maximum(count, 1), 0.0)
         self.plots["cond_mean"].set_series(cond.astype(np.float32))
+        self._sync_detection_plot_labels()
         # Clump is the expensive one; keep whatever it last held during a drag and
         # refresh it on slider release.
         if "clump" not in self.plots or self.plots["clump"].y.size == 0:
@@ -587,6 +792,9 @@ class SpeedExplorer(QWidget):
         most direct readout of 'is there a real moving CLUMP here, or just a few
         scattered noisy blocks that happen to exceed the cutoff'.
         """
+        if self._scalar_detection_key() is not None:
+            self.plots["clump"].set_series(np.zeros(self.T, np.float32))
+            return
         thr = self.threshold
         largest = np.zeros(self.T, np.float32)
         # Valid-area weights so a one-pixel-tall edge sliver is not counted as a
@@ -597,8 +805,9 @@ class SpeedExplorer(QWidget):
         for region in self._active_regions():
             y0, x0, y1, x1 = region["atlas_bbox"]
             w_flat = weight_plane[y0:y1, x0:x1].reshape(-1)
-            for t in range(self.T):
-                m = (self.speed[t, y0:y1, x0:x1] > thr).astype(np.uint8)
+            values = self.speed[:, y0:y1, x0:x1]
+            for t, field in enumerate(self._iter_detection_fields(values)):
+                m = (field > thr).astype(np.uint8)
                 if not m.any():
                     continue
                 n_lab, labels, _, _ = cv2.connectedComponentsWithStats(
@@ -612,19 +821,57 @@ class SpeedExplorer(QWidget):
     # -- control handlers ----------------------------------------------------
 
     def _sync_labels(self):
-        self.thr_lbl.setText(f"Speed threshold: {self.threshold:.2f} px/s")
-        self.rw_lbl.setText(f"Rolling window: {self.roll_win_s:.2f} s")
+        self.thr_lbl.setText(
+            f"Threshold ({self._detection_label()}): {self.threshold:.2f} "
+            f"{self._detection_unit()}")
+        self.min_lbl.setText(
+            f"Detection minimum: {self.detection_min:.2f} px/s")
+        self.rw_lbl.setText(
+            f"Detection window W: {self.win_frames} fr "
+            f"({self.win_frames / self.fps:.2f} s)")
+
+    def _rescale_detection_threshold(self):
+        self.thr_vmax = self._detection_scale()
+        self.threshold = self.thr_slider.value() / 1000.0 * self.thr_vmax
 
     def _on_threshold(self, v: int):
-        self.threshold = v / 1000.0 * self.vmax
+        self.threshold = v / 1000.0 * self.thr_vmax
         self._sync_labels()
         self._thr_debounce.start()
         self._redraw_video()          # highlight overlay follows immediately
 
     def _on_roll_win(self, v: int):
-        self.roll_win_s = v * 0.05
+        self.win_frames = max(2, int(v))
+        self._recompute_temporal_series()
+        if self.detect_on in ("windowed", "scalar:roll_std"):
+            self._rescale_detection_threshold()
+            self._thr_debounce.start()
         self._sync_labels()
-        self._recompute_rolling()
+        self._redraw_video()
+
+    def _on_roll_win_released(self):
+        if self.detect_on in ("windowed", "scalar:roll_std"):
+            self._thr_debounce.stop()
+            self._recompute_threshold_series()
+            self._recompute_clump()
+
+    def _on_detection_min(self, v: int):
+        self.detection_min = v / 1000.0 * self.vmax
+        self._sync_labels()
+        self._min_debounce.start()
+        self._thr_debounce.start()
+        self._redraw_video()
+
+    def _on_detect_plot_toggled(self, button, checked: bool):
+        if not checked:
+            return
+        data = button.property("detect_target")
+        self.detect_on = str(data) if data is not None else "per_frame"
+        self._rescale_detection_threshold()
+        self._sync_labels()
+        self._recompute_threshold_series()
+        self._recompute_clump()
+        self._redraw_video()
 
     def _on_region_changed(self, _index: int):
         data = self.region_combo.currentData()
@@ -841,8 +1088,11 @@ class SpeedExplorer(QWidget):
                 heat = cv2.applyColorMap(
                     (norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
                 heat = cv2.resize(heat, (rw, rh), interpolation=cv2.INTER_NEAREST)
-                out[dy0:dy1, dx0:dx1] = cv2.addWeighted(
-                    roi, 0.45, heat, 0.55, 0)
+                blended = cv2.addWeighted(roi, 0.45, heat, 0.55, 0)
+                retained = cv2.resize(
+                    (sub_speed >= self.detection_min).astype(np.uint8),
+                    (rw, rh), interpolation=cv2.INTER_NEAREST)
+                np.copyto(roi, blended, where=(retained > 0)[:, :, None])
             elif mode == "Flow direction (HSV)" and self.u is not None:
                 u = self.u[self.frame, y0:y1, x0:x1]
                 v = self.v[self.frame, y0:y1, x0:x1]
@@ -855,8 +1105,11 @@ class SpeedExplorer(QWidget):
                 direction = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
                 direction = cv2.resize(
                     direction, (rw, rh), interpolation=cv2.INTER_NEAREST)
-                out[dy0:dy1, dx0:dx1] = cv2.addWeighted(
-                    roi, 0.4, direction, 0.6, 0)
+                blended = cv2.addWeighted(roi, 0.4, direction, 0.6, 0)
+                retained = cv2.resize(
+                    (sub_speed >= self.detection_min).astype(np.uint8),
+                    (rw, rh), interpolation=cv2.INTER_NEAREST)
+                np.copyto(roi, blended, where=(retained > 0)[:, :, None])
             elif mode == "Flow vectors" and self.u is not None:
                 u = self.u[self.frame, y0:y1, x0:x1]
                 v = self.v[self.frame, y0:y1, x0:x1]
@@ -865,6 +1118,8 @@ class SpeedExplorer(QWidget):
                 vector_scale = min(cell_w, cell_h) / max(self.vmax, 1e-6) * 1.5
                 for by in range(0, gy, 2):
                     for bx in range(0, gx, 2):
+                        if sub_speed[by, bx] < self.detection_min:
+                            continue
                         ax0 = int(dx0 + (bx + 0.5) * cell_w)
                         ay0 = int(dy0 + (by + 0.5) * cell_h)
                         ax1 = int(ax0 + u[by, bx] * vector_scale)
@@ -873,11 +1128,20 @@ class SpeedExplorer(QWidget):
                                         (80, 220, 255), 1, tipLength=0.35)
 
         if self.hi_chk.isChecked() and not self._overlay_peek_hidden:
+            scalar_series = self._scalar_detection_series()
+            scalar_detected = scalar_series is not None and \
+                bool(scalar_series[self.frame] > self.threshold)
             for region_index in active_indices:
                 region = self.regions[region_index]
                 y0, x0, y1, x1 = region["atlas_bbox"]
                 dx0, dy0, dx1, dy1 = self._display_bbox(region, cw, ch)
-                m = (sp[y0:y1, x0:x1] > self.threshold).astype(np.uint8)
+                if scalar_series is not None:
+                    m = np.full((y1 - y0, x1 - x0), scalar_detected,
+                                dtype=np.uint8)
+                else:
+                    values = self.speed[:, y0:y1, x0:x1]
+                    field = self._detection_field_at(self.frame, values)
+                    m = (field > self.threshold).astype(np.uint8)
                 mm = cv2.resize(m, (dx1 - dx0, dy1 - dy0),
                                 interpolation=cv2.INTER_NEAREST)
                 roi = out[dy0:dy1, dx0:dx1]

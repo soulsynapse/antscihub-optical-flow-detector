@@ -96,6 +96,167 @@ class SpeedExplorerRegionTests(unittest.TestCase):
         finally:
             explorer.close()
 
+    def test_detection_minimum_drops_blocks_before_windowed_detection(self):
+        explorer = SpeedExplorer(_CacheStub())
+        try:
+            explorer.detection_min = 3.0
+            explorer.win_frames = 2
+            explorer._recompute_temporal_series()
+
+            # Rejected blocks are zero before the same trailing-window mean used
+            # by the per-block detector. The effective windows are [frame 0]
+            # and [frames 0, 1].
+            np.testing.assert_allclose(
+                explorer.plots["roll_mean"].y, [1.75, 2.375])
+
+            explorer.threshold = 0.5
+            explorer._recompute_threshold_series()
+            explorer._recompute_clump()
+            np.testing.assert_array_equal(explorer.plots["count"].y, [2, 3])
+            np.testing.assert_array_equal(explorer.plots["clump"].y, [2, 2])
+        finally:
+            explorer.close()
+
+    def test_temporal_signal_matches_structure_tensor_window_contract(self):
+        explorer = SpeedExplorer(_CacheStub())
+        try:
+            explorer.detection_min = 3.0
+            explorer.win_frames = 2
+            explorer._recompute_temporal_series()
+
+            np.testing.assert_allclose(
+                explorer.plots["roll_mean"].y, [1.75, 2.375])
+            self.assertEqual(explorer.plots["roll_mean"].unit, "px/s")
+            owned = explorer._active_block_values(explorer.speed)
+            fields = np.stack(list(explorer._iter_windowed_fields(owned)))
+            np.testing.assert_allclose(
+                explorer.plots["roll_mean"].y, fields.mean(1))
+            explorer.detect_on = "windowed"
+            np.testing.assert_allclose(
+                explorer._detection_field_at(1, owned), fields[1])
+            self.assertEqual(
+                explorer.temporal_mode_lbl.text(),
+                "Trailing-window mean (same contract as structure tensor)")
+            self.assertFalse(hasattr(explorer, "temporal_mode_combo"))
+        finally:
+            explorer.close()
+
+    def test_window_is_trailing_and_never_reads_future_frames(self):
+        explorer = SpeedExplorer(_CacheStub())
+        try:
+            explorer.win_frames = 3
+            explorer._recompute_temporal_series()
+
+            # With only two frames, W=3 uses one sample at frame 0 and two at
+            # frame 1. It neither centers the window nor repeats edge frames.
+            np.testing.assert_allclose(
+                explorer.plots["roll_mean"].y, [2.5, 3.0])
+            hi, lo, neff = explorer._window_bounds(3)
+            np.testing.assert_array_equal(hi, [1, 2])
+            np.testing.assert_array_equal(lo, [0, 0])
+            np.testing.assert_array_equal(neff, [1, 2])
+
+            left_tile = explorer.speed[:, 0:1, 0:2]
+            np.testing.assert_array_equal(
+                explorer._detection_field_at(0, left_tile), [[1.0, 2.0]])
+        finally:
+            explorer.close()
+
+    def test_detect_on_switches_thresholding_to_the_windowed_block_field(self):
+        explorer = SpeedExplorer(_CacheStub())
+        try:
+            self.assertFalse(hasattr(explorer, "detect_combo"))
+            self.assertFalse(hasattr(explorer, "detect_header"))
+            check_index = explorer.plot_col.indexOf(
+                explorer.detect_checks["per_frame"])
+            plot_index = explorer.plot_col.indexOf(explorer.plots["mean"])
+            self.assertEqual(explorer.plot_col.getItemPosition(check_index)[1], 0)
+            self.assertEqual(explorer.plot_col.getItemPosition(plot_index)[1], 1)
+            self.assertTrue(explorer.detect_checks["per_frame"].isChecked())
+            self.assertFalse(explorer.detect_checks["windowed"].isChecked())
+            explorer.detection_min = 3.0
+            explorer.win_frames = 2
+
+            explorer.threshold = 3.6
+            explorer._recompute_threshold_series()
+            explorer._recompute_clump()
+            np.testing.assert_array_equal(explorer.plots["count"].y, [1, 2])
+            np.testing.assert_array_equal(explorer.plots["clump"].y, [1, 2])
+
+            explorer.detect_checks["windowed"].setChecked(True)
+            explorer.threshold = 3.6
+            explorer._recompute_threshold_series()
+            explorer._recompute_clump()
+
+            self.assertEqual(explorer.detect_on, "windowed")
+            self.assertFalse(explorer.detect_checks["per_frame"].isChecked())
+            self.assertTrue(explorer.detect_checks["windowed"].isChecked())
+            np.testing.assert_array_equal(explorer.plots["count"].y, [1, 1])
+            np.testing.assert_array_equal(explorer.plots["clump"].y, [1, 1])
+            self.assertEqual(explorer.plots["cond_mean"].unit, "px/s")
+            self.assertAlmostEqual(explorer.thr_vmax, explorer.vmax)
+        finally:
+            explorer.close()
+
+    def test_scalar_plot_detection_is_binary_and_highlights_whole_replicate(self):
+        explorer = SpeedExplorer(_CacheStub())
+        try:
+            expected_targets = {
+                "per_frame", "scalar:median", "scalar:p90", "scalar:p99",
+                "scalar:max", "scalar:sstd", "scalar:peak", "windowed",
+                "scalar:roll_std",
+            }
+            self.assertEqual(set(explorer.detect_checks), expected_targets)
+
+            explorer.detect_checks["scalar:p90"].setChecked(True)
+            explorer.threshold = 4.0
+            explorer._recompute_threshold_series()
+
+            # P90 is 3.7 then 4.7 across the four owned blocks.
+            np.testing.assert_array_equal(explorer.plots["count"].y, [0, 1])
+            self.assertEqual(explorer.plots["count"].unit, "0/1")
+            self.assertIn("90th pct speed", explorer.plots["count"].title)
+            for key in ("frac", "clump", "cond_mean", "energy"):
+                self.assertTrue(explorer.plots[key].isHidden())
+
+            explorer.overlay_mode.setCurrentText("Raw frame")
+            explorer.frame = 0
+            explorer._redraw_video()
+            quiet = explorer.video_view._pix.toImage()
+            self.assertEqual(quiet.pixelColor(25, 25).getRgb()[:3], (0, 0, 0))
+
+            explorer.frame = 1
+            explorer._redraw_video()
+            detected = explorer.video_view._pix.toImage()
+            for x in (25, 75):
+                r, g, b = detected.pixelColor(x, 25).getRgb()[:3]
+                self.assertGreater(g, r)
+                self.assertGreater(g, b)
+
+            explorer.detect_checks["per_frame"].setChecked(True)
+            self.assertEqual(explorer.plots["count"].unit, "blk")
+            for key in ("frac", "clump", "cond_mean", "energy"):
+                self.assertFalse(explorer.plots[key].isHidden())
+        finally:
+            explorer.close()
+
+    def test_detection_minimum_removes_rejected_blocks_from_heatmap(self):
+        explorer = SpeedExplorer(_CacheStub())
+        try:
+            explorer.hi_chk.setChecked(False)
+            explorer.detection_min = 3.0
+            explorer._redraw_video()
+
+            image = explorer.video_view._pix.toImage()
+            # Frame 0's left replicate contains speeds [1, 2], so its heatmap
+            # is entirely absent and the black raw frame remains visible.
+            self.assertEqual(image.pixelColor(25, 25).getRgb()[:3], (0, 0, 0))
+            # The right replicate contains retained speeds [3, 4].
+            self.assertNotEqual(
+                image.pixelColor(75, 25).getRgb()[:3], (0, 0, 0))
+        finally:
+            explorer.close()
+
     def test_replicate_click_focuses_data_and_right_click_returns_to_overview(self):
         explorer = SpeedExplorer(_CacheStub())
         try:
