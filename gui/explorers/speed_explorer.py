@@ -39,6 +39,7 @@ source-frame boxes; atlas separators are never displayed or included in plots.
 """
 from __future__ import annotations
 
+import csv
 import os
 
 import cv2
@@ -53,7 +54,7 @@ from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
                          QPolygonF, QShortcut)
 from PyQt6.QtCore import QPointF, QRectF
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox,
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
                              QGridLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
                              QSlider, QVBoxLayout, QWidget)
 
@@ -879,25 +880,6 @@ class SpeedExplorer(QWidget):
         band_hint.setWordWrap(True)
         left.addWidget(band_hint)
 
-        # Spatial clump gate: bridges nearby in-band blocks within this
-        # Chebyshev block gap into one clump. Detection just requires a
-        # non-empty clump -- there is no separate min-size slider.
-        gap_row = QHBoxLayout()
-        self.gap_lbl = QLabel()
-        self.gap_lbl.setMinimumWidth(190)
-        gap_row.addWidget(self.gap_lbl)
-        self.gap_slider = QSlider(Qt.Orientation.Horizontal)
-        self.gap_slider.setRange(1, 8)
-        self.gap_slider.setValue(self.clump_gap)
-        self.gap_slider.setToolTip(
-            "Blocks within this Chebyshev block distance join one clump "
-            "(1 = strict 8-connectivity). Bridges gaps left by noisy "
-            "sub-threshold blocks so a real object reads as a single clump.")
-        self.gap_slider.valueChanged.connect(self._on_clump_gap)
-        self.gap_slider.sliderReleased.connect(self._on_clump_gap_released)
-        gap_row.addWidget(self.gap_slider, 1)
-        left.addLayout(gap_row)
-
         info = QLabel(
             f"cache: {self.meta.get('backend', '?')} | fps {self.fps:.2f} | "
             f"block {self.block}px | downsample {self.meta.get('downsample', '?')} | "
@@ -976,7 +958,15 @@ class SpeedExplorer(QWidget):
             "a few fast-block outliers. Axis-only: band thresholds are still set "
             "and compared in raw px/s regardless of this toggle.")
         self.log_chk.stateChanged.connect(self._on_log_toggle)
+        self.log_chk.setChecked(True)
         self.side_panel.addWidget(self.log_chk)
+        self.save_btn = QPushButton("Save plots (CSV)")
+        self.save_btn.setToolTip(
+            "Export every readout plot's per-frame series to one CSV -- a "
+            "'frame' column plus one column per plot, in the same order they "
+            "appear in the scroll column above.")
+        self.save_btn.clicked.connect(self._export_plots_csv)
+        self.side_panel.addWidget(self.save_btn)
         self.side_panel.addStretch(1)
         self.plot_col.addWidget(side_widget, 0, 2, -1, 1,
                                  Qt.AlignmentFlag.AlignTop)
@@ -990,8 +980,6 @@ class SpeedExplorer(QWidget):
         self._thr_debounce.setSingleShot(True)
         self._thr_debounce.setInterval(120)
         self._thr_debounce.timeout.connect(self._recompute_threshold_series)
-
-        self._sync_labels()
 
     # -- static (threshold-independent) series -------------------------------
 
@@ -1045,6 +1033,30 @@ class SpeedExplorer(QWidget):
         # the matrix data or the band -- a threshold means the same speed
         # whether the checkbox is on or off.
         self.plots["dist"].set_log_axis(self.log_chk.isChecked())
+
+    def _export_plots_csv(self):
+        """Dump every readout plot's per-frame series to one CSV.
+
+        Each plot (however it's computed -- density max, spatial std, a
+        threshold sweep) reduces to one (T,) series in ``plot.y``, so a
+        single frame-indexed table covers all of them regardless of type.
+        """
+        stem = os.path.splitext(os.path.basename(
+            self.meta.get("video_path", "speed")))[0]
+        default = f"{stem}_speed_plots.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export plots to CSV", default, "CSV (*.csv)")
+        if not path:
+            return
+        keys = list(self.plots.keys())
+        cols = [self.plots[k].y for k in keys]
+        n = max((c.size for c in cols), default=0)
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["frame"] + keys)
+            for i in range(n):
+                w.writerow([i] + [float(c[i]) if i < c.size else ""
+                                   for c in cols])
 
     # -- threshold-dependent series ------------------------------------------
 
@@ -1117,9 +1129,6 @@ class SpeedExplorer(QWidget):
 
     # -- control handlers ----------------------------------------------------
 
-    def _sync_labels(self):
-        self.gap_lbl.setText(f"Clump gap: {self.clump_gap} blk")
-
     def _on_band_changed(self):
         """A band handle is being dragged: cheap series debounced, overlay live."""
         self._thr_debounce.start()
@@ -1129,15 +1138,6 @@ class SpeedExplorer(QWidget):
         """Handle released: flush the cheap series and refresh the clump."""
         self._thr_debounce.stop()
         self._recompute_threshold_series()
-        self._recompute_clump()
-        self._redraw_video()
-
-    def _on_clump_gap(self, v: int):
-        """Gap slider moved: relabel live; re-cluster only on release (costly)."""
-        self.clump_gap = max(1, int(v))
-        self._sync_labels()
-
-    def _on_clump_gap_released(self):
         self._recompute_clump()
         self._redraw_video()
 
@@ -1171,7 +1171,6 @@ class SpeedExplorer(QWidget):
         self._apply_selected_plot_ui()
         self._recompute_threshold_series()
         self._recompute_clump()
-        self._sync_labels()
         self._sync_window_title()
         self._redraw_video()
 
