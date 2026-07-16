@@ -3,7 +3,7 @@
 A throwaway diagnostic to answer one question the main app currently makes you
 guess at: what does the speed signal actually look like, per block, over time --
 and what does the spatial detector (an in-band clump that must bridge nearby
-blocks and clear a size gate) do as you move its threshold, gap and size? The raw
+blocks) do as you move its threshold and gap? The raw
 per-block distribution is shown as a density heatmap rather than a spatial mean,
 because the mean buries the sparse fast blocks that are the actual signal.
 
@@ -14,24 +14,24 @@ every number here is exactly the number the real pipeline sees -- there is no
 second, slightly-different flow implementation to mistrust.
 
 Left panel  : the video with replicate-aware optical-flow overlay + transport.
-Right panel : a long scrollable column of speed-only time readouts. Ticking a
-              plot's checkbox makes it the detection channel: it doubles in
-              height and grows a draggable min/max *band* (in that plot's own Y
-              units). Detection is ``band_lo <= value <= band_hi`` -- the same
-              range primitive the real pipeline thresholds -- and the "above
-              band" group reshapes live as you drag either handle. A handle
-              parked at the plot's edge means *unbounded* on that side (readout
-              shows an infinity sign): this matters in per-block modes, where
-              individual block values run far past the plotted spatial-mean
-              curve's own maximum.
+Right panel : a long scrollable column of speed-only time readouts. The
+              per-block speed distribution plot carries the detection *band*:
+              a draggable min/max pair (in that plot's own Y units). Detection
+              is ``band_lo <= value <= band_hi`` -- the same range primitive
+              the real pipeline thresholds -- and the "above band" group
+              reshapes live as you drag either handle. A handle parked at the
+              plot's edge means *unbounded* on that side (readout shows an
+              infinity sign): individual block values run far past the
+              plotted density curve's own maximum, so an unbounded side must
+              not silently reject them.
 
-              In per-block modes the band feeds a *spatial* gate mirroring the
-              intended downstream: in-band blocks within a Chebyshev block *gap*
-              are single-link clustered into clumps, and a frame is a positive
-              detection when the largest clump's valid-area-weighted size clears
-              a *min-size* gate. Both are horizontal sliders; the video
-              highlights the qualifying clump bright and the gated-out in-band
-              blocks dim, so you can see exactly which blocks the gate keeps.
+              The band feeds a *spatial* gate mirroring the intended
+              downstream: in-band blocks within a Chebyshev block *gap* are
+              single-link clustered into clumps, and a frame is a positive
+              detection when the largest clump is non-empty. The gap is a
+              horizontal slider; the video highlights the qualifying clump
+              bright and the gated-out in-band blocks dim, so you can see
+              exactly which blocks the gate keeps.
 
 Current caches process each replicate independently and pack their block grids
 into a sparse storage atlas.  This explorer maps those tiles back to their real
@@ -43,6 +43,9 @@ import os
 
 import cv2
 import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 
 from core.replicates import block_weight_plane
 
@@ -50,7 +53,7 @@ from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
                          QPolygonF, QShortcut)
 from PyQt6.QtCore import QPointF, QRectF
-from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox,
                              QGridLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
                              QSlider, QVBoxLayout, QWidget)
 
@@ -60,7 +63,6 @@ from gui.video_panel import FrameView
 BG = QColor(24, 24, 24)
 PLOT_BG = QColor(12, 12, 12)
 LINE = QColor(120, 215, 255)
-LINE2 = QColor(255, 170, 80)
 CURSOR = QColor(255, 210, 80)
 TXT = QColor(210, 210, 210)
 TXT_DIM = QColor(140, 140, 140)
@@ -139,14 +141,20 @@ def _cluster_inband(mask: np.ndarray, weight: np.ndarray, gap: int):
     Dilation would have been cheaper but wrong on both fronts: it counts the
     phantom bridging blocks, and two isolated blocks merge at Chebyshev ``2*gap``
     (overlapping balls) rather than the intended ``gap``.
+
+    ``gap > 1`` used to pair up every in-band block against every other in
+    pure Python (O(K^2), called once per frame) -- fine at startup's default
+    K, but with a wide-open band and thousands of in-band blocks per frame
+    across a full clip, that stalls or hangs the UI the moment the gap slider
+    moves past 1. A KD-tree under Chebyshev distance (``p=inf``) finds the
+    same edge set -- pairs within ``gap`` -- in O(K log K), then
+    ``connected_components`` unions them in C.
     """
     if not mask.any():
         return np.zeros(mask.shape, np.int32), {}
 
     if gap <= 1:
-        # gap == 1 is plain 8-connectivity: let OpenCV label it in C. This is the
-        # default and the startup case (an unbounded band puts every block
-        # in-band), where an O(K^2) Python pass would stall on a large cache.
+        # gap == 1 is plain 8-connectivity: let OpenCV label it in C.
         n_lab, labels, _, _ = cv2.connectedComponentsWithStats(
             mask.astype(np.uint8), connectivity=8)
         areas = np.bincount(labels.reshape(-1),
@@ -158,28 +166,20 @@ def _cluster_inband(mask: np.ndarray, weight: np.ndarray, gap: int):
     coords = np.argwhere(mask)
     k = len(coords)
 
-    parent = np.arange(k)
+    if k == 1:
+        r, c = coords[0]
+        labels[r, c] = 1
+        return labels, {1: float(weight[r, c])}
 
-    def find(a: int) -> int:
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return int(a)
+    tree = cKDTree(coords)
+    pairs = tree.query_pairs(r=gap, p=np.inf, output_type="ndarray")
+    graph = csr_matrix((np.ones(len(pairs), np.uint8), (pairs[:, 0], pairs[:, 1])),
+                       shape=(k, k))
+    _, comp = connected_components(graph, directed=False)
 
-    for i in range(k):
-        if i + 1 >= k:
-            break
-        d = np.abs(coords[i + 1:] - coords[i]).max(axis=1)
-        for off in np.flatnonzero(d <= gap):
-            ra, rb = find(i), find(i + 1 + int(off))
-            if ra != rb:
-                parent[ra] = rb
-
-    roots = np.array([find(i) for i in range(k)])
-    _, ids = np.unique(roots, return_inverse=True)
     sizes: dict[int, float] = {}
     for idx, (r, c) in enumerate(coords):
-        cid = int(ids[idx]) + 1
+        cid = int(comp[idx]) + 1
         labels[r, c] = cid
         sizes[cid] = sizes.get(cid, 0.0) + float(weight[r, c])
     return labels, sizes
@@ -198,9 +198,10 @@ class MiniPlot(QWidget):
 
     When it is the selected detection channel the plot grows to double height and
     grows a detection *band*: two draggable 1px lines (a minimum and a maximum, in
-    the plot's own Y units) whose accepted strip is shaded. The lines extend a few
-    pixels past the plot's right edge into a handle margin so they read as pull
-    handles, mirroring the sketch. Detection is ``lo <= value <= hi`` -- the same
+    the plot's own Y units) whose rejected strips (outside the band) are shaded.
+    The lines extend a few pixels past the plot's right edge into a handle
+    margin so they read as pull handles, mirroring the sketch. Detection is
+    ``lo <= value <= hi`` -- the same
     band primitive the real pipeline uses (:class:`core.behavior.RangeLeaf`).
 
     A handle dragged to (or past) the plot's edge sets that side to +/-inf --
@@ -283,13 +284,24 @@ class MiniPlot(QWidget):
         return QRectF(6, 16, max(1, self.width() - 6 - rm),
                       max(1, self.height() - 22))
 
-    @staticmethod
-    def _y_of(val: float, r: QRectF, lo: float, hi: float) -> float:
-        return r.bottom() - (val - lo) / (hi - lo) * r.height()
+    def _fwd(self, v):
+        """Value -> axis-position space. Identity here; :class:`DensityPlot`
+        overrides this for its optional log value axis. Never touches stored
+        band values -- only where they get drawn/picked."""
+        return v
 
-    @staticmethod
-    def _val_of(y: float, r: QRectF, lo: float, hi: float) -> float:
-        return lo + (r.bottom() - y) / max(1.0, r.height()) * (hi - lo)
+    def _inv(self, t):
+        """Inverse of :meth:`_fwd`."""
+        return t
+
+    def _y_of(self, val: float, r: QRectF, lo: float, hi: float) -> float:
+        tval, tlo, thi = self._fwd(val), self._fwd(lo), self._fwd(hi)
+        return r.bottom() - (tval - tlo) / max(1e-12, thi - tlo) * r.height()
+
+    def _val_of(self, y: float, r: QRectF, lo: float, hi: float) -> float:
+        tlo, thi = self._fwd(lo), self._fwd(hi)
+        tval = tlo + (r.bottom() - y) / max(1.0, r.height()) * (thi - tlo)
+        return self._inv(tval)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -354,7 +366,7 @@ class MiniPlot(QWidget):
         p.end()
 
     def _paint_band(self, p: QPainter, r: QRectF, lo: float, hi: float) -> None:
-        """Shade the accepted [band_lo, band_hi] strip and draw its pull handles."""
+        """Shade the rejected strips outside [band_lo, band_hi] and draw handles."""
         blo, bhi = self.band()
         ylo = self._y_of(min(max(blo, lo), hi), r, lo, hi)
         yhi = self._y_of(min(max(bhi, lo), hi), r, lo, hi)
@@ -362,7 +374,10 @@ class MiniPlot(QWidget):
 
         shade = QColor(BAND)
         shade.setAlpha(30)
-        p.fillRect(QRectF(r.left(), top, r.width(), bot - top), shade)
+        if top > r.top():
+            p.fillRect(QRectF(r.left(), r.top(), r.width(), top - r.top()), shade)
+        if r.bottom() > bot:
+            p.fillRect(QRectF(r.left(), bot, r.width(), r.bottom() - bot), shade)
 
         line_right = self.width() - 3          # a few px past the plot's right edge
         p.setPen(QPen(BAND, 1))
@@ -454,8 +469,8 @@ class DensityPlot(MiniPlot):
     vanishing into the baseline.
 
     It is still a detection channel: the band handles ride the value axis exactly
-    as on a line plot, so the shaded strip shows precisely which slice of the
-    distribution the detector keeps. The heatmap is a binned image (cost scales
+    as on a line plot, so the shaded strips show precisely which slice of the
+    distribution the detector rejects. The heatmap is a binned image (cost scales
     with pixels, not blocks x frames), so a full-clip cache never lags.
     """
     # 0 -> plot background, ramping to bright cyan-white at the densest bin.
@@ -468,6 +483,22 @@ class DensityPlot(MiniPlot):
         self._img: QImage | None = None
         self._img_key: tuple | None = None
         self._ver = 0
+        # Value-axis-only log1p toggle: spreads out the low-speed bulk that a
+        # linear axis crushes against the bottom under a handful of fast-block
+        # outliers. Never changes what's stored in the matrix or the band --
+        # only where a given raw value gets drawn/picked on the Y axis.
+        self._log_axis = False
+
+    def set_log_axis(self, on: bool) -> None:
+        self._log_axis = bool(on)
+        self._img = None
+        self.update()
+
+    def _fwd(self, v):
+        return np.log1p(v) if self._log_axis else v
+
+    def _inv(self, t):
+        return np.expm1(t) if self._log_axis else t
 
     def set_matrix(self, m: np.ndarray) -> None:
         self.matrix = np.asarray(m, np.float32)          # (T, K)
@@ -494,13 +525,14 @@ class DensityPlot(MiniPlot):
     def _density_image(self, w: int, h: int, lo: float, hi: float):
         if w <= 0 or h <= 0 or self.matrix.size == 0:
             return None
-        key = (w, h, float(lo), float(hi), self._ver)
+        key = (w, h, float(lo), float(hi), self._ver, self._log_axis)
         if self._img is not None and self._img_key == key:
             return self._img
         T, K = self.matrix.shape
         col = np.clip((np.arange(T) * w) // max(1, T), 0, w - 1)
         col_idx = np.repeat(col, K).astype(np.int64)
-        frac = (self.matrix.ravel() - lo) / max(1e-9, hi - lo)
+        tlo, thi = self._fwd(lo), self._fwd(hi)
+        frac = (self._fwd(self.matrix.ravel()) - tlo) / max(1e-9, thi - tlo)
         # Row 0 is the top of the plot, so invert: the fastest blocks sit high.
         row = np.clip(((1.0 - frac) * (h - 1)).astype(np.int64), 0, h - 1)
         counts = np.bincount(row * w + col_idx,
@@ -545,12 +577,94 @@ class DensityPlot(MiniPlot):
 
         cur = float(self.y[min(self.cursor, n - 1)]) if n else 0.0
         p.setPen(TXT)
-        p.drawText(8, 12, self.title)
+        p.drawText(8, 12, self.title + (" [log axis]" if self._log_axis else ""))
         val_txt = f"max {cur:.4g} {self.unit}".strip()
         p.setPen(QColor(self.color))
         p.drawText(int(r.right()) - 7 * len(val_txt) - 2, 12, val_txt)
         p.setPen(TXT_DIM)
         p.drawText(int(r.left()), int(r.bottom()) + 8, f"{lo:.3g}")
+        p.end()
+
+
+class PixelBarPlot(MiniPlot):
+    """A bar chart rendered the same pixelated way as :class:`DensityPlot`.
+
+    :class:`MiniPlot` draws its envelope as an antialiased polyline. That reads
+    fine for a smooth line, but the per-block speed heatmap right above this
+    plot is a raster of hard square cells, and a smooth line under a blocky
+    heatmap looks like two different instruments. This plot instead rasterizes
+    into a ``QImage`` -- one flat-colored bar per pixel column, no antialiasing
+    -- so "# blocks in band" reads as the same pixel-grid instrument as the
+    density plot it sits under, just turned into bars instead of a value
+    histogram.
+
+    Columns use the same frame -> pixel mapping as
+    :meth:`DensityPlot._density_image` (``(frame * w) // T``), so a burst in
+    the heatmap and the bar it produces land in the same x column.
+    """
+
+    BASE_H = MiniPlot.BASE_H * 2
+
+    def _data_range(self) -> tuple[float, float]:
+        n = self.y.size
+        if n == 0:
+            return 0.0, 1.0
+        hi = float(np.nanmax(self.y))
+        if not np.isfinite(hi) or hi <= 0:
+            hi = 1.0
+        return 0.0, hi
+
+    def _bar_image(self, w: int, h: int, hi: float):
+        if w <= 0 or h <= 0 or self.y.size == 0:
+            return None
+        T = self.y.size
+        col = np.clip((np.arange(T) * w) // max(1, T), 0, w - 1)
+        heights = np.zeros(w, np.float32)
+        np.maximum.at(heights, col, self.y)          # envelope max per column
+        frac = np.clip(heights / max(1e-9, hi), 0, 1)
+        bar_px = np.round(frac * h).astype(np.int64)
+
+        rgb = np.empty((h, w, 3), np.uint8)
+        rgb[:, :] = (PLOT_BG.red(), PLOT_BG.green(), PLOT_BG.blue())
+        bar_color = (self.color.red(), self.color.green(), self.color.blue())
+        for x in range(w):
+            bp = int(bar_px[x])
+            if bp > 0:
+                rgb[h - bp:h, x] = bar_color
+        rgb = np.ascontiguousarray(rgb)
+        img = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+        return img
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), BG)
+        r = self._plot_rect()
+        p.fillRect(r, PLOT_BG)
+        p.setFont(QFont("Consolas", 7))
+        if self.y.size == 0:
+            p.setPen(TXT_DIM)
+            p.drawText(8, 12, self.title)
+            p.end()
+            return
+
+        lo, hi = self._data_range()
+        img = self._bar_image(int(r.width()), int(r.height()), hi)
+        if img is not None:
+            p.drawImage(r.topLeft(), img)
+
+        n = self.y.size
+        cx = r.left() + (self.cursor + 0.5) / n * r.width()
+        p.setPen(QPen(CURSOR, 1))
+        p.drawLine(int(cx), int(r.top()), int(cx), int(r.bottom()))
+
+        cur = float(self.y[min(self.cursor, n - 1)])
+        p.setPen(TXT)
+        p.drawText(8, 12, self.title)
+        val_txt = f"{cur:.4g} {self.unit}".strip()
+        p.setPen(QColor(self.color))
+        p.drawText(int(r.right()) - 7 * len(val_txt) - 2, 12, val_txt)
+        p.setPen(TXT_DIM)
+        p.drawText(int(r.left()), int(r.bottom()) + 8, f"{hi:.3g}")
         p.end()
 
 
@@ -583,6 +697,12 @@ class SpeedExplorer(QWidget):
         # Default to one experimental unit.  "All" remains available as an
         # explicitly pooled diagnostic, but behavior detection is per replicate.
         self.active_region_index = -1 if len(self.regions) > 1 else 0
+        # Each replicate (and the pooled overview) has its own value scale, so a
+        # band set on one scope is meaningless on another's axis. Cache bands per
+        # (scope, channel) instead of a single live value: revisiting a scope
+        # restores exactly what was left there, and a scope visited for the first
+        # time still seeds wide-open.
+        self._band_cache: dict[tuple[int, str], tuple[float, float]] = {}
         self.n_blocks = self._active_block_count()
         self.src_w = int(self.meta.get("src_width", 0))
         self.src_h = int(self.meta.get("src_height", 0))
@@ -629,13 +749,11 @@ class SpeedExplorer(QWidget):
         # which gives the slider one stable absolute px/s mapping.  Focusing a
         # replicate must not silently reinterpret or reset an analysis threshold.
         self.vmax = self._active_speed_scale()
-        self.win_frames = max(2, min(self.T - 1, int(round(self.fps))))
-        self.detect_on = "per_frame"
         # Spatial gate mirroring the intended downstream: bridge in-band blocks
-        # up to a Chebyshev block gap, then require the largest clump to reach a
-        # weighted size before the frame counts as a positive detection.
+        # up to a Chebyshev block gap into clumps. A frame is a positive
+        # detection when the largest clump is non-empty -- there is no
+        # separate min-size gate/slider; it was more trouble than it was worth.
         self.clump_gap = 1
-        self.clump_min = 1
 
         self.frame = int(state.current_frame) if state is not None else 0
         self.playing = False
@@ -746,45 +864,24 @@ class SpeedExplorer(QWidget):
         self.overlay_mode.setCurrentText("Speed heatmap")
         self.overlay_mode.currentTextChanged.connect(lambda _: self._redraw_video())
         orow.addWidget(self.overlay_mode, 1)
-        self.hi_chk = QCheckBox("Highlight detected clumps (band + size gate)")
+        self.hi_chk = QCheckBox("Highlight detected clumps (band, gap-bridged)")
         self.hi_chk.setChecked(True)
         self.hi_chk.stateChanged.connect(lambda _: self._redraw_video())
         orow.addWidget(self.hi_chk)
         left.addLayout(orow)
 
         # Detection thresholds no longer live on horizontal sliders: they are the
-        # min/max handles of the band on whichever plot is the selected channel.
+        # min/max handles of the band on the per-block speed plot.
         band_hint = QLabel(
-            "Detection thresholds: drag the min/max handles on the selected "
-            "plot (checked ✓) at right.")
+            "Detection thresholds: drag the min/max handles on the per-block "
+            "speed plot at right.")
         band_hint.setStyleSheet("color:#888;")
         band_hint.setWordWrap(True)
         left.addWidget(band_hint)
 
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Temporal aggregation:"))
-        self.temporal_mode_lbl = QLabel(
-            "Trailing-window mean (same contract as structure tensor)")
-        self.temporal_mode_lbl.setToolTip(
-            "Each frame uses that frame and up to W-1 preceding frames. At the "
-            "start of the clip, only the available history is averaged.")
-        mode_row.addWidget(self.temporal_mode_lbl, 1)
-        left.addLayout(mode_row)
-
-        rw_row = QHBoxLayout()
-        self.rw_lbl = QLabel()
-        self.rw_lbl.setMinimumWidth(190)
-        rw_row.addWidget(self.rw_lbl)
-        self.rw_slider = QSlider(Qt.Orientation.Horizontal)
-        self.rw_slider.setRange(2, max(3, self.T - 1))
-        self.rw_slider.setValue(self.win_frames)
-        self.rw_slider.valueChanged.connect(self._on_roll_win)
-        self.rw_slider.sliderReleased.connect(self._on_roll_win_released)
-        rw_row.addWidget(self.rw_slider, 1)
-        left.addLayout(rw_row)
-
-        # Spatial clump gate (per-block modes only): gap bridges nearby blocks
-        # into one clump; size gates how big the largest clump must be to fire.
+        # Spatial clump gate: bridges nearby in-band blocks within this
+        # Chebyshev block gap into one clump. Detection just requires a
+        # non-empty clump -- there is no separate min-size slider.
         gap_row = QHBoxLayout()
         self.gap_lbl = QLabel()
         self.gap_lbl.setMinimumWidth(190)
@@ -801,20 +898,6 @@ class SpeedExplorer(QWidget):
         gap_row.addWidget(self.gap_slider, 1)
         left.addLayout(gap_row)
 
-        size_row = QHBoxLayout()
-        self.size_lbl = QLabel()
-        self.size_lbl.setMinimumWidth(190)
-        size_row.addWidget(self.size_lbl)
-        self.size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.size_slider.setRange(1, max(2, self.n_blocks))
-        self.size_slider.setValue(min(self.clump_min, max(2, self.n_blocks)))
-        self.size_slider.setToolTip(
-            "Minimum largest-clump size (in valid-area-weighted blocks) for a "
-            "positive detection. This is the downstream min-clump gate.")
-        self.size_slider.valueChanged.connect(self._on_clump_min)
-        size_row.addWidget(self.size_slider, 1)
-        left.addLayout(size_row)
-
         info = QLabel(
             f"cache: {self.meta.get('backend', '?')} | fps {self.fps:.2f} | "
             f"block {self.block}px | downsample {self.meta.get('downsample', '?')} | "
@@ -822,9 +905,12 @@ class SpeedExplorer(QWidget):
         info.setStyleSheet("color:#888;")
         left.addWidget(info)
 
-        root.addLayout(left, 3)
+        root.addLayout(left, 1)
 
-        # ---- right: scrollable readouts ----
+        # ---- right: scrollable readouts. The gap for future toggles lives
+        # *inside* the scrolled grid (its own column), not beside the
+        # QScrollArea -- otherwise the scrollbar would float away from the
+        # program's right edge instead of hugging it.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         holder = QWidget()
@@ -832,17 +918,13 @@ class SpeedExplorer(QWidget):
         self.plot_col.setSpacing(3)
         self.plot_col.setColumnMinimumWidth(0, 20)
         self.plot_col.setColumnStretch(1, 1)
+        self.plot_col.setColumnMinimumWidth(2, 160)
+        self.plot_col.setColumnStretch(2, 0)
         scroll.setWidget(holder)
         scroll.setMinimumWidth(500)
-        root.addWidget(scroll, 2)
+        root.addWidget(scroll, 1)
 
         self.plots: dict[str, MiniPlot] = {}
-        self.detect_checks: dict[str, QCheckBox] = {}
-        # detect_target -> plot key, so the selected channel's band handles are
-        # found on the right plot.
-        self.detect_plot_key: dict[str, str] = {}
-        self.detect_group = QButtonGroup(self)
-        self.detect_group.setExclusive(True)
         self._plot_row = 0
 
         def section(text: str):
@@ -852,60 +934,52 @@ class SpeedExplorer(QWidget):
             self._plot_row += 1
             return lbl
 
-        def add(key: str, title: str, unit: str, color=LINE,
-                detect_target: str | None = None, cls=MiniPlot):
+        def add(key: str, title: str, unit: str, color=LINE, cls=MiniPlot):
             pl = cls(title, unit, color)
             pl.seek_requested.connect(self._seek)
             self.plots[key] = pl
             self.plot_col.addWidget(pl, self._plot_row, 1)
-            if detect_target is not None:
-                self.detect_plot_key[detect_target] = key
-                pl.band_changed.connect(self._on_band_changed)
-                pl.band_committed.connect(self._on_band_committed)
-                check = QCheckBox()
-                check.setAccessibleName(f"Detect on {title}")
-                check.setToolTip(
-                    f"Use {title} as the detection channel and drag its band")
-                check.setProperty("detect_target", detect_target)
-                self.detect_group.addButton(check)
-                self.detect_checks[detect_target] = check
-                check.setChecked(detect_target == self.detect_on)
-                self.plot_col.addWidget(
-                    check, self._plot_row, 0, Qt.AlignmentFlag.AlignCenter)
             self._plot_row += 1
+            return pl
 
         section("Raw selected-block speed distribution (per frame)")
-        add("mean", "Per-block speed (density)", "px/s",
-            detect_target="per_frame", cls=DensityPlot)
-        add("median", "Median speed", "px/s", detect_target="scalar:median")
-        add("p90", "90th pct speed", "px/s", detect_target="scalar:p90")
-        add("p99", "99th pct speed", "px/s", detect_target="scalar:p99")
-        add("max", "Max speed (single fastest block)", "px/s",
-            detect_target="scalar:max")
-        add("sstd", "Spatial std of speed", "px/s", detect_target="scalar:sstd")
-        add("peak", "Max - median (peakedness)", "px/s",
-            detect_target="scalar:peak")
+        dist = add("dist", "Per-block speed (density)", "px/s", cls=DensityPlot)
+        dist.band_changed.connect(self._on_band_changed)
+        dist.band_committed.connect(self._on_band_committed)
+        add("count", "# blocks in band", "blk", QColor(110, 230, 120),
+            cls=PixelBarPlot)
+        add("sstd", "Spatial std of speed", "px/s")
+        add("peak", "Max - median (peakedness)", "px/s")
 
-        section("Trailing-window detection signal (window)")
-        add("roll_mean", "Mean speed over trailing window", "px/s", LINE2,
-            detect_target="windowed")
-        add("roll_std", "Rolling std of block speed", "px/s", LINE2,
-            detect_target="scalar:roll_std")
-
-        self.detection_section_lbl = section(
-            "Detection sweep on selected channel (drag band handles)")
-        add("count", "# blocks in band", "blk", QColor(110, 230, 120))
+        section("Detection sweep (drag band handles on per-block speed plot)")
         add("frac", "Fraction of blocks in band", "", QColor(110, 230, 120))
         add("clump", "Largest clump in band (gap-bridged)", "blk",
             QColor(110, 230, 120))
-        add("detect", "Positive detection (clump ≥ size gate)", "0/1",
+        add("detect", "Positive detection (non-empty clump)", "0/1",
             QColor(120, 255, 140))
         add("cond_mean", "Mean speed OF blocks in band", "px/s",
             QColor(110, 230, 120))
         add("energy", "Total speed summed over blocks in band", "px/s",
             QColor(110, 230, 120))
         self.plot_col.setRowStretch(self._plot_row, 1)
-        self.detect_group.buttonToggled.connect(self._on_detect_plot_toggled)
+
+        # Reserved side strip (column 2): a home for toggles that apply to the
+        # whole readout column rather than one plot. Placed after every row is
+        # added so its -1 row-span actually covers them all.
+        side_widget = QWidget()
+        self.side_panel = QVBoxLayout(side_widget)
+        self.side_panel.setContentsMargins(6, 6, 6, 6)
+        self.log_chk = QCheckBox("Log-transform per-block speed")
+        self.log_chk.setToolTip(
+            "Draw the per-block speed distribution's value axis as log1p(speed) "
+            "instead of linear px/s, so the low-speed bulk isn't crushed flat by "
+            "a few fast-block outliers. Axis-only: band thresholds are still set "
+            "and compared in raw px/s regardless of this toggle.")
+        self.log_chk.stateChanged.connect(self._on_log_toggle)
+        self.side_panel.addWidget(self.log_chk)
+        self.side_panel.addStretch(1)
+        self.plot_col.addWidget(side_widget, 0, 2, -1, 1,
+                                 Qt.AlignmentFlag.AlignTop)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -962,175 +1036,33 @@ class SpeedExplorer(QWidget):
         # The per-frame channel shows the full per-block distribution as a
         # density heatmap, not a spatial mean -- the mean buries the sparse fast
         # blocks that are the actual signal.
-        self.plots["mean"].set_matrix(s)
-        self.plots["median"].set_series(np.median(s, 1))
-        self.plots["p90"].set_series(np.percentile(s, 90, axis=1))
-        self.plots["p99"].set_series(np.percentile(s, 99, axis=1))
-        self.plots["max"].set_series(s.max(1))
+        self.plots["dist"].set_matrix(s)
         self.plots["sstd"].set_series(s.std(1))
         self.plots["peak"].set_series(s.max(1) - np.median(s, 1))
-        self._recompute_temporal_series()
 
-    def _detection_input_series(self) -> np.ndarray:
-        """Spatial mean of the per-block field used as window input.
-
-        This is exactly the spatial mean of the per-block field that the windowed
-        detection channel later averages over a trailing time window.
-        """
-        values = self._active_block_values(self.speed)
-        return values.mean(1, dtype=np.float64).astype(np.float32)
-
-    def _window_bounds(self, W: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Structure-tensor-compatible trailing [lo, hi) window bounds."""
-        hi = np.arange(self.T) + 1
-        lo = np.maximum(0, hi - W)
-        return hi, lo, (hi - lo).astype(np.float32)
-
-    def _recompute_temporal_series(self):
-        win = self._temporal_window_frames()
-        x = self._detection_input_series()
-        hi, lo, neff = self._window_bounds(win)
-        cs = np.concatenate([[0.0], np.cumsum(x, dtype=np.float64)])
-        cs2 = np.concatenate([[0.0], np.cumsum(x.astype(np.float64) ** 2)])
-        rmean = (cs[hi] - cs[lo]) / neff
-        rmsq = (cs2[hi] - cs2[lo]) / neff
-        rstd = np.sqrt(np.maximum(rmsq - rmean ** 2, 0.0))
-        self.plots["roll_mean"].set_series(rmean.astype(np.float32))
-        self.plots["roll_std"].set_series(rstd.astype(np.float32))
+    def _on_log_toggle(self, _state=None):
+        # Axis-only: repaints how raw values map to pixel rows. Never touches
+        # the matrix data or the band -- a threshold means the same speed
+        # whether the checkbox is on or off.
+        self.plots["dist"].set_log_axis(self.log_chk.isChecked())
 
     # -- threshold-dependent series ------------------------------------------
 
-    def _temporal_window_frames(self) -> int:
-        return max(1, int(self.win_frames))
-
-    def _iter_windowed_fields(self, values: np.ndarray):
-        """Yield the selected temporal field one frame at a time.
-
-        Keeping only one block plane plus running sums avoids allocating another
-        full ``(T, ny, nx)`` array beside the already-large speed cache.
-        """
-        win = self._temporal_window_frames()
-        total = np.zeros(values.shape[1:], np.float64)
-
-        for frame in range(self.T):
-            np.add(total, values[frame], out=total)
-            outgoing = frame - win
-            if outgoing >= 0:
-                np.subtract(total, values[outgoing], out=total)
-            field = np.zeros(values.shape[1:], np.float32)
-            np.multiply(total, 1.0 / min(frame + 1, win), out=field,
-                        casting="unsafe")
-            yield field
-
-    def _iter_detection_fields(self, values: np.ndarray):
-        if self.detect_on == "windowed":
-            yield from self._iter_windowed_fields(values)
-            return
-        for frame in values:
-            yield frame
-
-    def _detection_field_at(self, frame: int, values: np.ndarray) -> np.ndarray:
-        """Selected per-block detection field at one frame."""
-        if self.detect_on != "windowed":
-            return values[frame]
-
-        win = self._temporal_window_frames()
-        lo = max(0, frame + 1 - win)
-        samples = values[lo:frame + 1]
-        return samples.mean(0, dtype=np.float64).astype(np.float32)
-
-    def _scalar_detection_key(self) -> str | None:
-        prefix = "scalar:"
-        return self.detect_on[len(prefix):] if self.detect_on.startswith(prefix) \
-            else None
-
-    def _scalar_detection_series(self) -> np.ndarray | None:
-        key = self._scalar_detection_key()
-        return self.plots[key].y if key in self.plots else None
-
-    def _selected_plot_key(self) -> str:
-        return self.detect_plot_key.get(self.detect_on, "mean")
-
-    def _selected_plot(self) -> "MiniPlot":
-        return self.plots[self._selected_plot_key()]
-
     def _band(self) -> tuple[float, float]:
-        """Current (lo, hi) detection band in the selected channel's Y units."""
-        return self._selected_plot().band()
+        """Current (lo, hi) detection band, in per-block speed's Y units."""
+        return self.plots["dist"].band()
 
     def _apply_selected_plot_ui(self):
-        """Expand + activate the band on the selected plot; reset the others."""
-        for target, key in self.detect_plot_key.items():
-            selected = (target == self.detect_on)
-            pl = self.plots[key]
-            pl.set_band_active(selected)
-            pl.set_expanded(selected)
-
-    def _detection_label(self) -> str:
-        key = self._scalar_detection_key()
-        if key in self.plots:
-            return self.plots[key].title
-        if self.detect_on != "windowed":
-            return "per-frame speed"
-        return "trailing-window mean speed"
-
-    def _detection_unit(self) -> str:
-        key = self._scalar_detection_key()
-        if key in self.plots:
-            return self.plots[key].unit
-        return "px/s"
-
-    def _sync_detection_plot_labels(self):
-        label = self._detection_label()
-        unit = self._detection_unit()
-        scalar = self._scalar_detection_key() is not None
-        self.detection_section_lbl.setText(
-            "Scalar detection on selected plot (in-band?)" if scalar
-            else "Detection sweep on selected channel (drag band handles)")
-        for key in ("frac", "clump", "detect", "cond_mean", "energy"):
-            self.plots[key].setHidden(scalar)
-        if scalar:
-            self.plots["count"].title = f"{label} in band"
-            self.plots["count"].unit = "0/1"
-            self.plots["count"].update()
-            return
-        self.plots["count"].title = "# blocks in band"
-        self.plots["count"].unit = "blk"
-        self.plots["cond_mean"].title = \
-            f"Mean {label} OF blocks in band"
-        self.plots["cond_mean"].unit = unit
-        self.plots["energy"].title = \
-            f"Total {label} summed over blocks in band"
-        self.plots["energy"].unit = unit
-        self.plots["cond_mean"].update()
-        self.plots["energy"].update()
-        self.plots["count"].update()
+        """The per-block speed plot is the sole detection channel: always on."""
+        self.plots["dist"].set_band_active(True)
+        self.plots["dist"].set_expanded(True)
 
     def _recompute_threshold_series(self):
         lo, hi = self._band()
-        scalar_series = self._scalar_detection_series()
-        if scalar_series is not None:
-            detected = ((scalar_series >= lo) &
-                        (scalar_series <= hi)).astype(np.float32)
-            self.plots["count"].set_series(detected)
-            self._sync_detection_plot_labels()
-            return
-        if self.detect_on == "per_frame":
-            values = self._active_block_values(self.speed)
-            mask = (values >= lo) & (values <= hi)
-            count = mask.sum(1).astype(np.float32)
-            energy = np.where(mask, values, 0.0).sum(1, dtype=np.float64)
-        else:
-            count = np.zeros(self.T, np.float32)
-            energy = np.zeros(self.T, np.float64)
-            for region in self._active_regions():
-                y0, x0, y1, x1 = region["atlas_bbox"]
-                values = self.speed[:, y0:y1, x0:x1]
-                for frame, field in enumerate(
-                        self._iter_windowed_fields(values)):
-                    mask = (field >= lo) & (field <= hi)
-                    count[frame] += float(mask.sum())
-                    energy[frame] += float(field[mask].sum(dtype=np.float64))
+        values = self._active_block_values(self.speed)
+        mask = (values >= lo) & (values <= hi)
+        count = mask.sum(1).astype(np.float32)
+        energy = np.where(mask, values, 0.0).sum(1, dtype=np.float64)
         self.plots["count"].set_series(count)
         self.plots["frac"].set_series(count / max(1, self.n_blocks))
 
@@ -1138,7 +1070,6 @@ class SpeedExplorer(QWidget):
         with np.errstate(invalid="ignore", divide="ignore"):
             cond = np.where(count > 0, energy / np.maximum(count, 1), 0.0)
         self.plots["cond_mean"].set_series(cond.astype(np.float32))
-        self._sync_detection_plot_labels()
         # Clump is the expensive one; keep whatever it last held during a drag and
         # refresh it on band release.
         if "clump" not in self.plots or self.plots["clump"].y.size == 0:
@@ -1154,10 +1085,6 @@ class SpeedExplorer(QWidget):
         This is the most direct readout of 'is there a real moving CLUMP here,
         or just a few scattered noisy blocks that happen to fall in the band'.
         """
-        if self._scalar_detection_key() is not None:
-            self.plots["clump"].set_series(np.zeros(self.T, np.float32))
-            self._recompute_detect()
-            return
         lo, hi = self._band()
         largest = np.zeros(self.T, np.float32)
         # Valid-area weights so a one-pixel-tall edge sliver is not counted as a
@@ -1169,7 +1096,7 @@ class SpeedExplorer(QWidget):
             y0, x0, y1, x1 = region["atlas_bbox"]
             w = weight_plane[y0:y1, x0:x1]
             values = self.speed[:, y0:y1, x0:x1]
-            for t, field in enumerate(self._iter_detection_fields(values)):
+            for t, field in enumerate(values):
                 m = (field >= lo) & (field <= hi)
                 if not m.any():
                     continue
@@ -1180,30 +1107,18 @@ class SpeedExplorer(QWidget):
         self._recompute_detect()
 
     def _recompute_detect(self):
-        """Positive-detection channel: is the largest clump >= the size gate?
+        """Positive-detection channel: is the largest clump non-empty?
 
         Cheap: it only re-compares the already-computed largest-clump series, so
-        moving the size slider never re-clusters -- only the gap slider or the
-        band does.
+        this never re-clusters -- only the gap slider or the band does.
         """
-        if self._scalar_detection_key() is not None:
-            self.plots["detect"].set_series(np.zeros(self.T, np.float32))
-            return
-        detected = (self.plots["clump"].y >= self.clump_min).astype(np.float32)
+        detected = (self.plots["clump"].y > 0).astype(np.float32)
         self.plots["detect"].set_series(detected)
 
     # -- control handlers ----------------------------------------------------
 
     def _sync_labels(self):
-        self.rw_lbl.setText(
-            f"Detection window W: {self.win_frames} fr "
-            f"({self.win_frames / self.fps:.2f} s)")
         self.gap_lbl.setText(f"Clump gap: {self.clump_gap} blk")
-        self.size_lbl.setText(f"Min clump size: {self.clump_min} blk")
-        spatial = self._scalar_detection_key() is None
-        for w in (self.gap_slider, self.gap_lbl,
-                  self.size_slider, self.size_lbl):
-            w.setEnabled(spatial)
 
     def _on_band_changed(self):
         """A band handle is being dragged: cheap series debounced, overlay live."""
@@ -1217,20 +1132,6 @@ class SpeedExplorer(QWidget):
         self._recompute_clump()
         self._redraw_video()
 
-    def _on_roll_win(self, v: int):
-        self.win_frames = max(2, int(v))
-        self._recompute_temporal_series()
-        if self.detect_on in ("windowed", "scalar:roll_std"):
-            self._thr_debounce.start()
-        self._sync_labels()
-        self._redraw_video()
-
-    def _on_roll_win_released(self):
-        if self.detect_on in ("windowed", "scalar:roll_std"):
-            self._thr_debounce.stop()
-            self._recompute_threshold_series()
-            self._recompute_clump()
-
     def _on_clump_gap(self, v: int):
         """Gap slider moved: relabel live; re-cluster only on release (costly)."""
         self.clump_gap = max(1, int(v))
@@ -1240,25 +1141,16 @@ class SpeedExplorer(QWidget):
         self._recompute_clump()
         self._redraw_video()
 
-    def _on_clump_min(self, v: int):
-        """Size gate moved: only re-gate the cheap detection series + overlay."""
-        self.clump_min = max(1, int(v))
-        self._sync_labels()
-        self._recompute_detect()
-        self._redraw_video()
-
-    def _on_detect_plot_toggled(self, button, checked: bool):
-        if not checked:
-            return
-        data = button.property("detect_target")
-        self.detect_on = str(data) if data is not None else "per_frame"
-        self._apply_selected_plot_ui()
-        self._sync_labels()
-        self._recompute_threshold_series()
-        self._recompute_clump()
-        self._redraw_video()
-
     def _on_region_changed(self, _index: int):
+        old_index = self.active_region_index
+        # Stash the outgoing scope's bands so re-visiting it later (rep 25 ->
+        # rep 26 -> rep 25) restores exactly what was left there, rather than
+        # losing it to a blanket reseed.
+        for key in ("dist",):
+            pl = self.plots[key]
+            if pl.band_lo is not None and pl.band_hi is not None:
+                self._band_cache[old_index, key] = (pl.band_lo, pl.band_hi)
+
         data = self.region_combo.currentData()
         self.active_region_index = int(data) if data is not None else 0
         focus = None if self.active_region_index < 0 else \
@@ -1266,18 +1158,16 @@ class SpeedExplorer(QWidget):
         self.video_view.set_focus_frac(focus)
         self._sync_video_boxes()
         self.n_blocks = self._active_block_count()
-        # A focused replicate holds far fewer blocks than the pooled overview, so
-        # keep the size gate's travel within the new scope's reachable clump size.
-        self.size_slider.setRange(1, max(2, self.n_blocks))
-        self.clump_min = min(self.clump_min, max(2, self.n_blocks))
-        self.size_slider.setValue(self.clump_min)
         self._compute_static_series()
-        # Each replicate lives on its own value scale, so a band frozen from the
-        # previous scope would sit off this replicate's plot entirely. Re-seed
-        # every channel's band to the new scope's range (this is a per-replicate
-        # diagnostic); the active plot reseeds immediately, the rest lazily.
-        for key in self.detect_plot_key.values():
-            self.plots[key].band_lo = self.plots[key].band_hi = None
+        # Each replicate lives on its own value scale, so a band frozen from a
+        # *different* scope would sit off this replicate's plot entirely -- but
+        # a band this exact scope held before is still meaningful. Restore it
+        # from the cache if we have one; otherwise the plot's band stays
+        # unseeded (None) and lazily seeds wide-open when it becomes active.
+        for key in ("dist",):
+            pl = self.plots[key]
+            cached = self._band_cache.get((self.active_region_index, key))
+            pl.band_lo, pl.band_hi = cached if cached is not None else (None, None)
         self._apply_selected_plot_ui()
         self._recompute_threshold_series()
         self._recompute_clump()
@@ -1516,41 +1406,23 @@ class SpeedExplorer(QWidget):
 
         if self.hi_chk.isChecked() and not self._overlay_peek_hidden:
             lo, hi = self._band()
-            scalar_series = self._scalar_detection_series()
-            scalar_detected = scalar_series is not None and \
-                bool(lo <= scalar_series[self.frame] <= hi)
-            # Per-block modes gate the highlight the same way the detect channel
-            # does: bright green marks blocks in a clump that clears the size
-            # gate (the actual detection), dim green the in-band blocks it drops.
-            weight_plane = (None if scalar_series is not None
-                            else block_weight_plane(self.meta))
+            # Bright green marks blocks in a non-empty gap-bridged clump --
+            # there is no min-size gate to drop any of them dim anymore.
+            weight_plane = block_weight_plane(self.meta)
             for region_index in active_indices:
                 region = self.regions[region_index]
                 y0, x0, y1, x1 = region["atlas_bbox"]
                 dx0, dy0, dx1, dy1 = self._display_bbox(region, cw, ch)
-                dim = None
-                if scalar_series is not None:
-                    hot = np.full((y1 - y0, x1 - x0), scalar_detected,
-                                  dtype=np.uint8)
-                else:
-                    values = self.speed[:, y0:y1, x0:x1]
-                    field = self._detection_field_at(self.frame, values)
-                    inband = (field >= lo) & (field <= hi)
-                    labels, sizes = _cluster_inband(
-                        inband, weight_plane[y0:y1, x0:x1], self.clump_gap)
-                    qual = [cid for cid, s in sizes.items()
-                            if s >= self.clump_min]
-                    hot = (np.isin(labels, qual) if qual
-                           else np.zeros_like(labels, bool)).astype(np.uint8)
-                    dim = (inband & (hot == 0)).astype(np.uint8)
+                field = self.speed[self.frame, y0:y1, x0:x1]
+                inband = (field >= lo) & (field <= hi)
+                labels, sizes = _cluster_inband(
+                    inband, weight_plane[y0:y1, x0:x1], self.clump_gap)
+                qual = [cid for cid, s in sizes.items() if s > 0]
+                hot = (np.isin(labels, qual) if qual
+                       else np.zeros_like(labels, bool)).astype(np.uint8)
                 roi = out[dy0:dy1, dx0:dx1]
                 green = np.zeros_like(roi)
                 green[..., 1] = 255
-                if dim is not None and dim.any():
-                    md = cv2.resize(dim, (dx1 - dx0, dy1 - dy0),
-                                    interpolation=cv2.INTER_NEAREST)
-                    faint = cv2.addWeighted(roi, 0.78, green, 0.22, 0)
-                    np.copyto(roi, faint, where=(md > 0)[:, :, None])
                 mm = cv2.resize(hot, (dx1 - dx0, dy1 - dy0),
                                 interpolation=cv2.INTER_NEAREST)
                 blended = cv2.addWeighted(roi, 0.5, green, 0.5, 0)
