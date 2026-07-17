@@ -183,6 +183,12 @@ class StructureTensorExplorerTests(unittest.TestCase):
             np.testing.assert_allclose(
                 explorer.plots["appear_w"].y, [0.5, 1.0, 7.0 / 3.0, 3.0],
                 rtol=1e-5)
+            # Unchecking the box switches every windowed read to the causal
+            # trailing convention [t-W+1, t]: same data, mass W/2 later.
+            explorer.centered_chk.setChecked(False)
+            np.testing.assert_allclose(
+                explorer.plots["appear_w"].y, [0.0, 0.5, 1.0, 7.0 / 3.0],
+                rtol=1e-5)
         finally:
             explorer.close()
 

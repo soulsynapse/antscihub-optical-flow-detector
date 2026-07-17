@@ -179,6 +179,8 @@ class StructureTensorExplorer(QWidget):
         # so a single-frame spike of N blocks dilutes to N/D and cannot fake a
         # sustained event. D = 1 reproduces the raw per-frame count.
         self.sweep_win = max(1, min(self.T - 1, int(round(self.fps))))
+        # Centered vs trailing integration windows (see _window_bounds).
+        self.centered = True
         self.detect = "appearance energy"
         self.frame = int(state.current_frame) if state is not None else 0
         self.playing = False
@@ -256,23 +258,33 @@ class StructureTensorExplorer(QWidget):
         self.n_blocks = self._ci_own.shape[1]
 
     def _window_bounds(self, W):
-        """CENTERED prefix-sum bounds: frame t integrates [t - W//2, t + ceil(W/2) - 1].
+        """Prefix-sum bounds per frame; centered or trailing per the checkbox.
 
-        Centered rather than trailing so an event's windowed mass peaks where
-        the event IS, not W/2 frames later -- this is an offline explorer over
-        a cached clip, so reading the future is free. (A causal deployment of
-        the same thresholds gets the W/2 latency back.) Windows truncate at
-        both clip edges; neff keeps the means honest there.
+        Centered (default): frame t integrates [t - W//2, t + ceil(W/2) - 1],
+        so an event's windowed mass peaks where the event IS, not W/2 frames
+        later -- this is an offline explorer over a cached clip, so reading
+        the future is free. Trailing ([t - W + 1, t]) is the causal view: what
+        a live detector running these thresholds would actually see, W/2 lag
+        included. Windows truncate at the clip edges; neff keeps the means
+        honest there.
         """
         t = np.arange(self.T)
-        lo = np.maximum(0, t - W // 2)
-        hi = np.minimum(self.T, t + (W - W // 2))
+        if self.centered:
+            lo = np.maximum(0, t - W // 2)
+            hi = np.minimum(self.T, t + (W - W // 2))
+        else:
+            hi = t + 1
+            lo = np.maximum(0, hi - W)
         return hi, lo, (hi - lo).astype(np.float32)
 
     def _win_slice(self, t: int, W: int) -> tuple[int, int]:
         """Scalar (lo, hi) of ``_window_bounds`` for one frame (overlay path)."""
-        lo = max(0, t - W // 2)
-        hi = min(self.T, t + (W - W // 2))
+        if self.centered:
+            lo = max(0, t - W // 2)
+            hi = min(self.T, t + (W - W // 2))
+        else:
+            hi = t + 1
+            lo = max(0, hi - W)
         return lo, hi
 
     def _owned_windowed(self, W):
@@ -389,6 +401,17 @@ class StructureTensorExplorer(QWidget):
         self.log_chk.setChecked(True)
         self.log_chk.stateChanged.connect(self._on_log_toggle)
         left.addWidget(self.log_chk)
+
+        self.centered_chk = QCheckBox("Centered integration windows")
+        self.centered_chk.setToolTip(
+            "Checked: frame t integrates [t-W/2, t+W/2], so windowed mass and "
+            "detections peak ON the event (offline view; reads the future). "
+            "Unchecked: trailing [t-W+1, t] -- what a causal live detector "
+            "would see, with its W/2 lag. Applies to W, the detection window "
+            "D, the overlay, and the vs-W density alike.")
+        self.centered_chk.setChecked(self.centered)
+        self.centered_chk.stateChanged.connect(self._on_centered_toggle)
+        left.addWidget(self.centered_chk)
 
         self.win_slider, self.win_lbl = self._add_slider(
             left, 2, max(3, self.T - 1), self.win_frames, self._on_window)
@@ -576,12 +599,13 @@ class StructureTensorExplorer(QWidget):
         self._recompute_windowed_count(count)
 
     def _recompute_windowed_count(self, count: np.ndarray | None = None):
-        """Centered mean of the in-band count over the detection window D.
+        """Mean of the in-band count over the detection window D.
 
-        Same centered convention as ``_window_bounds``, so the gate fires ON
-        the event rather than D/2 frames after it. The dilution property is
-        unchanged: a 1-frame spike of N blocks never reads more than N/D, so
-        sustained evidence is still required to clear the min handle.
+        Follows the ``_window_bounds`` convention (centered by default, so the
+        gate fires ON the event rather than D/2 frames after it). The dilution
+        property holds either way: a 1-frame spike of N blocks never reads
+        more than N/D, so sustained evidence is still required to clear the
+        min handle.
         """
         if count is None:
             count = self.plots["count"].y
@@ -592,12 +616,11 @@ class StructureTensorExplorer(QWidget):
         if self.sweep_win <= 1:
             windowed = count.astype(np.float32)
         else:
+            # count is always the full-clip (T,) series, so the shared bounds
+            # apply directly.
             c = np.concatenate([[0.0], np.cumsum(count, dtype=np.float64)])
-            D = self.sweep_win
-            t = np.arange(count.size)
-            lo = np.maximum(0, t - D // 2)
-            hi = np.minimum(count.size, t + (D - D // 2))
-            windowed = ((c[hi] - c[lo]) / (hi - lo)).astype(np.float32)
+            hi, lo, neff = self._window_bounds(self.sweep_win)
+            windowed = ((c[hi] - c[lo]) / neff).astype(np.float32)
         self.plots["count_w"].set_series(windowed)
         self._recompute_detect()
 
@@ -661,9 +684,13 @@ class StructureTensorExplorer(QWidget):
         Ws = np.unique(np.round(
             np.geomspace(1, self.T, num=min(160, self.T))).astype(int))
         Ws = Ws[Ws >= 1]
-        # Same centered convention as _window_bounds, per window length.
-        los = np.maximum(0, t0 - Ws // 2)
-        his = np.minimum(self.T, t0 + (Ws - Ws // 2))
+        # Same convention as _window_bounds, per window length.
+        if self.centered:
+            los = np.maximum(0, t0 - Ws // 2)
+            his = np.minimum(self.T, t0 + (Ws - Ws // 2))
+        else:
+            his = np.full_like(Ws, t0 + 1)
+            los = np.maximum(0, t0 + 1 - Ws)
         neff = (his - los).astype(np.float32)[:, None]
         if self.detect == "amplitude variance":
             mi = (self._ci_own[his] - self._ci_own[los]) / neff
@@ -719,6 +746,12 @@ class StructureTensorExplorer(QWidget):
         on = self.log_chk.isChecked()
         for key in ("variance", "change_w", "appear_w", "vw_sel"):
             self.plots[key].set_log_axis(on)
+
+    def _on_centered_toggle(self, _state=None):
+        # Same recompute path as a window-length change: every windowed read
+        # (series, sweep, vs-W curve, overlay) depends on the convention.
+        self.centered = self.centered_chk.isChecked()
+        self._apply_window_change()
 
     def _on_band_changed(self):
         """A band handle is being dragged: cheap series debounced, overlay live."""
