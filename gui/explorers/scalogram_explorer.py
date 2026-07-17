@@ -94,7 +94,13 @@ class ScalogramPlot(MiniPlot):
         self._img = None
         self._img_key = None
         self._ver = 0
-        self.band_active = True
+        # Seed the band through set_band_active (not a bare band_active = True):
+        # MiniPlot.band() short-circuits to full range whenever EITHER endpoint
+        # is still None, so an unseeded band silently ignores every drag until
+        # both handles have been assigned. Seeding both to +/-inf (as every other
+        # band plot does) keeps the same wide-open default while making the very
+        # first drag take effect.
+        self.set_band_active(True)
         self.setMinimumHeight(self.BASE_H)
         self.setMaximumHeight(self.BASE_H)
 
@@ -251,9 +257,13 @@ class ScalogramExplorer(QWidget):
             "intensity": np.asarray(ch["intensity"], np.float32),
             "speed": np.asarray(cache.read("speed"), np.float32),
         }
+        self._channels_bytes = sum(a.nbytes for a in self._chan.values())
         self.T = self._chan["change"].shape[0]
         self.freqs = default_freqs(self.fps)
         self.channel = "change energy Jtt"
+        # One-line status ("what is it doing right now") shown persistently under
+        # the video. Set before every heavy step so a GUI-thread stall is legible.
+        self._phase = "starting…"
         self.frame = int(state.current_frame) if state is not None else 0
         self.playing = False
         self._overlay_peek_hidden = False
@@ -447,9 +457,17 @@ class ScalogramExplorer(QWidget):
                       f"{len(self.freqs)} scales")
         info.setStyleSheet("color:#888;")
         left.addWidget(info)
-        self._busy_lbl = QLabel("")
-        self._busy_lbl.setStyleSheet("color:#e0a94a;")
-        left.addWidget(self._busy_lbl)
+        # Persistent activity/memory line. Everything heavy on this explorer is
+        # either off-thread (the cube worker) or a blocking O(F*T*B) / O(T)
+        # GUI-thread pass; this line names the current step and reports retained
+        # cube memory vs budget so an unresponsive stretch has a visible cause.
+        self._status_lbl = QLabel("")
+        self._status_lbl.setWordWrap(False)
+        self._status_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._status_lbl.setStyleSheet(
+            "color:#e0a94a; font-family:Consolas; font-size:11px;")
+        left.addWidget(self._status_lbl)
         root.addLayout(left, 3)
 
         scroll = QScrollArea()
@@ -542,6 +560,7 @@ class ScalogramExplorer(QWidget):
 
         self._apply_selected_plot_ui()
         self._sync_labels()
+        self._update_status()
 
     def _add_slider(self, layout, lo, hi, val, handler):
         row = QHBoxLayout()
@@ -587,6 +606,12 @@ class ScalogramExplorer(QWidget):
         if self.active_region_index < 0:
             return
         i, j = self._band_indices()
+        n_cached = sum(1 for name in self.density_plots
+                       if self._sg_cache.get((self.active_region_index, name))
+                       is not None)
+        if n_cached:
+            self._set_phase(f"summing band power ({n_cached} cube"
+                            f"{'s' if n_cached > 1 else ''})…", paint=True)
         empty = np.zeros((0, 0), np.float32)
         for name, dp in self.density_plots.items():
             cube = self._sg_cache.get((self.active_region_index, name))
@@ -601,6 +626,7 @@ class ScalogramExplorer(QWidget):
         pooled = blocks.mean(axis=1)
         self.trace_plot.set_series(pooled)
         self.trace_plot.set_cursor(self.frame)
+        self._set_phase("transforming pooled scalogram…", paint=True)
         self.scalo_plot.set_scalogram(morlet_power(pooled, self.fps, self.freqs))
         self.scalo_plot.set_cursor(self.frame)
         # Overlay color scale is a whole-clip percentile of this channel/scope;
@@ -658,7 +684,13 @@ class ScalogramExplorer(QWidget):
         # A private contiguous copy: the worker reads it while the GUI thread
         # keeps using self._chan freely.
         blocks = np.ascontiguousarray(self._scope_blocks(arr, region_idx))
-        self._set_busy(True)
+        # Announce the build with the cube's projected footprint (F*T*B float32),
+        # so the wait has a number attached before the worker even starts.
+        b = blocks.shape[1]
+        est = len(self.freqs) * self.T * b * 4
+        self._set_phase(f"building scalogram · {channel} · "
+                        f"{len(self.freqs)}×{self.T}×{b} (~{self._fmt_bytes(est)})…",
+                        paint=True)
         self._worker = _ScalogramWorker(key, blocks, self.fps, self.freqs, self)
         self._worker.done.connect(self._on_cube_ready)
         # Free the finished thread (and its private (T, B) blocks copy) instead
@@ -696,8 +728,57 @@ class ScalogramExplorer(QWidget):
                 continue
             total -= self._sg_cache.pop(k).nbytes
 
+    # -- status line ---------------------------------------------------------
+    @staticmethod
+    def _fmt_bytes(n) -> str:
+        n = float(n)
+        for unit, thresh in (("GB", 1024 ** 3), ("MB", 1024 ** 2),
+                             ("KB", 1024.0)):
+            if n >= thresh:
+                return f"{n / thresh:.1f} {unit}"
+        return f"{n:.0f} B"
+
+    def _update_status(self) -> None:
+        """Recompose the persistent line from live state (cheap: a few sums)."""
+        if not hasattr(self, "_status_lbl"):
+            return
+        parts = [self._phase]
+        total = sum(c.nbytes for c in self._sg_cache.values())
+        parts.append(
+            f"cubes {len(self._sg_cache)} · {self._fmt_bytes(total)}/"
+            f"{self._fmt_bytes(self._SG_CACHE_BUDGET)}")
+        cube = self._sg_cache.get((self.active_region_index, self.channel))
+        if cube is not None:
+            f, t, b = cube.shape
+            parts.append(f"cube {f}×{t}×{b} ({self._fmt_bytes(cube.nbytes)})")
+        parts.append(f"channels {self._fmt_bytes(self._channels_bytes)}")
+        flo, fhi = self.scalo_plot.band_hz()
+        parts.append(f"band {flo:.2f}–{fhi:.2f} Hz")
+        self._status_lbl.setText("   ·   ".join(parts))
+
+    def _set_phase(self, phase: str, *, paint: bool = False) -> None:
+        """Set the current-activity string and refresh the line. ``paint=True``
+        forces an immediate synchronous repaint -- use it right before a blocking
+        GUI-thread step so the label shows the step *while* it stalls."""
+        self._phase = phase
+        self._update_status()
+        if paint and hasattr(self, "_status_lbl"):
+            self._status_lbl.repaint()
+
+    def _settle_phase(self):
+        """Return the line to a resting state -- but never stomp a build that is
+        still running, whose phase should stand until its cube lands."""
+        if self._worker is not None:
+            self._update_status()
+            return
+        self._set_phase("select a replicate" if self.active_region_index < 0
+                        else "ready")
+
     def _set_busy(self, busy):
-        self._busy_lbl.setText("building scalogram…" if busy else "")
+        # A finished/settled state: name what's next rather than blanking, so the
+        # line always reports memory even at rest.
+        if not busy:
+            self._settle_phase()
 
     def closeEvent(self, e):
         if self._event_filter_app is not None:
@@ -749,6 +830,7 @@ class ScalogramExplorer(QWidget):
     def _recompute_sweep(self):
         self._recompute_counts()
         self._recompute_clump()
+        self._settle_phase()
 
     def _recompute_counts(self):
         """# blocks in the selected channel's value band per frame, and its
@@ -765,6 +847,7 @@ class ScalogramExplorer(QWidget):
         self.count_plot.set_series(count)
         self.count_plot.set_cursor(self.frame)
         self._recompute_windowed_count(count)
+        self._settle_phase()
 
     def _recompute_windowed_count(self, count: np.ndarray | None = None):
         if count is None:
@@ -808,6 +891,8 @@ class ScalogramExplorer(QWidget):
             self.clump_plot.set_series(np.zeros(0, np.float32))
             return
         lo, hi = dp.band()
+        self._set_phase(f"computing connected clumps ({m.shape[0]} frames)…",
+                        paint=True)
         largest = np.zeros(m.shape[0], np.float32)
         for t in range(m.shape[0]):
             cols = m[t]
