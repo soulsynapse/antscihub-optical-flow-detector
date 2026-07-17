@@ -48,7 +48,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                              QPushButton, QScrollArea, QSlider, QVBoxLayout,
                              QWidget)
 
-from core.tensor_channels import load_or_extract_channels
+from core.channel_source import cache_channel_source
 from core.wavelet import default_freqs, morlet_power
 from gui.video_panel import FrameView
 from gui.explorers.speed_explorer import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
@@ -208,15 +208,40 @@ class ScalogramExplorer(QWidget):
     _SG_CACHE_BUDGET = 6 * 1024 ** 3
 
     def __init__(self, cache=None, video_path: str | None = None, *,
-                 state=None, sidecar_path: str | None = None, parent=None):
+                 state=None, sidecar_path: str | None = None,
+                 channel_data=None, parent=None):
         super().__init__(parent)
-        if state is not None:
+        if state is not None and cache is None and channel_data is None:
             cache = state.cache
-        if cache is None:
-            raise ValueError("ScalogramExplorer requires an open cache")
         self.state = state
         self.cache = cache
-        self.meta = cache.meta
+
+        # Source of geometry + channels. A ChannelData decouples us from the
+        # cache: it comes either from an open cache (all five channels) or a live
+        # windowed pass over a bare video (four channels, no cached flow speed).
+        if channel_data is None:
+            if cache is None:
+                raise ValueError(
+                    "ScalogramExplorer requires a cache, state, or channel_data")
+            dlg = QProgressDialog("Extracting structure-tensor channels...", None,
+                                  0, int(cache.meta["n_frames"]), self)
+            dlg.setWindowModality(Qt.WindowModality.WindowModal)
+            dlg.setMinimumDuration(0)
+
+            def prog(done, total):
+                dlg.setMaximum(total)
+                dlg.setValue(done)
+                QApplication.processEvents()
+
+            channel_data = cache_channel_source(
+                cache, sidecar_path=sidecar_path, progress=prog)
+            dlg.close()
+
+        self._cd = channel_data
+        self.meta = channel_data.meta
+        # Absolute video frame the T axis starts at (0 for full-clip sources);
+        # the video overlay adds it back to decode the right frame.
+        self.window_start = int(channel_data.window_start)
         self.fps = float(self.meta["fps"])
         self.dt = 1.0 / max(self.fps, EPS)
         self.ny, self.nx = map(int, self.meta["grid"])
@@ -234,25 +259,10 @@ class ScalogramExplorer(QWidget):
         self.src_h = max(1, int(self.meta.get("src_height", 0)) or
                          int(self.meta.get("work_height", 1)))
 
-        dlg = QProgressDialog("Extracting structure-tensor channels...", None,
-                              0, int(self.meta["n_frames"]), self)
-        dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        dlg.setMinimumDuration(0)
-
-        def prog(done, total):
-            dlg.setMaximum(total)
-            dlg.setValue(done)
-            QApplication.processEvents()
-
-        ch = load_or_extract_channels(cache, sidecar_path=sidecar_path, progress=prog)
-        dlg.close()
-        self._chan = {
-            "change": np.asarray(ch["change"], np.float32),
-            "appearance": np.asarray(ch["appearance"], np.float32),
-            "tensor_speed": np.asarray(ch["tensor_speed"], np.float32),
-            "intensity": np.asarray(ch["intensity"], np.float32),
-            "speed": np.asarray(cache.read("speed"), np.float32),
-        }
+        # Channels present in this source. tensor_speed/change/intensity/
+        # appearance are always here; "speed" (cached flow) only from a cache.
+        self._chan = {k: np.asarray(v, np.float32)
+                      for k, v in channel_data.channels.items()}
         self._channels_bytes = sum(a.nbytes for a in self._chan.values())
         self.T = self._chan["change"].shape[0]
         self.freqs = default_freqs(self.fps)
@@ -337,6 +347,15 @@ class ScalogramExplorer(QWidget):
             raise ValueError("Open a feature cache before creating this explorer")
         return cls(state=state, parent=parent)
 
+    @classmethod
+    def from_channel_data(cls, channel_data, video_path: str | None = None,
+                          parent=None) -> "ScalogramExplorer":
+        """Standalone explorer over a ChannelData (e.g. a live windowed source),
+        decoding its own video for the overlay."""
+        return cls(channel_data=channel_data,
+                   video_path=video_path or channel_data.meta.get("video_path"),
+                   parent=parent)
+
     # -- scope / geometry ----------------------------------------------------
     def _regions_for_index(self, idx: int) -> list[dict]:
         """The regions a scope index covers: all of them when pooled (<0)."""
@@ -345,8 +364,16 @@ class ScalogramExplorer(QWidget):
     def _active_regions(self) -> list[dict]:
         return self._regions_for_index(self.active_region_index)
 
+    def _channel_available(self, name: str) -> bool:
+        """Whether this source carries the channel behind display name ``name``.
+        Live (cacheless) sources lack ``cached flow speed``."""
+        return CHANNELS[name][0] in self._chan
+
     def _chan_arr(self):
-        return self._chan[CHANNELS[self.channel][0]]
+        attr = CHANNELS[self.channel][0]
+        if attr not in self._chan:                     # defensive: absent channel
+            return np.zeros((self.T, self.ny, self.nx), np.float32)
+        return self._chan[attr]
 
     def _scope_blocks(self, arr: np.ndarray, idx: int) -> np.ndarray:
         """(T, B) block columns of ``arr`` over the regions of scope ``idx``,
@@ -511,8 +538,12 @@ class ScalogramExplorer(QWidget):
         for r, name in enumerate(CHANNELS):
             cb = QCheckBox()
             cb.setProperty("channel", name)
-            cb.setToolTip(f"Detect on {name} (builds its cube on first check)")
-            cb.setChecked(name == self.channel)
+            available = self._channel_available(name)
+            cb.setEnabled(available)
+            cb.setToolTip(
+                f"Detect on {name} (builds its cube on first check)" if available
+                else f"{name} needs a flow cache — unavailable on the live source")
+            cb.setChecked(available and name == self.channel)
             self.chan_group.addButton(cb)
             self.chan_checks[name] = cb
             grid.addWidget(cb, r, 0, Qt.AlignmentFlag.AlignCenter)
@@ -913,7 +944,7 @@ class ScalogramExplorer(QWidget):
         if self.state is not None:
             bgr = self.state.display_frame(self.frame, focus_frac=focus)
         elif self.source is not None:
-            bgr = self.source.frame_at(self.frame)
+            bgr = self.source.frame_at(self.window_start + self.frame)
             if bgr is not None and focus is not None:
                 h, w = bgr.shape[:2]
                 x0, y0, x1, y1 = focus

@@ -65,52 +65,74 @@ def _tiles_from_meta(meta: dict) -> list[dict]:
     return tiles
 
 
-def extract_channels(cache, sigma: float = 2.0, max_frames: int | None = None,
-                     progress=None) -> dict:
-    """Stream the clip once and return per-block (T, ny, nx) channel arrays.
+def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
+                     start: int = 0, n: int | None = None,
+                     cached_uv: tuple[np.ndarray, np.ndarray] | None = None,
+                     cached_texture: np.ndarray | None = None,
+                     denoise: str | None = None, progress=None) -> dict:
+    """Stream a frame window [start, start+n) and return per-block channel arrays.
 
-    ``cache`` is an open feature cache (its meta drives geometry and points at the
-    video). ``progress(done, total)`` is called if given. Returns a dict of the
-    ``CHANNELS`` arrays plus ``meta`` describing how they were built.
+    Geometry comes from ``meta`` (the same shape a feature cache carries); the
+    video is streamed directly, so this needs no cache -- it is the seam that lets
+    the tensor/scalogram path run on a bare video.
+
+    ``cached_uv`` is the pipeline's block flow (u, v) in px/s, indexed by absolute
+    frame, used for the appearance residual; pass ``None`` to measure the residual
+    against the tensor's OWN per-pixel flow instead (px/frame, no cache needed).
+    ``cached_texture`` is read straight through when present, else computed.
+    ``denoise`` overrides the config's temporal-denoise mode (the live/windowed
+    path forces it off, since denoise is stateful from frame zero and cannot be
+    reproduced starting mid-clip).
+
+    Returns a dict of the ``CHANNELS`` arrays (length = clamped window n) plus
+    ``meta`` describing how they were built.
     """
-    meta = cache.meta
     fps = float(meta["fps"])
     block = int(meta["block_size"])
     ny, nx = map(int, meta["grid"])
-    n = int(meta["n_frames"])
-    if max_frames is not None:
-        n = min(n, max_frames)
+    total = int(meta["n_frames"])
+    start = max(0, min(int(start), max(0, total - 1)))
+    n = (total - start) if n is None else max(0, min(int(n), total - start))
     scale = float(meta.get("downsample", 1.0))
     tiles = _tiles_from_meta(meta)
 
     base_cfg = PipelineConfig.from_dict(meta.get("config", {})).preprocess
+    denoise = base_cfg.denoise if denoise is None else denoise
     # Replay every step that can be reconstructed exactly by a sequential pass.
-    # Temporal denoising is stateful but deterministic from frame zero, unlike
-    # registration/background models whose fitted assets are not cached.
+    # Registration/background models need fitted assets the cache does not retain,
+    # so they are dropped and the result is flagged approximated when they were on.
     pre_cfg = replace(base_cfg, downsample=scale, mask_path=None,
-                      registration="off", bg_subtract="off")
+                      registration="off", bg_subtract="off", denoise=denoise)
     approximated = (base_cfg.mask_path is not None or
                     base_cfg.registration != "off" or
-                    base_cfg.bg_subtract != "off")
-
-    # Cached block flow (px/s -> px/frame), for the appearance residual.
-    U = np.asarray(cache.read("u"), np.float32)
-    V = np.asarray(cache.read("v"), np.float32)
-
-    feats = set(meta.get("features", []))
-    cached_texture = None
-    if "texture_min_eigen" in feats:
-        cached_texture = np.asarray(cache.read("texture_min_eigen"), np.float32)
+                    base_cfg.bg_subtract != "off" or
+                    denoise != base_cfg.denoise)
 
     out = {k: np.zeros((n, ny, nx), np.float32) for k in CHANNELS}
+    if n == 0:
+        out["meta"] = {"fps": fps, "block": block, "grid": (ny, nx),
+                       "n_frames": 0, "channel_version": CHANNEL_VERSION,
+                       "approximated": approximated, "sigma": sigma,
+                       "window_start": start}
+        return out
+
     pres = {t["id"]: Preprocessor(pre_cfg, t["source_box"][2] - t["source_box"][0],
                                   t["source_box"][3] - t["source_box"][1])
             for t in tiles}
     prev_g: dict = {t["id"]: None for t in tiles}
 
-    src = VideoSource(meta["video_path"])
+    # For a window that does not start at frame zero, read one preceding frame to
+    # seed prev_g, so the first stored frame carries motion. This is only valid
+    # because denoise is forced off in the windowed path -- a stateful denoise
+    # would need every frame from zero to reach the correct state here.
+    seed = 1 if start > 0 else 0
+    first = start - seed
+    count = n + seed
+
+    src = VideoSource(video_path)
     try:
-        for i, frame in src.iter_frames(0, n):
+        for i, frame in src.iter_frames(first, count):
+            oi = i - start                     # <0 for the seed frame (not stored)
             for t in tiles:
                 rid = t["id"]
                 x0, y0, x1, y1 = t["source_box"]
@@ -118,42 +140,50 @@ def extract_channels(cache, sigma: float = 2.0, max_frames: int | None = None,
                 g = pres[rid].apply(frame[y0:y1, x0:x1])
                 th, tw = ay1 - ay0, ax1 - ax0
 
-                out["intensity"][i, ay0:ay1, ax0:ax1] = _reduce(g, block, th, tw)
-                if cached_texture is not None:
-                    out["texture"][i, ay0:ay1, ax0:ax1] = \
-                        cached_texture[i, ay0:ay1, ax0:ax1]
-
                 gp = prev_g[rid]
-                if gp is not None:
-                    it = g - gp
-                    # Match the proof of concept: form and spatially smooth the
-                    # complete 3-D tensor at a small scale, solve LK per pixel,
-                    # then reduce the resulting speed to cache blocks.  Solving
-                    # only once per block would couple the aperture problem to
-                    # the user's display/block size.
-                    prods = tensor_products(gp, g)
-                    J = np.stack([cv2.GaussianBlur(prods[k], (0, 0), sigma)
-                                  for k in range(6)])
-                    uv = flow_from_tensor(J)
-                    tensor_speed = np.hypot(uv[..., 0], uv[..., 1]) * fps
-                    out["tensor_speed"][i, ay0:ay1, ax0:ax1] = \
-                        _reduce(tensor_speed, block, th, tw)
-                    out["change"][i, ay0:ay1, ax0:ax1] = \
-                        _reduce(J[2], block, th, tw)
-                    # residual r = I_t + grad(I).v against upsampled cached flow.
-                    ub = cv2.resize(U[i, ay0:ay1, ax0:ax1] / fps, (g.shape[1], g.shape[0]),
-                                    interpolation=cv2.INTER_NEAREST)
-                    vb = cv2.resize(V[i, ay0:ay1, ax0:ax1] / fps, (g.shape[1], g.shape[0]),
-                                    interpolation=cv2.INTER_NEAREST)
-                    iy, ix = np.gradient(g)
-                    r = it + ix * ub + iy * vb
-                    out["appearance"][i, ay0:ay1, ax0:ax1] = _reduce(r * r, block, th, tw)
-                    if cached_texture is None:
-                        out["texture"][i, ay0:ay1, ax0:ax1] = \
-                            _reduce(spatial_min_eigen(J), block, th, tw)
+                if oi >= 0:
+                    out["intensity"][oi, ay0:ay1, ax0:ax1] = _reduce(g, block, th, tw)
+                    if cached_texture is not None:
+                        out["texture"][oi, ay0:ay1, ax0:ax1] = \
+                            cached_texture[i, ay0:ay1, ax0:ax1]
+                    if gp is not None:
+                        it = g - gp
+                        # Form and spatially smooth the complete 3-D tensor at a
+                        # small scale, solve LK per pixel, then reduce speed to
+                        # blocks. Solving once per block would couple the aperture
+                        # problem to the user's display/block size.
+                        prods = tensor_products(gp, g)
+                        J = np.stack([cv2.GaussianBlur(prods[k], (0, 0), sigma)
+                                      for k in range(6)])
+                        uv = flow_from_tensor(J)                 # px/frame
+                        tensor_speed = np.hypot(uv[..., 0], uv[..., 1]) * fps
+                        out["tensor_speed"][oi, ay0:ay1, ax0:ax1] = \
+                            _reduce(tensor_speed, block, th, tw)
+                        out["change"][oi, ay0:ay1, ax0:ax1] = \
+                            _reduce(J[2], block, th, tw)
+                        # Appearance residual r = I_t + grad(I).v. Against cached
+                        # block flow (px/s -> px/frame, upsampled) when given, else
+                        # against the tensor's own per-pixel flow (already px/frame).
+                        if cached_uv is not None:
+                            U, V = cached_uv
+                            ub = cv2.resize(U[i, ay0:ay1, ax0:ax1] / fps,
+                                            (g.shape[1], g.shape[0]),
+                                            interpolation=cv2.INTER_NEAREST)
+                            vb = cv2.resize(V[i, ay0:ay1, ax0:ax1] / fps,
+                                            (g.shape[1], g.shape[0]),
+                                            interpolation=cv2.INTER_NEAREST)
+                        else:
+                            ub, vb = uv[..., 0], uv[..., 1]
+                        iy, ix = np.gradient(g)
+                        r = it + ix * ub + iy * vb
+                        out["appearance"][oi, ay0:ay1, ax0:ax1] = \
+                            _reduce(r * r, block, th, tw)
+                        if cached_texture is None:
+                            out["texture"][oi, ay0:ay1, ax0:ax1] = \
+                                _reduce(spatial_min_eigen(J), block, th, tw)
                 prev_g[rid] = g
-            if progress and (i % 20 == 0):
-                progress(i + 1, n)
+            if progress and (oi >= 0) and (oi % 20 == 0):
+                progress(oi + 1, n)
     finally:
         src.release()
 
@@ -161,8 +191,39 @@ def extract_channels(cache, sigma: float = 2.0, max_frames: int | None = None,
         progress(n, n)
     out["meta"] = {"fps": fps, "block": block, "grid": (ny, nx), "n_frames": n,
                    "channel_version": CHANNEL_VERSION, "approximated": approximated,
-                   "sigma": sigma}
+                   "sigma": sigma, "window_start": start}
     return out
+
+
+def extract_channels(cache, sigma: float = 2.0, max_frames: int | None = None,
+                     progress=None) -> dict:
+    """Stream the clip once and return per-block (T, ny, nx) channel arrays.
+
+    ``cache`` is an open feature cache (its meta drives geometry and points at the
+    video). Appearance is measured against the cached block flow, and cached
+    texture is read straight through when present -- the full-clip, cache-backed
+    contract. ``progress(done, total)`` is called if given.
+    """
+    meta = cache.meta
+    U = np.asarray(cache.read("u"), np.float32)
+    V = np.asarray(cache.read("v"), np.float32)
+    cached_texture = None
+    if "texture_min_eigen" in set(meta.get("features", [])):
+        cached_texture = np.asarray(cache.read("texture_min_eigen"), np.float32)
+    return _stream_channels(meta["video_path"], meta, sigma=sigma, start=0,
+                            n=max_frames, cached_uv=(U, V),
+                            cached_texture=cached_texture, progress=progress)
+
+
+def extract_channels_live(video_path: str, meta: dict, *, start: int = 0,
+                          n: int | None = None, sigma: float = 2.0,
+                          progress=None) -> dict:
+    """Cacheless windowed extraction: geometry from ``meta``, appearance against
+    the tensor's own flow, temporal denoise forced off (stateful, can't reproduce
+    mid-clip). This is what feeds the live scalogram surface."""
+    return _stream_channels(video_path, meta, sigma=sigma, start=start, n=n,
+                            cached_uv=None, cached_texture=None, denoise="off",
+                            progress=progress)
 
 
 def load_or_extract_channels(cache, sidecar_path: str | None = None,
