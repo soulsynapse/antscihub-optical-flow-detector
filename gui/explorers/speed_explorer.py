@@ -286,9 +286,13 @@ class MiniPlot(QWidget):
         return lo, hi
 
     def band(self) -> tuple[float, float]:
-        if self.band_lo is None or self.band_hi is None:
-            return float("-inf"), float("inf")
-        return self.band_lo, self.band_hi
+        # An unset endpoint is unbounded on ITS OWN side only -- never force the
+        # whole band open just because one handle hasn't been placed. (Forcing
+        # both open silently swallowed a lone finite handle, so a band left
+        # unseeded ignored every drag until both endpoints were assigned.)
+        lo = float("-inf") if self.band_lo is None else self.band_lo
+        hi = float("inf") if self.band_hi is None else self.band_hi
+        return lo, hi
 
     def _plot_rect(self) -> QRectF:
         rm = self.HANDLE_MARGIN if self.band_active else 6

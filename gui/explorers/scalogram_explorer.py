@@ -94,12 +94,8 @@ class ScalogramPlot(MiniPlot):
         self._img = None
         self._img_key = None
         self._ver = 0
-        # Seed the band through set_band_active (not a bare band_active = True):
-        # MiniPlot.band() short-circuits to full range whenever EITHER endpoint
-        # is still None, so an unseeded band silently ignores every drag until
-        # both handles have been assigned. Seeding both to +/-inf (as every other
-        # band plot does) keeps the same wide-open default while making the very
-        # first drag take effect.
+        # Seed the band through set_band_active, as every other band plot does,
+        # rather than a bare band_active = True (both handles start wide open).
         self.set_band_active(True)
         self.setMinimumHeight(self.BASE_H)
         self.setMaximumHeight(self.BASE_H)
