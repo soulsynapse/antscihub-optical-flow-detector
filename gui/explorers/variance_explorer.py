@@ -559,6 +559,9 @@ class StructureTensorExplorer(QWidget):
         frac_view = np.where(w["change"] > self.change_floor, w["frac"], np.nan)
         self.plots["frac"].set_matrix(frac_view)
         self._w_cache = w
+        # The overlay display scale is derived from this cache; a fresh cache
+        # invalidates it so the next redraw re-percentiles the new data.
+        self._scale_cache_key = None
 
     def _recompute_sweep_counts(self):
         lo, hi = self._band()
@@ -994,7 +997,9 @@ class StructureTensorExplorer(QWidget):
             # A shared scale makes flipping between estimators a real visual
             # comparison rather than independently recolored heatmaps.
             return self.speed_display_vmax
-        key = (mode, self.win_frames)
+        # Scope is part of the key: each replicate lives on its own value
+        # scale, and a scale frozen from another scope would recolor this one.
+        key = (mode, self.win_frames, self.active_region_index)
         if getattr(self, "_scale_cache_key", None) != key:
             if mode == "Texture":
                 src = self.texture
@@ -1003,11 +1008,14 @@ class StructureTensorExplorer(QWidget):
             elif mode == "Cached flow speed":
                 src = self.cached_speed
             else:
-                w = self._owned_windowed(self.win_frames)
+                # Reuse the windowed cache _recompute_series just built:
+                # recomputing _owned_windowed here doubled the full-clip
+                # windowed pass (six (T, B) allocations) on every window or
+                # scope change, purely to derive a display percentile.
                 key_by_mode = {"Amplitude variance": "variance",
                                "Change energy Jtt": "change",
                                "Appearance energy": "appearance"}
-                src = w[key_by_mode[mode]]
+                src = self._w_cache[key_by_mode[mode]]
             finite = src[np.isfinite(src)]
             self._scale_cache = max(
                 float(np.percentile(finite, 99.0)) if finite.size else 1.0, 1e-4)
