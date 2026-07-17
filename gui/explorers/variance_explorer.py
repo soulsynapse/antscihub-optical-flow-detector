@@ -16,24 +16,27 @@ appearance residual, so nothing here re-solves optical flow):
                          flicker; the backlit-wing channel.
     appearance energy    windowed residual^2                -- change no motion
                           explains; the detection channel for wing/shape events.
-    appearance fraction  residual^2 / change                -- diagnostic view of
-                          how much of a block's change is unexplained; blanked
-                          (not zeroed) where there is no real change to explain.
+    appearance fraction  residual^2 / change                -- per-event
+                          classifier (is this change motion or appearance?),
+                          kept as a spatial OVERLAY only: the question is
+                          per-block-at-a-moment, which a density plot cannot
+                          anchor. Gated to zero where no real change exists.
     texture              spatial min-eigen (from the cache when present).
-    tensor speed          Lucas-Kanade speed solved from J, shown beside the
-                          pipeline's cached flow speed and their disagreement.
+    tensor speed          Lucas-Kanade speed solved from J; an audit of the
+                          cached flow, surfaced as |diff| / disagreement plots
+                          and overlay modes rather than raw speed traces.
 
 The three detection channels are drawn as time x value density heatmaps of the
 full per-block distribution (log value axis by default), never spatial means:
 each replicate is mostly empty space, so a mean buries the handful of behaving
 blocks that are the actual signal -- the same lesson the speed explorer learned.
-Detection bands live on the heavy-tailed *energies*; the bounded fraction is
-kept as a classifier view (is this change motion or appearance?) because a band
-on a ratio alone lets a barely-above-floor block at fraction 1.0 outrank a wing
-beat with 100x the energy at fraction 0.7.
+Detection bands live on the heavy-tailed *energies*, never the bounded fraction:
+a band on a ratio alone lets a barely-above-floor block at fraction 1.0 outrank
+a wing beat with 100x the energy at fraction 0.7.
 
-The integration-window slider is the point: watch amplitude variance and change
-energy accumulate, and the appearance fraction stabilise, as the window widens.
+The integration-window slider is the point: the value-vs-W density shows the
+selected channel's whole per-block distribution accumulating as W widens, so
+the knee where integration stops paying off is visible directly.
 """
 from __future__ import annotations
 
@@ -62,8 +65,6 @@ CHANGE_C = QColor(255, 170, 80)    # change energy
 APPEAR_C = QColor(180, 140, 255)   # appearance
 SWEEP_C = QColor(110, 230, 120)    # threshold sweep
 VW_C = QColor(255, 150, 90)        # value-vs-window
-TENSOR_SPEED_C = QColor(255, 205, 80)
-CACHE_SPEED_C = QColor(80, 205, 255)
 SPEED_DIFF_C = QColor(255, 105, 135)
 EPS = 1e-6
 
@@ -73,6 +74,13 @@ EPS = 1e-6
 # log-heatmap + tail-band instrument applies to each; the bounded appearance
 # *fraction* is deliberately not a target (see module docstring).
 DETECT_TARGETS = ("amplitude variance", "change energy", "appearance energy")
+
+# Overlay-combo item for each detection target, so selecting a channel to
+# detect on also shows that channel spatially. The user can still pick any
+# other overlay afterwards; the sync happens only at selection time.
+OVERLAY_BY_TARGET = {"amplitude variance": "Amplitude variance",
+                     "change energy": "Change energy Jtt",
+                     "appearance energy": "Appearance energy"}
 
 
 class StructureTensorExplorer(QWidget):
@@ -167,7 +175,7 @@ class StructureTensorExplorer(QWidget):
 
         self.win_frames = max(2, min(self.T - 1, int(round(self.fps))))
         # Detection-sweep integration window (frames). The binary detection
-        # gate reads the trailing MEAN of "# blocks in band" over this window,
+        # gate reads the centered MEAN of "# blocks in band" over this window,
         # so a single-frame spike of N blocks dilutes to N/D and cannot fake a
         # sustained event. D = 1 reproduces the raw per-frame count.
         self.sweep_win = max(1, min(self.T - 1, int(round(self.fps))))
@@ -229,17 +237,13 @@ class StructureTensorExplorer(QWidget):
 
     def _rebuild_owned_prefixes(self):
         ci, ci2, cc, ca = [], [], [], []
-        tensor_speed, cached_speed, speed_absdiff, speed_disagreement = [], [], [], []
+        speed_absdiff, speed_disagreement = [], []
         for region in self._active_regions():
             y0, x0, y1, x1 = region["atlas_bbox"]
             ci.append(self._ci[:, y0:y1, x0:x1].reshape(self.T + 1, -1))
             ci2.append(self._ci2[:, y0:y1, x0:x1].reshape(self.T + 1, -1))
             cc.append(self._cc[:, y0:y1, x0:x1].reshape(self.T + 1, -1))
             ca.append(self._ca[:, y0:y1, x0:x1].reshape(self.T + 1, -1))
-            tensor_speed.append(
-                self.tensor_speed[:, y0:y1, x0:x1].reshape(self.T, -1))
-            cached_speed.append(
-                self.cached_speed[:, y0:y1, x0:x1].reshape(self.T, -1))
             speed_absdiff.append(
                 self.speed_absdiff[:, y0:y1, x0:x1].reshape(self.T, -1))
             speed_disagreement.append(
@@ -247,16 +251,29 @@ class StructureTensorExplorer(QWidget):
         cat = lambda parts: parts[0] if len(parts) == 1 else np.concatenate(parts, 1)
         self._ci_own, self._ci2_own = cat(ci), cat(ci2)
         self._cc_own, self._ca_own = cat(cc), cat(ca)
-        self._tensor_speed_own = cat(tensor_speed)
-        self._cached_speed_own = cat(cached_speed)
         self._speed_absdiff_own = cat(speed_absdiff)
         self._speed_disagreement_own = cat(speed_disagreement)
         self.n_blocks = self._ci_own.shape[1]
 
     def _window_bounds(self, W):
-        hi = np.arange(self.T) + 1
-        lo = np.maximum(0, hi - W)
+        """CENTERED prefix-sum bounds: frame t integrates [t - W//2, t + ceil(W/2) - 1].
+
+        Centered rather than trailing so an event's windowed mass peaks where
+        the event IS, not W/2 frames later -- this is an offline explorer over
+        a cached clip, so reading the future is free. (A causal deployment of
+        the same thresholds gets the W/2 latency back.) Windows truncate at
+        both clip edges; neff keeps the means honest there.
+        """
+        t = np.arange(self.T)
+        lo = np.maximum(0, t - W // 2)
+        hi = np.minimum(self.T, t + (W - W // 2))
         return hi, lo, (hi - lo).astype(np.float32)
+
+    def _win_slice(self, t: int, W: int) -> tuple[int, int]:
+        """Scalar (lo, hi) of ``_window_bounds`` for one frame (overlay path)."""
+        lo = max(0, t - W // 2)
+        hi = min(self.T, t + (W - W // 2))
+        return lo, hi
 
     def _owned_windowed(self, W):
         """(T, B) windowed reads over the owned blocks."""
@@ -266,9 +283,7 @@ class StructureTensorExplorer(QWidget):
         var = np.maximum(mean_i2 - mean_i * mean_i, 0.0)
         change = (self._cc_own[hi] - self._cc_own[lo]) / neff[:, None]
         appear = (self._ca_own[hi] - self._ca_own[lo]) / neff[:, None]
-        frac = np.where(change > self.change_floor, appear / (change + EPS), 0.0)
-        return {"variance": var, "change": change, "appearance": appear,
-                "frac": frac}
+        return {"variance": var, "change": change, "appearance": appear}
 
     def _detect_field(self, w: dict) -> np.ndarray:
         if self.detect == "amplitude variance":
@@ -278,7 +293,7 @@ class StructureTensorExplorer(QWidget):
         return w["appearance"]
 
     def _selected_plot_key(self) -> str:
-        return self.detect_plot_key.get(self.detect, "frac")
+        return self.detect_plot_key[self.detect]
 
     def _selected_plot(self) -> "MiniPlot":
         return self.plots[self._selected_plot_key()]
@@ -367,11 +382,10 @@ class StructureTensorExplorer(QWidget):
         self.log_chk = QCheckBox("Log value axis on channel heatmaps")
         self.log_chk.setToolTip(
             "Draw the amplitude-variance / change-energy / appearance-energy "
-            "heatmaps' value axis as log1p(value): these channels span decades "
-            "and a linear axis crushes the noise-floor bulk flat under a few "
-            "hot blocks. Axis-only -- band thresholds are still set and "
-            "compared in raw units. The appearance-fraction view is bounded "
-            "[0,1] and always stays linear.")
+            "heatmaps' (and the vs-W density's) value axis as log1p(value): "
+            "these channels span decades and a linear axis crushes the "
+            "noise-floor bulk flat under a few hot blocks. Axis-only -- band "
+            "thresholds are still set and compared in raw units.")
         self.log_chk.setChecked(True)
         self.log_chk.stateChanged.connect(self._on_log_toggle)
         left.addWidget(self.log_chk)
@@ -385,9 +399,10 @@ class StructureTensorExplorer(QWidget):
             "Window W integrates temporal change: amplitude variance = "
             "<(I-mean)^2> over W (background subtraction, integrated); change "
             "energy = <I_t^2> (fast flicker); appearance energy = residual "
-            "change no motion explains (wing/shape detector). The appearance-"
-            "fraction heatmap (residual/change, gated blocks blank) is a "
-            "diagnostic view, not a detection channel.")
+            "change no motion explains (wing/shape detector). The appearance "
+            "fraction (residual/change, gated where change is below floor) "
+            "survives as an OVERLAY: it classifies a detected event as motion "
+            "vs appearance, a per-block question no time plot can anchor.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#8ab; padding-top:2px;")
         left.addWidget(note)
@@ -460,12 +475,6 @@ class StructureTensorExplorer(QWidget):
                     check, self._plot_row, 0, Qt.AlignmentFlag.AlignCenter)
             self._plot_row += 1
 
-        section("Tensor speed vs cached optical flow (no temporal integration)")
-        add("tensor_speed", "Mean tensor-derived speed", "px/s", TENSOR_SPEED_C)
-        add("cached_speed", "Mean cached flow speed", "px/s", CACHE_SPEED_C)
-        add("speed_absdiff", "Mean |tensor - cached speed|", "px/s", SPEED_DIFF_C)
-        add("speed_disagreement", "Mean relative speed disagreement", "", SPEED_DIFF_C)
-
         section("Per-frame appearance channels (no integration)")
         add("intensity", "Mean block intensity", "", LINE)
         add("change_pf", "Per-frame change energy Jtt", "", CHANGE_C)
@@ -478,20 +487,17 @@ class StructureTensorExplorer(QWidget):
             detect_target="change energy", cls=DensityPlot)
         add("appear_w", "Per-block appearance energy over W (density)", "",
             APPEAR_C, detect_target="appearance energy", cls=DensityPlot)
-        add("frac", "Appearance fraction (residual/change, gated blank)", "",
-            APPEAR_C, cls=DensityPlot)
 
         section("Detection sweep on selected channel (drag band handles)")
         add("count", "# blocks in band", "blk", SWEEP_C, cls=PixelBarPlot)
-        add("fracb", "Fraction of blocks in band", "", SWEEP_C)
-        add("clump", "Largest connected clump in band", "blk", SWEEP_C)
-        # The binary gate: trailing mean of the in-band count over D, with its
+        # The binary gate: centered mean of the in-band count over D, with its
         # own always-active band. The min handle is the sustained-evidence
         # threshold; the max handle can reject whole-replicate artifacts where
         # every block goes in-band at once (a lighting flash, not a behavior).
         add("count_w", "Windowed # blocks in band (mean over D)", "blk", SWEEP_C)
         add("detect", "Positive detection (windowed count in band)", "0/1",
             QColor(120, 255, 140))
+        add("clump", "Largest connected clump in band", "blk", SWEEP_C)
         count_w = self.plots["count_w"]
         count_w.band_changed.connect(self._recompute_detect)
         count_w.band_committed.connect(self._recompute_detect)
@@ -499,8 +505,13 @@ class StructureTensorExplorer(QWidget):
         count_w.set_expanded(True)
 
         section("Value of integration @ cursor (x axis = window length)")
-        add("vw_var", "Amplitude variance vs W", "", VW_C, seek=False)
-        add("vw_frac", "Appearance fraction vs W", "", VW_C, seek=False)
+        # Per-block density of the SELECTED channel vs window length: the knee
+        # where widening W stops sharpening the tail is the right W to run at.
+        add("vw_sel", self._vw_title(), "", VW_C, seek=False, cls=DensityPlot)
+
+        section("Flow audit: |tensor - cached| speed (no temporal integration)")
+        add("speed_absdiff", "Mean |tensor - cached speed|", "px/s", SPEED_DIFF_C)
+        add("speed_disagreement", "Mean relative speed disagreement", "", SPEED_DIFF_C)
         self.plot_col.setRowStretch(self._plot_row, 1)
         self.detect_group.buttonToggled.connect(self._on_detect_plot_toggled)
 
@@ -536,8 +547,6 @@ class StructureTensorExplorer(QWidget):
 
     def _recompute_series(self):
         w = self._owned_windowed(self.win_frames)
-        self.plots["tensor_speed"].set_series(self._tensor_speed_own.mean(1))
-        self.plots["cached_speed"].set_series(self._cached_speed_own.mean(1))
         self.plots["speed_absdiff"].set_series(self._speed_absdiff_own.mean(1))
         self.plots["speed_disagreement"].set_series(
             self._speed_disagreement_own.mean(1))
@@ -553,11 +562,6 @@ class StructureTensorExplorer(QWidget):
         self.plots["variance"].set_matrix(w["variance"])
         self.plots["change_w"].set_matrix(w["change"])
         self.plots["appear_w"].set_matrix(w["appearance"])
-        # The fraction is only meaningful where real change exists: gated
-        # blocks become NaN (blank) rather than a blazing "nothing happened"
-        # row at 0 that would drown the informative [0,1] structure.
-        frac_view = np.where(w["change"] > self.change_floor, w["frac"], np.nan)
-        self.plots["frac"].set_matrix(frac_view)
         self._w_cache = w
         # The overlay display scale is derived from this cache; a fresh cache
         # invalidates it so the next redraw re-percentiles the new data.
@@ -569,16 +573,15 @@ class StructureTensorExplorer(QWidget):
         mask = (field >= lo) & (field <= hi)
         count = mask.sum(1).astype(np.float32)
         self.plots["count"].set_series(count)
-        self.plots["fracb"].set_series(count / max(1, self.n_blocks))
         self._recompute_windowed_count(count)
 
     def _recompute_windowed_count(self, count: np.ndarray | None = None):
-        """Trailing mean of the in-band count over the detection window D.
+        """Centered mean of the in-band count over the detection window D.
 
-        Same trailing-window convention as ``_window_bounds`` (the window
-        shortens at the clip start rather than reading the future), so a
-        1-frame spike of N blocks reads N/D once D frames have passed it --
-        sustained evidence is required to clear the min handle.
+        Same centered convention as ``_window_bounds``, so the gate fires ON
+        the event rather than D/2 frames after it. The dilution property is
+        unchanged: a 1-frame spike of N blocks never reads more than N/D, so
+        sustained evidence is still required to clear the min handle.
         """
         if count is None:
             count = self.plots["count"].y
@@ -590,8 +593,10 @@ class StructureTensorExplorer(QWidget):
             windowed = count.astype(np.float32)
         else:
             c = np.concatenate([[0.0], np.cumsum(count, dtype=np.float64)])
-            hi = np.arange(count.size) + 1
-            lo = np.maximum(0, hi - self.sweep_win)
+            D = self.sweep_win
+            t = np.arange(count.size)
+            lo = np.maximum(0, t - D // 2)
+            hi = np.minimum(count.size, t + (D - D // 2))
             windowed = ((c[hi] - c[lo]) / (hi - lo)).astype(np.float32)
         self.plots["count_w"].set_series(windowed)
         self._recompute_detect()
@@ -646,30 +651,38 @@ class StructureTensorExplorer(QWidget):
         # appearance energy: windowed residual change no motion explains
         return (self._ca[hi, y0:y1, x0:x1] - self._ca[lo, y0:y1, x0:x1]) / n
 
+    def _vw_title(self) -> str:
+        return f"{self.detect.capitalize()} vs W (per-block density)"
+
     def _recompute_value_curve(self):
+        """Selected channel's per-block distribution as a function of window
+        length, anchored at the cursor frame -- the W-choosing instrument."""
         t0 = self.frame
         Ws = np.unique(np.round(
             np.geomspace(1, self.T, num=min(160, self.T))).astype(int))
         Ws = Ws[Ws >= 1]
-        hi = t0 + 1
-        los = np.maximum(0, hi - Ws)
-        neff = (hi - los).astype(np.float32)[:, None]
-        mi = (self._ci_own[hi][None, :] - self._ci_own[los]) / neff
-        mi2 = (self._ci2_own[hi][None, :] - self._ci2_own[los]) / neff
-        var = np.maximum(mi2 - mi * mi, 0.0)
-        change = (self._cc_own[hi][None, :] - self._cc_own[los]) / neff
-        appear = (self._ca_own[hi][None, :] - self._ca_own[los]) / neff
-        frac = np.where(change > self.change_floor, appear / (change + EPS), 0.0)
+        # Same centered convention as _window_bounds, per window length.
+        los = np.maximum(0, t0 - Ws // 2)
+        his = np.minimum(self.T, t0 + (Ws - Ws // 2))
+        neff = (his - los).astype(np.float32)[:, None]
+        if self.detect == "amplitude variance":
+            mi = (self._ci_own[his] - self._ci_own[los]) / neff
+            mi2 = (self._ci2_own[his] - self._ci2_own[los]) / neff
+            vals = np.maximum(mi2 - mi * mi, 0.0)
+        elif self.detect == "change energy":
+            vals = (self._cc_own[his] - self._cc_own[los]) / neff
+        else:
+            vals = (self._ca_own[his] - self._ca_own[los]) / neff
         self._vw_Ws = Ws
-        self.plots["vw_var"].set_series(var.mean(1))
-        self.plots["vw_frac"].set_series(frac.mean(1))
+        vw = self.plots["vw_sel"]
+        vw.title = self._vw_title()
+        vw.set_matrix(vals)
         self._sync_value_cursor()
 
     def _sync_value_cursor(self):
         idx = int(np.searchsorted(self._vw_Ws, self.win_frames))
         idx = max(0, min(idx, self._vw_Ws.size - 1))
-        for key in ("vw_var", "vw_frac"):
-            self.plots[key].set_cursor(idx)
+        self.plots["vw_sel"].set_cursor(idx)
 
     # -- handlers -------------------------------------------------------------
 
@@ -704,7 +717,7 @@ class StructureTensorExplorer(QWidget):
         # same raw value whether the axis is log or linear. The fraction view
         # is bounded [0,1], where log1p is pointless; it stays linear.
         on = self.log_chk.isChecked()
-        for key in ("variance", "change_w", "appear_w"):
+        for key in ("variance", "change_w", "appear_w", "vw_sel"):
             self.plots[key].set_log_axis(on)
 
     def _on_band_changed(self):
@@ -724,7 +737,14 @@ class StructureTensorExplorer(QWidget):
         data = button.property("detect_target")
         self.detect = str(data) if data is not None else DETECT_TARGETS[-1]
         self._apply_selected_plot_ui()
+        # The overlay follows the channel being detected on (signals blocked:
+        # the redraw below covers it). Manual overlay picks still work -- this
+        # resync happens only when the detection channel itself changes.
+        self.overlay_mode.blockSignals(True)
+        self.overlay_mode.setCurrentText(OVERLAY_BY_TARGET[self.detect])
+        self.overlay_mode.blockSignals(False)
         self._recompute_sweep()
+        self._recompute_value_curve()
         self._redraw_video()
 
     def _on_region_changed(self, _index):
@@ -903,9 +923,7 @@ class StructureTensorExplorer(QWidget):
 
     def _overlay_field(self, y0, x0, y1, x1):
         """(th, tw) field for the current overlay mode at the current frame/window."""
-        W = self.win_frames
-        hi = self.frame + 1
-        lo = max(0, hi - W)
+        lo, hi = self._win_slice(self.frame, self.win_frames)
         neff = max(1, hi - lo)
         mode = self.overlay_mode.currentText()
         if mode == "Texture":
@@ -961,8 +979,7 @@ class StructureTensorExplorer(QWidget):
                 out[dy0:dy1, dx0:dx1] = cv2.addWeighted(roi, 0.45, heat, 0.55, 0)
 
         if self.hi_chk.isChecked() and not self._overlay_peek_hidden:
-            hi_i = self.frame + 1
-            lo_i = max(0, hi_i - self.win_frames)
+            lo_i, hi_i = self._win_slice(self.frame, self.win_frames)
             neff = np.array([max(1, hi_i - lo_i)], np.float32)
             band_lo, band_hi = self._band()
             for ri in list(active):

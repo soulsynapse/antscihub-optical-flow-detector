@@ -115,7 +115,7 @@ class StructureTensorExplorerTests(unittest.TestCase):
             self.assertIn("Structure tensor explorer", explorer.windowTitle())
             self.assertEqual(explorer.n_blocks, 4)
             # The selected detection channel (appearance ENERGY -- the fraction
-            # is a band-less diagnostic view) expands and carries the band; all
+            # is an overlay-only diagnostic) expands and carries the band; all
             # other plots stay at their class's base height without a band.
             appear_w = explorer.plots["appear_w"]
             self.assertTrue(appear_w.band_active)
@@ -142,25 +142,25 @@ class StructureTensorExplorerTests(unittest.TestCase):
             np.testing.assert_allclose(
                 explorer.plots["variance"].y, [0.0, 1.0, 1.0, 1.0])
             # appearance = change * 0.5 -> owned per-frame [0, 1, 2, 4];
-            # trailing W=2 windowed means give [0, 0.5, 1.5, 3].
+            # centered windows lean backward for even W, so W=2 covers
+            # [t-1, t] and the means are [0, 0.5, 1.5, 3].
             np.testing.assert_allclose(
                 explorer.plots["appear_w"].y, [0.0, 0.5, 1.5, 3.0])
             # The change floor comes from OWNED blocks only (median of the
             # positive owned change values [2,4,8] = 4), never the 999 atlas
             # separators, which would inflate it to 8 and gate everything.
             self.assertEqual(explorer.change_floor, 4.0)
-            # Windowed change is [0, 1, 3, 6]: frames 0-2 sit below the floor
-            # and are blanked to NaN (never a solid row at 0); frame 3 passes
-            # and reads appearance/change = 3/6 = 0.5.
-            frac_m = explorer.plots["frac"].matrix
-            self.assertTrue(np.isnan(frac_m[:3]).all())
-            np.testing.assert_allclose(frac_m[3], 0.5, rtol=1e-5)
+            # The fraction plot is gone; the classifier read survives as the
+            # "Appearance fraction" overlay, gated to 0 below the change floor.
+            self.assertNotIn("frac", explorer.plots)
+            self.assertGreaterEqual(
+                explorer.overlay_mode.findText("Appearance fraction"), 0)
+            # Raw speed traces are gone; the flow audit keeps the difference
+            # reads. |tensor - cached| owned means: |[0,1,2.5,3]-[0,1,2,3]|.
+            self.assertNotIn("tensor_speed", explorer.plots)
+            self.assertNotIn("cached_speed", explorer.plots)
             np.testing.assert_allclose(
-                explorer.plots["frac"].y, [0.0, 0.0, 0.0, 0.5], rtol=1e-5)
-            np.testing.assert_allclose(
-                explorer.plots["tensor_speed"].y, [0.0, 1.0, 2.5, 3.0])
-            np.testing.assert_allclose(
-                explorer.plots["cached_speed"].y, [0.0, 1.0, 2.0, 3.0])
+                explorer.plots["speed_absdiff"].y, [0.0, 0.0, 0.5, 0.0])
             self.assertGreaterEqual(
                 explorer.overlay_mode.findText("Tensor speed"), 0)
             self.assertGreaterEqual(
@@ -174,6 +174,15 @@ class StructureTensorExplorerTests(unittest.TestCase):
             self.assertEqual(set(explorer.detect_checks), set(DETECT_TARGETS))
             self.assertTrue(
                 explorer.detect_checks["appearance energy"].isChecked())
+            # Windows are CENTERED (an event's windowed mass peaks on the
+            # event, not W/2 frames later): odd W=3 covers [t-1, t+1],
+            # truncated at both clip edges. Owned per-frame appearance
+            # [0, 1, 2, 4] -> [0.5, 1, 7/3, 3].
+            explorer.win_slider.setValue(3)
+            explorer._apply_window_change()
+            np.testing.assert_allclose(
+                explorer.plots["appear_w"].y, [0.5, 1.0, 7.0 / 3.0, 3.0],
+                rtol=1e-5)
         finally:
             explorer.close()
 
@@ -182,6 +191,9 @@ class StructureTensorExplorerTests(unittest.TestCase):
                    return_value=_channels()):
             explorer = StructureTensorExplorer(_CacheStub())
         try:
+            # Default selection ships with a matching overlay and vs-W density.
+            self.assertEqual(explorer.overlay_mode.currentText(),
+                             "Appearance energy")
             explorer.detect_checks["change energy"].setChecked(True)
             self.assertEqual(explorer.detect, "change energy")
             self.assertFalse(
@@ -190,6 +202,10 @@ class StructureTensorExplorerTests(unittest.TestCase):
             self.assertTrue(change_w.band_active)
             self.assertEqual(change_w.maximumHeight(), MiniPlot.EXPANDED_H)
             self.assertFalse(explorer.plots["appear_w"].band_active)
+            # Overlay and the value-vs-W density both follow the selection.
+            self.assertEqual(explorer.overlay_mode.currentText(),
+                             "Change energy Jtt")
+            self.assertIn("Change energy", explorer.plots["vw_sel"].title)
 
             # Owned change energy is uniform per frame ([0, 2, 4, 8]); with the
             # default W=2 trailing window the block field is [0, 1, 3, 6].
@@ -203,9 +219,10 @@ class StructureTensorExplorerTests(unittest.TestCase):
             # pooled clump.
             np.testing.assert_array_equal(
                 explorer.plots["clump"].y, [0, 0, 2, 2])
-            # Detection window D=2 (fps): trailing mean of count [0, 0, 4, 4]
-            # is [0, 0, 2, 4] -- the first in-band frame is diluted by the
-            # quiet frame before it.
+            # Detection window D=2 (fps): centered mean (backward-leaning for
+            # even D, so D=2 covers [t-1, t]) of count [0, 0, 4, 4] is
+            # [0, 0, 2, 4] -- the first in-band frame is diluted by the quiet
+            # frame before it.
             self.assertEqual(explorer.sweep_win, 2)
             np.testing.assert_allclose(
                 explorer.plots["count_w"].y, [0.0, 0.0, 2.0, 4.0])
