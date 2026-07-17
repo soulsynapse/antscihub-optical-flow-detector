@@ -16,11 +16,17 @@ The scalogram IS the "first integration" here (the structure-tensor explorer's
 windowed mean over W): instead of a window length, the knob is the frequency band
 on the scalogram. So the "detect on which channel" picker -- which structure
 tensor puts as exclusive checkboxes beside its density plots -- lives on the RIGHT
-here too, an exclusive checkbox group over the source channels feeding the
-scalogram.
+here too, an exclusive checkbox group beside a per-channel band-power heatmap.
 
-Two stacked bands, mirroring the two questions: the scalogram's frequency band
-("which rhythm") and the density plot's value band ("which blocks are hot").
+To let the data be explored multiple ways (like the tensor explorer's stack of
+heatmaps) there is one band-power density heatmap PER source channel, plus the
+tensor's detection-sweep suite (windowed in-band count over D, a binary detection
+gate, and the largest connected clump). The heavy part -- a per-block Morlet cube
+runs hundreds of MB and scales with clip length -- is why the per-channel cubes
+build LAZILY: only the channel you actually check (detect on) is built, so you
+never pay for five cubes at once. A channel you have visited stays cached, so
+you can flick between channels to compare their band-power distributions.
+
 Nothing here is written to the cache; scalograms are derived on the fly from the
 structure-tensor channels so the cost/benefit is visible before it is paid.
 See docs/expanded_cache_plan.md.
@@ -29,6 +35,7 @@ from __future__ import annotations
 
 import os
 from collections import OrderedDict
+from functools import partial
 
 import cv2
 import numpy as np
@@ -37,8 +44,9 @@ from PyQt6.QtCore import QEvent, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
                          QShortcut)
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
-                             QHBoxLayout, QLabel, QProgressDialog, QPushButton,
-                             QScrollArea, QSlider, QVBoxLayout, QWidget)
+                             QGridLayout, QHBoxLayout, QLabel, QProgressDialog,
+                             QPushButton, QScrollArea, QSlider, QVBoxLayout,
+                             QWidget)
 
 from core.tensor_channels import load_or_extract_channels
 from core.wavelet import default_freqs, morlet_power
@@ -48,10 +56,12 @@ from gui.explorers.speed_explorer import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
                                           PixelBarPlot, _regions_from_meta)
 
 EPS = 1e-6
+SWEEP_C = QColor(110, 230, 120)      # in-band count / clump
+DETECT_C = QColor(120, 255, 140)     # binary detection gate
 
-# Channel -> (attribute, human label, overlay colormap). All are nonnegative
-# energies except cached speed; the scalogram cares only about their temporal
-# fluctuation, so the choice is about which signal's rhythm you want to see.
+# Channel -> (attribute, overlay colormap). All are nonnegative energies except
+# cached speed; the scalogram cares only about their temporal fluctuation, so the
+# choice is about which signal's rhythm you want to see.
 CHANNELS = {
     "change energy Jtt": ("change", cv2.COLORMAP_TURBO),
     "appearance energy": ("appearance", cv2.COLORMAP_TURBO),
@@ -206,6 +216,7 @@ class ScalogramExplorer(QWidget):
         self.cache = cache
         self.meta = cache.meta
         self.fps = float(self.meta["fps"])
+        self.dt = 1.0 / max(self.fps, EPS)
         self.ny, self.nx = map(int, self.meta["grid"])
         self.regions = _regions_from_meta(self.meta, (self.ny, self.nx))
         self.packed = bool(self.meta.get("replicate_tiles"))
@@ -248,12 +259,15 @@ class ScalogramExplorer(QWidget):
         self._overlay_peek_hidden = False
         self._render_frac = (0.0, 0.0, 1.0, 1.0)
         self._ov_scale = EPS       # replaced by a real percentile in _rebuild
-        # Per-block scalogram of the active scope: (F, T, B). Built off the GUI
-        # thread on region/channel change; band drags only re-sum it.
-        self._block_sg = None
-        # Per-region column bookkeeping into the cube's B axis, so a pooled scope
-        # can map each block column back to the replicate (and grid cell) it came
-        # from. Set by _apply_cube; a list of dicts {bbox, gy, gx, c0, n}.
+        # Detection-window D (frames): the binary gate reads the centered mean of
+        # "# blocks in band" over D, so a 1-frame spike of N blocks dilutes to
+        # N/D and cannot fake a sustained event. Centered by default (offline, so
+        # the gate fires ON the event rather than D/2 frames after it).
+        self.sweep_win = max(1, min(self.T - 1, int(round(self.fps))))
+        self.centered = True
+        # Per-region column bookkeeping into a cube's B axis: maps each block
+        # column back to its grid cell. Cube-independent (pure geometry), so it
+        # is set the moment a replicate is selected -- before any cube lands.
         self._block_snap: list[dict] = []
         # Memoize built cubes by (region_index, channel) so switching back is
         # instant. Cubes are large, so retain them under a byte budget rather
@@ -278,6 +292,12 @@ class ScalogramExplorer(QWidget):
         self._freq_debounce.setSingleShot(True)
         self._freq_debounce.setInterval(150)
         self._freq_debounce.timeout.connect(self._on_freq_band)
+        # Cheap in-band counts stay live while a band drags; the expensive clump
+        # (per-frame connected components) refreshes only on release.
+        self._sweep_debounce = QTimer(self)
+        self._sweep_debounce.setSingleShot(True)
+        self._sweep_debounce.setInterval(120)
+        self._sweep_debounce.timeout.connect(self._recompute_counts)
         self._build_ui()
 
         # Shift-to-peek (hide the overlay to read the raw frame) rides an
@@ -331,9 +351,27 @@ class ScalogramExplorer(QWidget):
                  (r["atlas_bbox"] for r in self._regions_for_index(idx))]
         return parts[0] if len(parts) == 1 else np.concatenate(parts, axis=1)
 
+    def _make_snap(self, idx: int) -> list[dict]:
+        """Per-region block-column map for scope ``idx`` (pure geometry)."""
+        snap: list[dict] = []
+        c0 = 0
+        for region in self._regions_for_index(idx):
+            y0, x0, y1, x1 = region["atlas_bbox"]
+            gy, gx = np.mgrid[y0:y1, x0:x1]
+            n = (y1 - y0) * (x1 - x0)
+            snap.append({"bbox": (y0, x0, y1, x1), "gy": gy.ravel(),
+                         "gx": gx.ravel(), "c0": c0, "n": n, "region": region})
+            c0 += n
+        return snap
+
+    def _all_plots(self):
+        return [self.trace_plot, self.scalo_plot, *self.density_plots.values(),
+                self.count_plot, self.count_w_plot, self.detect_plot,
+                self.clump_plot]
+
     # -- UI ------------------------------------------------------------------
     def _build_ui(self):
-        self.resize(1600, 950)
+        self.resize(1600, 980)
         root = QHBoxLayout(self)
 
         left = QVBoxLayout()
@@ -378,18 +416,27 @@ class ScalogramExplorer(QWidget):
         self.hi_chk.setChecked(True)
         self.hi_chk.stateChanged.connect(lambda _: self._redraw_video())
         hrow.addWidget(self.hi_chk)
+        self.centered_chk = QCheckBox("Centered detection window")
+        self.centered_chk.setToolTip(
+            "Checked: the detection window D is centered [t-D/2, t+D/2], so the "
+            "gate fires ON the event (offline; reads the future). Unchecked: "
+            "trailing [t-D+1, t] -- what a causal live detector would see.")
+        self.centered_chk.setChecked(self.centered)
+        self.centered_chk.stateChanged.connect(self._on_centered_toggle)
+        hrow.addWidget(self.centered_chk)
         hrow.addStretch(1)
         left.addLayout(hrow)
 
+        self.sweep_win_slider, self.sweep_win_lbl = self._add_slider(
+            left, 1, max(2, self.T - 1), self.sweep_win, self._on_sweep_window)
+
         note = QLabel(
             "Drag the FREQUENCY band on the scalogram to pick which rhythm to "
-            "detect on; the density plot below shows the per-block power that "
-            "band yields, with its own VALUE band -- the detection channel a "
-            "scalogram cache would store. Compare with the structure-tensor "
-            "explorer, whose single fixed band cannot be moved in frequency. "
-            "Click a replicate in the video to select it (nothing is computed "
-            "until you do). Space toggles playback; hold Shift to peek at the "
-            "raw frame.")
+            "detect on; each channel's density plot below shows the per-block "
+            "power that band yields, with its own VALUE band. Check a channel to "
+            "detect on it -- its per-block cube builds on demand (nothing else "
+            "is precomputed). Click a replicate in the video to select it. "
+            "Space toggles playback; hold Shift to peek at the raw frame.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#8ab; padding-top:4px;")
         left.addWidget(note)
@@ -411,24 +458,14 @@ class ScalogramExplorer(QWidget):
         col = QVBoxLayout(holder)
         col.setSpacing(4)
 
-        # Detection-channel picker, on the RIGHT beside the plots (the structure
-        # -tensor explorer's idiom): an exclusive checkbox group over the source
-        # channels, selecting which signal the scalogram / density stack reads.
-        sec = QLabel("Detect on channel")
-        sec.setStyleSheet("color:#7fd7ff; font-weight:bold; padding-top:2px;")
-        col.addWidget(sec)
-        self.chan_group = QButtonGroup(self)
-        self.chan_group.setExclusive(True)
-        self.chan_checks: dict[str, QCheckBox] = {}
-        for name in CHANNELS:
-            cb = QCheckBox(name)
-            cb.setChecked(name == self.channel)
-            cb.setToolTip(f"Compute the scalogram on '{name}' and detect on it")
-            self.chan_group.addButton(cb)
-            self.chan_checks[name] = cb
-            col.addWidget(cb)
-        self.chan_group.buttonToggled.connect(self._on_channel_toggled)
+        def section(text):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                "color:#7fd7ff; font-weight:bold; padding-top:6px;")
+            lbl.setWordWrap(True)
+            col.addWidget(lbl)
 
+        section("Selected channel")
         self.trace_plot = MiniPlot("selected channel (replicate mean)")
         self.trace_plot.seek_requested.connect(self._seek)
         col.addWidget(self.trace_plot)
@@ -437,81 +474,183 @@ class ScalogramExplorer(QWidget):
                                         self.freqs)
         self.scalo_plot.seek_requested.connect(self._seek)
         # band_changed fires on every mouse-move; the band-power re-sum is an
-        # O(F*T*B) pass, so debounce it (same pattern as the speed explorer's
-        # sweep debounce) and only recompute eagerly on release.
+        # O(F*T*B) pass per cached channel, so debounce it and recompute eagerly
+        # only on release.
         self.scalo_plot.band_changed.connect(self._freq_debounce.start)
         self.scalo_plot.band_committed.connect(self._on_freq_band_committed)
         col.addWidget(self.scalo_plot)
 
-        self.density_plot = DensityPlot("per-block band power (drag value band)")
-        self.density_plot.set_log_axis(True)
-        self.density_plot.set_band_active(True)
-        self.density_plot.seek_requested.connect(self._seek)
-        self.density_plot.band_changed.connect(self._redraw_video)
-        self.density_plot.band_committed.connect(self._update_count)
-        col.addWidget(self.density_plot)
+        # Per-channel band-power heatmaps, each with an inline exclusive checkbox
+        # (the structure-tensor idiom). Checking one selects it as the detection
+        # channel AND triggers its lazy cube build; visited channels stay cached.
+        section("Per-block band power by channel — check to detect (builds on "
+                "demand)")
+        grid_w = QWidget()
+        grid = QGridLayout(grid_w)
+        grid.setSpacing(3)
+        grid.setColumnMinimumWidth(0, 20)
+        grid.setColumnStretch(1, 1)
+        self.chan_group = QButtonGroup(self)
+        self.chan_group.setExclusive(True)
+        self.chan_checks: dict[str, QCheckBox] = {}
+        self.density_plots: dict[str, DensityPlot] = {}
+        for r, name in enumerate(CHANNELS):
+            cb = QCheckBox()
+            cb.setProperty("channel", name)
+            cb.setToolTip(f"Detect on {name} (builds its cube on first check)")
+            cb.setChecked(name == self.channel)
+            self.chan_group.addButton(cb)
+            self.chan_checks[name] = cb
+            grid.addWidget(cb, r, 0, Qt.AlignmentFlag.AlignCenter)
+            dp = DensityPlot(name)
+            dp.set_log_axis(True)
+            dp.seek_requested.connect(self._seek)
+            dp.band_changed.connect(partial(self._on_density_band_changed, name))
+            dp.band_committed.connect(
+                partial(self._on_density_band_committed, name))
+            self.density_plots[name] = dp
+            grid.addWidget(dp, r, 1)
+        col.addWidget(grid_w)
+        self.chan_group.buttonToggled.connect(self._on_channel_toggled)
 
+        section("Detection sweep (selected channel)")
         self.count_plot = PixelBarPlot("# blocks in band", unit="blocks",
-                                       color=QColor(110, 230, 120))
+                                       color=SWEEP_C)
         self.count_plot.seek_requested.connect(self._seek)
         col.addWidget(self.count_plot)
+        self.count_w_plot = MiniPlot("windowed # blocks in band (mean over D)",
+                                     "blocks", SWEEP_C)
+        self.count_w_plot.seek_requested.connect(self._seek)
+        self.count_w_plot.set_band_active(True)
+        self.count_w_plot.set_expanded(True)
+        self.count_w_plot.band_changed.connect(self._recompute_detect)
+        self.count_w_plot.band_committed.connect(self._recompute_detect)
+        col.addWidget(self.count_w_plot)
+        self.detect_plot = MiniPlot("positive detection (windowed count in band)",
+                                    "0/1", DETECT_C)
+        self.detect_plot.seek_requested.connect(self._seek)
+        col.addWidget(self.detect_plot)
+        self.clump_plot = PixelBarPlot("largest connected clump in band",
+                                       unit="blocks", color=SWEEP_C)
+        self.clump_plot.seek_requested.connect(self._seek)
+        col.addWidget(self.clump_plot)
 
         col.addStretch(1)
         scroll.setWidget(holder)
-        scroll.setMinimumWidth(460)
+        scroll.setMinimumWidth(480)
         root.addWidget(scroll, 2)
 
-    # -- scalogram computation ----------------------------------------------
-    def _rebuild_scalograms(self):
-        """Refresh the cheap per-frame views synchronously, then serve the
-        per-block cube from the memo cache or a background build.
+        self._apply_selected_plot_ui()
+        self._sync_labels()
 
-        Everything here is <10 ms (the pooled-mean scalogram is one column), so
-        it runs on the GUI thread for instant feedback. The heavy per-block cube
-        is handed to :meth:`_request_cube`, which threads it and caches it."""
+    def _add_slider(self, layout, lo, hi, val, handler):
+        row = QHBoxLayout()
+        lbl = QLabel()
+        lbl.setMinimumWidth(260)
+        row.addWidget(lbl)
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(lo, hi)
+        s.setValue(val)
+        s.valueChanged.connect(handler)
+        row.addWidget(s, 1)
+        layout.addLayout(row)
+        return s, lbl
+
+    def _apply_selected_plot_ui(self):
+        """Expand + activate the value band on the selected channel's density;
+        collapse and deactivate the rest (their matrices stay visible)."""
+        for name, dp in self.density_plots.items():
+            sel = (name == self.channel)
+            dp.set_band_active(sel)
+            dp.set_expanded(sel)
+
+    def _sync_labels(self):
+        self.sweep_win_lbl.setText(
+            f"Detection window D (count mean): {self.sweep_win} fr "
+            f"({self.sweep_win * self.dt:.2f} s)")
+
+    # -- frequency-band -> per-channel band power ---------------------------
+    def _band_indices(self) -> tuple[int, int]:
+        """[i, j) slice on the sorted frequency axis for the current band."""
+        flo, fhi = self.scalo_plot.band_hz()
+        i = int(np.searchsorted(self.freqs, flo, "left"))
+        j = int(np.searchsorted(self.freqs, fhi, "right"))
+        if j <= i:                              # empty band: snap to nearest scale
+            i = int(np.argmin(np.abs(self.freqs - flo)))
+            j = i + 1
+        return i, j
+
+    def _refresh_densities(self):
+        """Re-sum every CACHED channel cube over the current frequency band into
+        its density heatmap; blank the channels whose cube isn't built (or was
+        evicted) so the display never shows stale band power."""
         if self.active_region_index < 0:
-            # Selection view: nothing selected, so process nothing. Clear the
-            # plots (a prior selection's data must not linger) and leave the
-            # cube state empty; the video shows the full frame with boxes.
-            self._block_sg = None
-            self._block_snap = []
-            self.trace_plot.set_series(np.zeros(0, np.float32))
-            self.scalo_plot.set_scalogram(np.zeros((0, 0), np.float32))
-            self.density_plot.set_matrix(np.zeros((0, 0), np.float32))
-            self.count_plot.set_series(np.zeros(0, np.float32))
-            self._set_busy(False)
             return
+        i, j = self._band_indices()
+        empty = np.zeros((0, 0), np.float32)
+        for name, dp in self.density_plots.items():
+            cube = self._sg_cache.get((self.active_region_index, name))
+            dp.set_matrix(cube[i:j].sum(axis=0) if cube is not None else empty)
+
+    # -- scalogram computation ----------------------------------------------
+    def _rebuild_selected_views(self):
+        """Cheap per-frame views of the selected channel (no cube needed): the
+        replicate-mean trace and the pooled-mean scalogram + overlay scale."""
         arr = self._chan_arr()
         blocks = self._scope_blocks(arr, self.active_region_index)   # (T, B)
         pooled = blocks.mean(axis=1)
         self.trace_plot.set_series(pooled)
+        self.trace_plot.set_cursor(self.frame)
         self.scalo_plot.set_scalogram(morlet_power(pooled, self.fps, self.freqs))
+        self.scalo_plot.set_cursor(self.frame)
         # Overlay color scale is a whole-clip percentile of this channel/scope;
-        # freeze it here so scrubbing (which redraws the video every frame) never
+        # freeze it here so scrubbing (which redraws every frame) never
         # re-percentiles the array in the hot path.
         self._ov_scale = max(float(np.percentile(blocks, 99)), EPS)
 
-        key = (self.active_region_index, self.channel)
-        cube = self._sg_cache.get(key)
-        if cube is not None:                       # memo hit: apply immediately
-            self._sg_cache.move_to_end(key)
-            self._apply_cube(key, cube)
+    def _rebuild_scalograms(self):
+        """React to a replicate or channel change: refresh the cheap views, then
+        serve the selected channel's per-block cube from the memo cache or a
+        background build. Other channels' densities fill in only if their cube is
+        already cached (lazy)."""
+        if self.active_region_index < 0:
+            # Selection view: nothing selected, so process nothing. Clear the
+            # plots (a prior selection's data must not linger); the video shows
+            # the full frame with boxes.
+            self._block_snap = []
+            for pl in self._all_plots():
+                if isinstance(pl, ScalogramPlot):
+                    pl.set_scalogram(np.zeros((0, 0), np.float32))
+                elif isinstance(pl, DensityPlot):
+                    pl.set_matrix(np.zeros((0, 0), np.float32))
+                else:
+                    pl.set_series(np.zeros(0, np.float32))
             self._set_busy(False)
             return
 
-        # Cube not ready: drop the stale per-block state (a pending scrub must
-        # not pair the new scope's blocks with the old scope's coords) and build.
-        self._block_sg = None
-        self._block_snap = []
-        self._request_cube()
+        self._block_snap = self._make_snap(self.active_region_index)
+        self._rebuild_selected_views()
+        self._apply_selected_plot_ui()
+        self._refresh_densities()
+        self._recompute_sweep()
+        # Build the selected channel's cube if it isn't cached yet.
+        if self._sg_cache.get((self.active_region_index, self.channel)) is None:
+            self._request_cube()
+        else:
+            self._sg_cache.move_to_end((self.active_region_index, self.channel))
+            self._set_busy(False)
 
     def _request_cube(self):
-        """Start a background build for the current view unless one is already
-        in flight -- the running worker re-checks the current view when it ends,
-        so a rapid region/channel switch coalesces onto the latest target."""
+        """Build the SELECTED channel's cube unless it is already cached or a
+        build is in flight. Only the selected channel is ever built (lazy): the
+        running worker re-checks the current selection when it ends, so a rapid
+        channel/region switch coalesces onto the latest target."""
         if self.active_region_index < 0 or self._worker is not None:
             return
-        self._launch_worker((self.active_region_index, self.channel))
+        key = (self.active_region_index, self.channel)
+        if self._sg_cache.get(key) is not None:
+            return
+        self._launch_worker(key)
 
     def _launch_worker(self, key):
         region_idx, channel = key
@@ -532,41 +671,23 @@ class ScalogramExplorer(QWidget):
         self._sg_cache[key] = cube
         self._sg_cache.move_to_end(key)
         self._worker = None
-        cur = (self.active_region_index, self.channel)
-        self._evict_cache(protect=cur)
-        if key == cur:                             # still the view being shown
-            self._apply_cube(key, cube)
+        region_idx, channel = key
+        self._evict_cache(protect=(self.active_region_index, self.channel))
+        if region_idx == self.active_region_index and region_idx >= 0:
+            # Fold the new cube into its channel's density (and, if it is the
+            # selected one, the sweep + overlay).
+            self._refresh_densities()
+            if channel == self.channel:
+                self._recompute_sweep()
+                self._redraw_video()
+        # The selection may have moved while this built; build the new target.
+        self._request_cube()
+        if self._worker is None:
             self._set_busy(False)
-        elif cur[0] < 0:                           # view moved to the selection
-            self._set_busy(False)                  # (no-processing) scope
-        elif self._sg_cache.get(cur) is not None:  # view moved to a cached cube
-            self._sg_cache.move_to_end(cur)
-            self._apply_cube(cur, self._sg_cache[cur])
-            self._set_busy(False)
-        else:                                      # view moved on: build that one
-            self._launch_worker(cur)
-
-    def _apply_cube(self, key, cube):
-        """Bind ``cube`` as the active per-block scalogram and rebuild the
-        per-region column map. Only ever called with a cube whose scope matches
-        the current view, so the block coords line up with the cube's B axis."""
-        region_idx, _ = key
-        self._block_sg = cube
-        snap: list[dict] = []
-        c0 = 0
-        for region in self._regions_for_index(region_idx):
-            y0, x0, y1, x1 = region["atlas_bbox"]
-            gy, gx = np.mgrid[y0:y1, x0:x1]
-            n = (y1 - y0) * (x1 - x0)
-            snap.append({"bbox": (y0, x0, y1, x1), "gy": gy.ravel(),
-                         "gx": gx.ravel(), "c0": c0, "n": n, "region": region})
-            c0 += n
-        self._block_snap = snap
-        self._on_freq_band()
 
     def _evict_cache(self, protect):
         """Drop oldest cubes until the retained total is under budget, but never
-        the ``protect`` (current) key."""
+        the ``protect`` (current selected) key."""
         total = sum(c.nbytes for c in self._sg_cache.values())
         for k in list(self._sg_cache):             # oldest first
             if total <= self._SG_CACHE_BUDGET:
@@ -592,36 +713,115 @@ class ScalogramExplorer(QWidget):
         super().closeEvent(e)
 
     def _on_freq_band(self):
-        """Sum the per-block scalogram over the selected frequency band -> the
-        per-block band-power detection channel."""
-        if self._block_sg is None:
+        """Frequency band moved: re-sum cached channel cubes and refresh the
+        cheap sweep counts (clump waits for release)."""
+        if self.active_region_index < 0 or not self._block_snap:
             return
-        flo, fhi = self.scalo_plot.band_hz()
-        # The band is a contiguous interval on the sorted frequency axis, so a
-        # plain slice sums in place; a boolean mask would fancy-index a copy of
-        # the whole (F, T, B) block first.
-        i = int(np.searchsorted(self.freqs, flo, "left"))
-        j = int(np.searchsorted(self.freqs, fhi, "right"))
-        if j <= i:                              # empty band: snap to nearest scale
-            i = int(np.argmin(np.abs(self.freqs - flo)))
-            j = i + 1
-        band_power = self._block_sg[i:j].sum(axis=0)           # (T, B)
-        self.density_plot.set_matrix(band_power)
-        self._update_count()
+        self._refresh_densities()
+        self._recompute_counts()
+        self._redraw_video()
 
     def _on_freq_band_committed(self):
         self._freq_debounce.stop()
-        self._on_freq_band()
-
-    def _update_count(self, *_):
-        if self._block_sg is None:
+        if self.active_region_index < 0 or not self._block_snap:
             return
-        m = self.density_plot.matrix                            # (T, B)
-        lo, hi = self.density_plot.band()
-        inband = (m >= lo) & (m <= hi) & np.isfinite(m)
-        self.count_plot.set_series(inband.sum(axis=1).astype(np.float32))
-        self.count_plot.set_cursor(self.frame)
+        self._refresh_densities()
+        self._recompute_sweep()
         self._redraw_video()
+
+    # -- detection sweep (selected channel) ---------------------------------
+    def _selected_density(self) -> "DensityPlot | None":
+        return self.density_plots.get(self.channel)
+
+    def _window_bounds(self, W):
+        """Prefix-sum bounds per frame for the detection window D; centered or
+        trailing per the checkbox. Windows truncate at the clip edges; neff keeps
+        the means honest there."""
+        t = np.arange(self.T)
+        if self.centered:
+            lo = np.maximum(0, t - W // 2)
+            hi = np.minimum(self.T, t + (W - W // 2))
+        else:
+            hi = t + 1
+            lo = np.maximum(0, hi - W)
+        return hi, lo, (hi - lo).astype(np.float32)
+
+    def _recompute_sweep(self):
+        self._recompute_counts()
+        self._recompute_clump()
+
+    def _recompute_counts(self):
+        """# blocks in the selected channel's value band per frame, and its
+        windowed mean over D. Cheap: runs live while a band drags."""
+        dp = self._selected_density()
+        m = dp.matrix if dp is not None else None
+        if m is None or m.size == 0:
+            for pl in (self.count_plot, self.count_w_plot, self.detect_plot):
+                pl.set_series(np.zeros(0, np.float32))
+            return
+        lo, hi = dp.band()
+        inband = (m >= lo) & (m <= hi) & np.isfinite(m)
+        count = inband.sum(axis=1).astype(np.float32)
+        self.count_plot.set_series(count)
+        self.count_plot.set_cursor(self.frame)
+        self._recompute_windowed_count(count)
+
+    def _recompute_windowed_count(self, count: np.ndarray | None = None):
+        if count is None:
+            count = self.count_plot.y
+        if count.size == 0:
+            self.count_w_plot.set_series(np.zeros(0, np.float32))
+            self._recompute_detect()
+            return
+        if self.sweep_win <= 1:
+            windowed = count.astype(np.float32)
+        else:
+            c = np.concatenate([[0.0], np.cumsum(count, dtype=np.float64)])
+            hi, lo, neff = self._window_bounds(self.sweep_win)
+            windowed = ((c[hi] - c[lo]) / neff).astype(np.float32)
+        self.count_w_plot.set_series(windowed)
+        self.count_w_plot.set_cursor(self.frame)
+        self._recompute_detect()
+
+    def _recompute_detect(self):
+        blo, bhi = self.count_w_plot.band()
+        y = self.count_w_plot.y
+        self.detect_plot.set_series(
+            ((y >= blo) & (y <= bhi)).astype(np.float32) if y.size
+            else np.zeros(0, np.float32))
+        self.detect_plot.set_cursor(self.frame)
+
+    def _recompute_clump(self):
+        """Largest connected in-band clump per frame for the selected channel
+        (block-grid 8-connectivity). O(T) connected-components; refreshed only on
+        band/frequency release, never mid-drag."""
+        dp = self._selected_density()
+        if dp is None or dp.matrix.size == 0 or not self._block_snap:
+            self.clump_plot.set_series(np.zeros(0, np.float32))
+            return
+        m = dp.matrix                                          # (T, B)
+        s = self._block_snap[0]                                # single region
+        y0, x0, y1, x1 = s["bbox"]
+        dy, dx = y1 - y0, x1 - x0
+        gy, gx = s["gy"] - y0, s["gx"] - x0
+        if m.shape[1] != gy.size:                              # stale mid-switch
+            self.clump_plot.set_series(np.zeros(0, np.float32))
+            return
+        lo, hi = dp.band()
+        largest = np.zeros(m.shape[0], np.float32)
+        for t in range(m.shape[0]):
+            cols = m[t]
+            passing = (cols >= lo) & (cols <= hi) & np.isfinite(cols)
+            if not passing.any():
+                continue
+            grid = np.zeros((dy, dx), np.uint8)
+            grid[gy, gx] = passing.astype(np.uint8)
+            n_lab, _, stats, _ = cv2.connectedComponentsWithStats(
+                grid, connectivity=8)
+            if n_lab > 1:
+                largest[t] = float(stats[1:, cv2.CC_STAT_AREA].max())
+        self.clump_plot.set_series(largest)
+        self.clump_plot.set_cursor(self.frame)
 
     # -- video overlay -------------------------------------------------------
     def _base_frame(self):
@@ -681,8 +881,7 @@ class ScalogramExplorer(QWidget):
         arr = self._chan_arr()
         cmap = CHANNELS[self.channel][1]
 
-        # Spatial overlay: the selected channel at the current frame, per active
-        # replicate tile.
+        # Spatial overlay: the selected channel at the current frame.
         for region in self._active_regions():
             y0, x0, y1, x1 = region["atlas_bbox"]
             dx0, dy0, dx1, dy1 = self._display_bbox(region, ch_w, ch_h)
@@ -696,10 +895,12 @@ class ScalogramExplorer(QWidget):
             roi = out[dy0:dy1, dx0:dx1]
             out[dy0:dy1, dx0:dx1] = cv2.addWeighted(roi, 0.45, heat, 0.55, 0)
 
-        # Highlight blocks passing the value band (the detection footprint).
-        if self.hi_chk.isChecked() and not raw and self._block_sg is not None:
-            m = self.density_plot.matrix
-            lo, hi = self.density_plot.band()
+        # Highlight blocks passing the selected channel's value band.
+        dp = self._selected_density()
+        if self.hi_chk.isChecked() and not raw and dp is not None \
+                and self._block_snap:
+            m = dp.matrix
+            lo, hi = dp.band()
             total = sum(s["n"] for s in self._block_snap)
             # Guard against a stale matrix mid-rebuild (region/channel switch).
             if m.size and self.frame < m.shape[0] and m.shape[1] == total:
@@ -755,8 +956,7 @@ class ScalogramExplorer(QWidget):
             self.scrub.blockSignals(True)
             self.scrub.setValue(self.frame)
             self.scrub.blockSignals(False)
-        for pl in (self.trace_plot, self.scalo_plot, self.density_plot,
-                   self.count_plot):
+        for pl in self._all_plots():
             pl.set_cursor(self.frame)
         self.time_lbl.setText(f"{self.frame/self.fps:.2f} s  (#{self.frame})")
         if self.isVisible():
@@ -765,6 +965,14 @@ class ScalogramExplorer(QWidget):
     def _on_region_changed(self, _index):
         data = self.region_combo.currentData()
         self.active_region_index = int(data) if data is not None else 0
+        # Each replicate lives on its own value scale, so a value band frozen
+        # from the previous replicate would sit off this one's plots. Re-seed
+        # every channel's value band (and the count gate, whose block count just
+        # changed) wide open; the selected plot re-seeds via _apply_selected_ui.
+        for dp in self.density_plots.values():
+            dp.band_lo = dp.band_hi = None
+        self.count_w_plot.band_lo = self.count_w_plot.band_hi = None
+        self.count_w_plot.set_band_active(True)
         focus = None if self.active_region_index < 0 else \
             self._active_regions()[0]["frac"]
         self.video_view.set_focus_frac(focus)
@@ -778,9 +986,37 @@ class ScalogramExplorer(QWidget):
         # box; act only on the one that turned on.
         if not checked:
             return
-        self.channel = button.text()
-        self._rebuild_scalograms()
+        self.channel = str(button.property("channel"))
+        if self.active_region_index < 0:
+            return
+        self._rebuild_selected_views()
+        self._apply_selected_plot_ui()
+        self._refresh_densities()
+        self._recompute_sweep()
         self._redraw_video()
+        self._request_cube()      # build the newly-selected channel if needed
+
+    def _on_density_band_changed(self, name: str):
+        if name != self.channel:
+            return
+        self._sweep_debounce.start()   # cheap counts debounced
+        self._redraw_video()           # highlight overlay follows immediately
+
+    def _on_density_band_committed(self, name: str):
+        if name != self.channel:
+            return
+        self._sweep_debounce.stop()
+        self._recompute_sweep()
+        self._redraw_video()
+
+    def _on_sweep_window(self, v):
+        self.sweep_win = max(1, int(v))
+        self._sync_labels()
+        self._recompute_windowed_count()
+
+    def _on_centered_toggle(self, _state=None):
+        self.centered = self.centered_chk.isChecked()
+        self._recompute_windowed_count()
 
     def _on_video_clicked(self, point):
         """Click a replicate tile in the video to focus it (packed atlases)."""
@@ -797,7 +1033,7 @@ class ScalogramExplorer(QWidget):
 
     def _clear_region_focus(self):
         idx = self.region_combo.findData(-1)
-        if idx >= 0:                       # pooled scope exists: back to it
+        if idx >= 0:                       # selection scope exists: back to it
             self.region_combo.setCurrentIndex(idx)
         else:
             self.video_view.set_focus_frac(None)
