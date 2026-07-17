@@ -86,13 +86,19 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             # Overview pools the four owned cells, not the six cells in the
             # sparse storage atlas.
             self.assertEqual(explorer.n_blocks, 4)
+            # The raw per-frame channel reads out the fastest owned block.
             np.testing.assert_array_equal(explorer.plots["dist"].y, [4, 5])
+            # The detection channel is the windowed mean speed (W=2, centered).
+            # Frame 0's centered window truncates to itself (raw values); frame
+            # 1 averages both frames.
+            np.testing.assert_array_equal(
+                explorer.plots["dist_w"].matrix,
+                [[1.0, 2.0, 3.0, 4.0], [1.5, 2.5, 3.5, 4.5]])
 
             # A band that spans the whole value range accepts every owned block.
-            explorer.plots["dist"].band_lo = 0.0
-            explorer.plots["dist"].band_hi = 1e9
-            explorer._recompute_threshold_series()
-            explorer._recompute_clump()
+            explorer.plots["dist_w"].band_lo = 0.0
+            explorer.plots["dist_w"].band_hi = 1e9
+            explorer._recompute_sweep()
             np.testing.assert_array_equal(explorer.plots["count"].y, [4, 4])
             # The two tiles are independent 1x2 components, never one 1x4 clump.
             np.testing.assert_array_equal(explorer.plots["clump"].y, [2, 2])
@@ -102,87 +108,87 @@ class SpeedExplorerRegionTests(unittest.TestCase):
     def test_selected_plot_owns_the_band_and_expands(self):
         explorer = SpeedExplorer(_CacheStub())
         try:
-            dist = explorer.plots["dist"]
-            # The per-block speed plot is the sole detection channel: always
-            # expanded and always carrying the band, seeded wide open.
-            self.assertTrue(dist.band_active)
-            self.assertEqual(dist.maximumHeight(), MiniPlot.EXPANDED_H)
+            dist_w = explorer.plots["dist_w"]
+            # The windowed speed plot is the sole channel band: always expanded
+            # and always carrying the band, seeded wide open.
+            self.assertTrue(dist_w.band_active)
+            self.assertEqual(dist_w.maximumHeight(), MiniPlot.EXPANDED_H)
             self.assertEqual(explorer._band(), (float("-inf"), float("inf")))
 
-            # A non-sweep sparkline never grows a band.
-            self.assertFalse(explorer.plots["count"].band_active)
+            # The raw per-frame density is context only -- no band on it.
+            self.assertFalse(explorer.plots["dist"].band_active)
+            # The windowed-count gate carries its own always-active band.
+            self.assertTrue(explorer.plots["count_w"].band_active)
         finally:
             explorer.close()
 
     def test_dragging_a_band_line_updates_detection(self):
         explorer = SpeedExplorer(_CacheStub())
         try:
-            dist = explorer.plots["dist"]
-            dist.resize(200, MiniPlot.EXPANDED_H)
-            committed = QSignalSpy(dist.band_committed)
+            dist_w = explorer.plots["dist_w"]
+            dist_w.resize(200, MiniPlot.EXPANDED_H)
+            committed = QSignalSpy(dist_w.band_committed)
 
             # Grab the maximum handle at its current pixel row and drag it down
-            # to just above the fastest per-block speed's neighbourhood.
-            r = dist._plot_rect()
-            data_lo, data_hi = dist._data_range()
-            _, yhi, _ = dist._line_ys()
-            QTest.mousePress(dist, Qt.MouseButton.LeftButton,
+            # to just above the bulk of the windowed-speed distribution.
+            r = dist_w._plot_rect()
+            data_lo, data_hi = dist_w._data_range()
+            _, yhi, _ = dist_w._line_ys()
+            QTest.mousePress(dist_w, Qt.MouseButton.LeftButton,
                              pos=QPoint(int(r.right()) - 2, int(yhi)))
-            target = dist._y_of(3.0, r, data_lo, data_hi)
-            QTest.mouseMove(dist, pos=QPoint(int(r.right()) - 2, int(target)))
-            QTest.mouseRelease(dist, Qt.MouseButton.LeftButton,
+            target = dist_w._y_of(3.0, r, data_lo, data_hi)
+            QTest.mouseMove(dist_w, pos=QPoint(int(r.right()) - 2, int(target)))
+            QTest.mouseRelease(dist_w, Qt.MouseButton.LeftButton,
                                pos=QPoint(int(r.right()) - 2, int(target)))
 
             self.assertEqual(len(committed), 1)
             lo, hi = explorer._band()
             self.assertAlmostEqual(hi, 3.0, delta=0.2)
             self.assertLessEqual(lo, hi)
-            # Detection now reflects the dragged band, applied to per-block speed.
-            selected = explorer._active_block_values(explorer.speed)
+            # Detection reflects the dragged band, applied to windowed speed.
+            windowed = explorer._w_cache
             np.testing.assert_array_equal(
                 explorer.plots["count"].y,
-                ((selected >= lo) & (selected <= hi)).sum(1))
+                ((windowed >= lo) & (windowed <= hi)).sum(1))
         finally:
             explorer.close()
 
     def test_handle_at_plot_edge_means_unbounded_side(self):
         explorer = SpeedExplorer(_CacheStub())
         try:
-            dist = explorer.plots["dist"]
-            dist.resize(200, MiniPlot.EXPANDED_H)
-            r = dist._plot_rect()
-            data_lo, data_hi = dist._data_range()
+            dist_w = explorer.plots["dist_w"]
+            dist_w.resize(200, MiniPlot.EXPANDED_H)
+            r = dist_w._plot_rect()
+            data_lo, data_hi = dist_w._data_range()
 
-            # Fresh band accepts the fastest per-block speeds (4 and 5) even
-            # though the plotted density series tops out at 3.5 -- the original
-            # bug clamped hi to the plot max and silently rejected them.
-            explorer._recompute_threshold_series()
+            # Fresh band accepts every owned block's windowed speed.
+            explorer._recompute_sweep()
             np.testing.assert_array_equal(explorer.plots["count"].y, [4, 4])
 
             # Drag the lo handle up into the plot: a finite lower threshold.
             x = int(r.right()) - 2
-            ylo, _, _ = dist._line_ys()
-            QTest.mousePress(dist, Qt.MouseButton.LeftButton,
+            ylo, _, _ = dist_w._line_ys()
+            QTest.mousePress(dist_w, Qt.MouseButton.LeftButton,
                              pos=QPoint(x, int(ylo)))
-            target = dist._y_of(3.0, r, data_lo, data_hi)
-            QTest.mouseMove(dist, pos=QPoint(x, int(target)))
-            QTest.mouseRelease(dist, Qt.MouseButton.LeftButton,
+            target = dist_w._y_of(3.0, r, data_lo, data_hi)
+            QTest.mouseMove(dist_w, pos=QPoint(x, int(target)))
+            QTest.mouseRelease(dist_w, Qt.MouseButton.LeftButton,
                                pos=QPoint(x, int(target)))
             lo, hi = explorer._band()
             self.assertAlmostEqual(lo, 3.0, delta=0.2)
             # The untouched hi handle stays unbounded: the top region includes
             # the absolute highest values.
             self.assertEqual(hi, float("inf"))
-            selected = explorer._active_block_values(explorer.speed)
+            windowed = explorer._w_cache
             np.testing.assert_array_equal(
-                explorer.plots["count"].y, (selected >= lo).sum(1))
+                explorer.plots["count"].y, (windowed >= lo).sum(1))
 
             # Dragging lo off the bottom edge re-opens that side.
-            ylo, _, _ = dist._line_ys()
-            QTest.mousePress(dist, Qt.MouseButton.LeftButton,
+            ylo, _, _ = dist_w._line_ys()
+            QTest.mousePress(dist_w, Qt.MouseButton.LeftButton,
                              pos=QPoint(x, int(ylo)))
-            QTest.mouseMove(dist, pos=QPoint(x, int(r.bottom()) + 1))
-            QTest.mouseRelease(dist, Qt.MouseButton.LeftButton,
+            QTest.mouseMove(dist_w, pos=QPoint(x, int(r.bottom()) + 1))
+            QTest.mouseRelease(dist_w, Qt.MouseButton.LeftButton,
                                pos=QPoint(x, int(r.bottom()) + 1))
             self.assertEqual(explorer._band(),
                              (float("-inf"), float("inf")))
@@ -237,16 +243,26 @@ class SpeedExplorerRegionTests(unittest.TestCase):
         _, sizes = _cluster_inband(mask, w2, 2)
         self.assertAlmostEqual(sum(sizes.values()), 2.5)
 
-    def test_nonempty_clump_drives_positive_detection_channel(self):
+    def test_windowed_count_in_band_drives_positive_detection_channel(self):
         explorer = SpeedExplorer(_CacheStub())
         try:
-            # Wide-open band: each 1x2 tile is one gap=1 clump of weighted size 2,
-            # in both frames, so the largest-clump series is a flat 2 -- and
-            # detection fires every frame. There is no min-size gate anymore:
-            # any non-empty clump is a positive detection.
-            explorer._recompute_clump()
-            np.testing.assert_array_equal(explorer.plots["clump"].y, [2, 2])
+            # Wide-open channel band: all 4 owned blocks are in band every
+            # frame, so the in-band count is a flat 4. The detection window D
+            # is 1 frame here, so the windowed count equals the raw count, and
+            # with the count band seeded wide open detection fires every frame.
+            explorer._recompute_sweep()
+            np.testing.assert_array_equal(explorer.plots["count"].y, [4, 4])
+            np.testing.assert_array_equal(explorer.plots["count_w"].y, [4, 4])
             np.testing.assert_array_equal(explorer.plots["detect"].y, [1, 1])
+            # The clump diagnostic still runs on the windowed field: each 1x2
+            # tile is one gap=1 clump of weighted size 2.
+            np.testing.assert_array_equal(explorer.plots["clump"].y, [2, 2])
+
+            # Raising the count band's min above 4 rejects every frame: the
+            # sustained-evidence threshold is now unmet.
+            explorer.plots["count_w"].band_lo = 5.0
+            explorer._recompute_detect()
+            np.testing.assert_array_equal(explorer.plots["detect"].y, [0, 0])
         finally:
             explorer.close()
 
@@ -258,7 +274,7 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             # The overview band seeds wide open; place a finite threshold so we
             # can tell below whether it survives a scope round-trip.
             self.assertEqual(explorer._band(), unbounded)
-            explorer.plots["dist"].band_lo = 3.0
+            explorer.plots["dist_w"].band_lo = 3.0
 
             explorer._redraw_video()
             explorer._on_video_clicked(QPoint(25, 25))
@@ -272,13 +288,16 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             self.assertEqual(explorer._band(), unbounded)
             self.assertEqual(explorer.vmax, speed_scale)
             np.testing.assert_array_equal(explorer.plots["dist"].y, [2, 3])
-            selected = explorer._active_block_values(explorer.speed)
+            # The detection channel is this replicate's two owned blocks,
+            # windowed (W=2, centered): frame 0 truncates to itself, frame 1
+            # averages both frames.
             np.testing.assert_array_equal(
-                selected, explorer.speed[:, 0:1, 0:2].reshape(2, -1))
+                explorer._w_cache, [[1.0, 2.0], [1.5, 2.5]])
+            windowed = explorer._w_cache
             lo, hi = explorer._band()
             np.testing.assert_array_equal(
                 explorer.plots["count"].y,
-                ((selected >= lo) & (selected <= hi)).sum(1))
+                ((windowed >= lo) & (windowed <= hi)).sum(1))
 
             explorer.focus_mode.setCurrentIndex(1)
             flow_preview = explorer._base_frame()
@@ -300,7 +319,7 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             # scope's was.
             explorer._on_video_clicked(QPoint(25, 25))
             self.assertEqual(explorer._band(), unbounded)
-            explorer.plots["dist"].band_lo = 2.5
+            explorer.plots["dist_w"].band_lo = 2.5
             explorer._clear_region_focus()
             explorer._on_video_clicked(QPoint(25, 25))
             # Now this replicate's own cached band comes back too.
