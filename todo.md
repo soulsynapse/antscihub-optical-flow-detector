@@ -20,6 +20,9 @@ I'm writing this while waiting for the usage window to renew.
 - we can do away with the replicate drop menu, it is entirely redundant with the clicking navigation
 - it seems like there's some kind of runaway memory issue on the replicate tab somewhere.
 - we need to make a 'viewer' tab that ingests the output of fully processing the video, but has none of the stuff from the preprocessing tab - it just says when there was a detection, and when there was not. This should have the output bar that comes up at the bottom once a video is fully processed (currently), but then a second one that is zoomed in on a like, 1 minute window where the scrubber is currently. It should also have the ability to pass it *back* to the preprocessing tab in the middle of wherever it was paused so I can see how it processes it, rather than the current version where whenever I click on the timeline it will start the processing right away.
+- (23) ROI pre-transcode: cut each source once into per-replicate clips at working resolution + a manifest, so every later pass decodes ~1/16 the pixels instead of re-decoding 5.3K. Decode is the throughput wall; this is the one lever that removes it.
+- (24) headless batch driver: a no-GUI entry point (video + replicate JSON -> detection results) and file-level job partitioning, so a run fans out across HPC nodes. Scaling is linear across nodes and flat across cores on one box.
+- (25) replicate-aware auto downsample: resolve the scale from the widest replicate rather than the source width. Correctness, not preference - a pre-cropped video and an equivalent uncropped box currently resolve to different physical scales, so their results are not comparable. Sweep DEFAULT_TARGET_WIDTH first to price it.
 
 ---
 
@@ -284,7 +287,79 @@ retention). Do last.
   be rebuilt before comparing detection results across it** — the numbers moved
   for a good reason but the key does not know that.
 
-- **Then: Batch D/E** if perceived UI lag matters more than throughput.
+- **Throughput is now decode-bound, and that is a hardware wall.** Measured after
+  the ROI batch, and it invalidates the "optimize the top span" instinct:
+
+  | 479 frames (20 s of 5312x2988) | |
+  |---|---|
+  | full extraction pass | 4.39 s |
+  | **pure ffmpeg decode, no filters, output discarded** | **3.82 s** |
+
+  Everything the tool does — tensor solve, block reduce, wavelets, detection —
+  adds **13%** on top of decode. So `block_reduce` reading "31% of spans" is an
+  artifact: those spans accumulate while the loop waits on a frame. Optimizing it
+  gains ~nothing. Same for GPU on the tensor math — it is already free in the
+  shadow of decode. **Do not re-derive this by staring at the span table.**
+
+  **Multi-process does not scale**, because one ffmpeg already spreads H.264
+  decode across the whole box (`-threads 1` is 40.3 s vs 3.8 s auto):
+
+  | workers | CPU decode | GPU decode (`-hwaccel cuda`) |
+  |---|---|---|
+  | 1 | 4.6x realtime | 6.8x |
+  | 4 | 7.8x | 10.4x |
+  | 8 | 7.6x | **10.8x (ceiling)** |
+
+  Aggregate throughput is flat past ~2-4 workers either way. The RTX 4060 helps
+  ~38% but has one NVDEC engine and hits its own ceiling. At 10.8x realtime,
+  3000 h of footage is **~11.6 days on this machine** — so single-box tuning is
+  not the path. GPU decode is a real but small win; it is a flag
+  (`-hwaccel cuda` before `-i`), not a project, if it is ever wanted.
+
+### Batch I — ROI pre-transcode (todo 23) · new file + `channel_source`
+The one lever that removes the decode wall. Cut each source once into
+per-replicate clips at working resolution plus a manifest (geometry, scale,
+source hash, fps at full precision), and teach the extraction path to consume the
+manifest instead of the original. Every later pass then decodes ~1/16 the pixels.
+
+**It moves the bottleneck to the math, which is the point.** The already-cropped
+`rep3_intermittent_crop` (462x456) spends 3-5% on decode and ~7.8 s on math — a
+different regime entirely. So this must land *before* any math/threading work:
+afterwards CPU math parallelizes cleanly across processes, where decode does not.
+Reuses the `ReplicateVideoSource` filter-graph geometry that already exists.
+Watch: the `format=gray16le` after `scale` ordering, and keep fps at full
+precision in the manifest (see the seek bug fixed in the ROI batch).
+
+### Batch J — headless batch driver (todo 24) · new CLI + `core` only
+No-GUI entry point: video + replicate JSON -> detection results on disk, plus
+file-level job partitioning. This is what gets linear scaling, because each node
+brings its own decode capacity: 3000 h / 10x / 50 nodes ~ 6 h. Pairs with I (a
+batch run should consume pre-transcoded ROI clips). Also needs a memory note: the
+channel arrays are (n, ny, nx) float32 x 5 — ~354 MB per hour of 24 fps footage,
+so a multi-hour clip wants chunked writes rather than one in-memory pass.
+
+### Batch K — replicate-aware auto downsample (todo 25) · `core/config.py` + tests
+Was already flagged as the keystone under Batch C and has its own shelved writeup
+in `tests/test_auto_downsample.py`. Restated as a numbered item because it is a
+**correctness** gap, not a tuning preference, and it is the only remaining one:
+today a pre-cropped video and an equivalent uncropped box resolve to different
+physical scales, so results are not comparable across those two workflows. The
+`auto (0.245)` in the UI is the source-width number, i.e. provisional.
+Sweep `DEFAULT_TARGET_WIDTH` (1300) against detection output on a known clip
+before paying the ~16x pixels; halving the per-replicate target is 4x rather than
+16x and may cost no sensitivity at all. Passes are now ~5x realtime, so the sweep
+that was previously painful is quick.
+
+- **Then: Batch D/E** if perceived UI lag matters more than throughput. Note D/E
+  are `gui/explorers/scalogram_explorer.py`, which is the widget inside **tab 2 ·
+  Preprocessing (live)** (`tab_live_preprocess.py` -> `live_scalogram_surface.py`),
+  not the shelved flow-cache tab.
+
+### Suggested order
+K (correctness, cheap, blocks nothing) -> I (removes the decode wall) -> then
+either J (HPC fan-out) or D/E (interactive polish), depending on whether the next
+milestone is a big batch run or day-to-day use. F is worth folding into whichever
+comes first, since 18 is a real speed win.
 
 ### Shelved (todo 8, 9)
 `gui/tab1_flow.py` and `gui/tab3_behavior.py` are unmaintained. Do not fix them if a
