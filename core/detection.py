@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from core.timing import Timer
 from core.wavelet import band_indices, default_freqs, morlet_band_power
 
 
@@ -138,17 +139,24 @@ def recompute_from_band_power(band_power: np.ndarray, *, value_band, count_band,
                               window_start=0) -> DetectionResult:
     """Cheap re-tune: value band / detection window / count band change without a
     fresh transform, operating on retained (T, B) band power."""
+    tm = Timer("recompute_from_band_power")
     bp = np.asarray(band_power, np.float32)
     lo, hi = value_band
-    count = inband_count(bp, lo, hi)
-    windowed = windowed_mean(count, detect_window, centered)
-    blo, bhi = count_band
-    gate = detect_gate(windowed, blo, bhi)
+    with tm.span("count_window_gate"):
+        count = inband_count(bp, lo, hi)
+        windowed = windowed_mean(count, detect_window, centered)
+        blo, bhi = count_band
+        gate = detect_gate(windowed, blo, bhi)
     if region_grid is not None and bp.size:
         dy, dx, gy, gx = region_grid
-        clump = largest_clump_per_frame(bp, lo, hi, dy, dx, gy, gx)
+        # Per-frame connected components: a Python loop over T, so it is the one
+        # part of the cheap re-tune path that is not obviously cheap.
+        with tm.span("clump"):
+            clump = largest_clump_per_frame(bp, lo, hi, dy, dx, gy, gx)
     else:
         clump = np.zeros(bp.shape[0], np.float32)
+    tm.log(min_seconds=0.05, T=bp.shape[0] if bp.ndim else 0,
+           B=bp.shape[1] if bp.ndim > 1 else 0)
     return DetectionResult(
         band_power=bp, count=count, windowed=windowed, gate=gate, clump=clump,
         freq_band_hz=tuple(freq_band_hz), value_band=(lo, hi),
@@ -184,11 +192,23 @@ def detect_over_blocks(blocks: np.ndarray, fps: float, freqs: np.ndarray, *,
                        block_chunk: int = 512) -> DetectionResult:
     """Full detector over one region's per-block channel columns (T, B): Morlet
     band power (memory-bounded), then the shared count/window/gate/clump chain."""
+    tm = Timer("detect_over_blocks")
     blocks = np.asarray(blocks, np.float32)
     flo, fhi = freq_band_hz
     i, j = band_indices(freqs, flo, fhi)
-    bp = morlet_band_power(blocks, fps, freqs, i, j, block_chunk=block_chunk)
-    return recompute_from_band_power(
-        bp, value_band=value_band, count_band=count_band,
-        detect_window=detect_window, centered=centered, region_grid=region_grid,
-        freq_band_hz=(flo, fhi), window_start=window_start)
+    with tm.span("morlet_band_power"):
+        bp = morlet_band_power(blocks, fps, freqs, i, j, block_chunk=block_chunk)
+    # The count/gate/clump chain is part of this pass's cost, so it is timed here
+    # and logged after -- logging before the call would report the transform alone
+    # and hide the per-frame clump loop, which is the expensive half over a whole
+    # clip. The inner Timer still logs separately for the cheap re-tune path.
+    with tm.span("recompute"):
+        res = recompute_from_band_power(
+            bp, value_band=value_band, count_band=count_band,
+            detect_window=detect_window, centered=centered,
+            region_grid=region_grid, freq_band_hz=(flo, fhi),
+            window_start=window_start)
+    tm.log(T=blocks.shape[0] if blocks.ndim else 0,
+           B=blocks.shape[1] if blocks.ndim > 1 else 0,
+           freqs=len(freqs), band=f"{i}:{j}")
+    return res

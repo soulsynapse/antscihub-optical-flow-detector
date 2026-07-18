@@ -115,6 +115,67 @@ bar following the scrubber, and an "open here in preprocessing" handoff that see
 the live surface without auto-triggering a pass. Depends on B (cancel) and F (state
 retention). Do last.
 
+### Status (append only — item line numbers above must not shift)
+
+- **Batch A — done**, commit `56fe5a6`. Also rewrote
+  `tests/test_live_scalogram_surface.py`, which had been written against a
+  decoded-`frame_window` cache that `90da164` replaced with the per-pixel
+  channel cache; it never passed in a commit.
+- **Batch B — done**, commit `40c7cac`. `_StreamWorker` base gives both passes a
+  `cancel()` polled from the progress tick. Two deviations from the plan above:
+  a cancelled pass emits `cancelled` (emitting nothing leaves the buttons stuck
+  disabled), and a knob edit mid-extract *supersedes* that pass rather than
+  being dropped — live extract only, never the whole-video commit.
+  Fixed in passing: `closeEvent` did not stop the debounce timers, so a knob
+  edited just before a close fired `extract()` into a dying widget. That was the
+  pre-existing ~1-in-3 Qt crash (exit 9) in the full suite.
+  **Open question:** a stop during the detector phase discards a completed
+  `DetectionResult`, because `detect_channel_region` has no cancel point and the
+  trailing `if self._cancel` throws the finished result away. Delivering it may
+  be better — the expensive extraction is already paid for.
+- **Batch C (todo 5) — done.** New `core/timing.py`: one `Timer` per pass, named
+  spans, one log line at the end. Spans are preallocated reused objects (entered
+  ~30k times a pass), so a name must not nest inside itself. On by default;
+  `OFD_TIMING=0` disables. Logger `ofd.timing` self-attaches a stderr handler and
+  sets `propagate = False`, so `caplog` cannot see it — `tests/test_timing.py`
+  captures on the named logger instead. Instrumented `_stream_channels` (decode /
+  preprocess / tensor_products / tensor_blur / flow_solve / appearance / texture /
+  block_reduce / progress_cb) and the detector.
+  Three review fixes applied: `detect_over_blocks` now logs *after* the
+  count/gate/clump chain (logging before it hid the per-frame clump loop);
+  `_stream_channels` logs from its `finally` with a `done=` count, so a pass
+  superseded by a knob edit still reports its spans; guarded `blocks.shape[0]`.
+
+  **Measured (todo 6 is now a numbers question, not a guess).** 4 replicates,
+  block=16, `.venv\Scripts\python.exe`, `Videos/Stabilized/`:
+
+  - `GX010047c2` 5312x2988 @23.98, auto scale 0.2447, 479 frames (20 s): **33.6 s
+    total, ~1.7x slower than realtime.** decode 26% · preprocess 18% ·
+    block_reduce 14% · tensor_blur 14% · flow_solve 10% · tensor_products 7% ·
+    appearance 4% · texture 2%.
+  - `rep3_intermittent_crop` 462x456 @59.94, scale 1.0, 599 frames (10 s): 3.3 s.
+    block_reduce 32% · tensor_blur 21% · flow_solve 15%; decode only 5%.
+  - Detection is **free**: 0.04 s for T=479, B=627 — morlet 87%, chain 13%. All
+    optimization effort belongs in extraction. Whole-clip clump was the suspected
+    cost and is not one at these sizes.
+
+  **What the numbers say, against the plan's guesses.** The plan expected the
+  per-pixel eigen-solve to dominate; it is 10%. On the full-size clip **decode +
+  preprocess is 44%** — I/O and resize, not math, and both are pure producer work
+  that overlaps with the tensor stage. So the first lever is a one-frame-deep
+  producer thread (OpenCV decode releases the GIL), worth up to ~40% for no math
+  change and no GPU. Second lever: `block_reduce` is 14% here and 32% on the
+  small clip, called 5x per frame per tile via the frame-by-frame `_reduce` —
+  and `core/channel_source.py:_reduce_stack` is ALREADY a vectorized (T,H,W)
+  version of the identical math. Reducing per tile-window instead of per frame
+  reuses code that exists. Only after both is GPU worth pricing.
+  The `DEFAULT_TARGET_WIDTH` sweep the plan calls for is still unrun and still
+  the right way to price the replicate-aware-downsample correctness gap.
+
+- **Next: Batch C's hot-spot half (todo 6)** — producer-thread decode first, then
+  batched block reduce; re-measure after each with the timing lines. Or jump to
+  Batch D/E if perceived UI lag matters more than throughput.
+
 ### Shelved (todo 8, 9)
 `gui/tab1_flow.py` and `gui/tab3_behavior.py` are unmaintained. Do not fix them if a
 change breaks them; just note it. Consider renaming to `_shelved_*` (the repo already

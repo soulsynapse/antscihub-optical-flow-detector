@@ -34,10 +34,14 @@ from core.flow import reduce_scalar_to_blocks
 from core.preprocess import Preprocessor
 from core.structure_tensor import (flow_from_tensor, spatial_min_eigen,
                                    tensor_products)
+from core.timing import Timer
 from core.video import VideoSource
 
 CHANNELS = ("intensity", "change", "appearance", "texture", "tensor_speed")
 CHANNEL_VERSION = 3     # bump when the extraction math changes (sidecar key)
+
+# Shared always-off timer so _reduce can time itself without a per-call branch.
+_NO_TIMER = Timer("", enabled=False)
 
 
 def _tiles_from_meta(meta: dict) -> list[dict]:
@@ -129,20 +133,32 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
     first = start - seed
     count = n + seed
 
+    tm = Timer("extract_channels")
+    done = 0            # stored frames, so a cancelled pass can report how far it got
     src = VideoSource(video_path)
     try:
-        for i, frame in src.iter_frames(first, count):
+        # The decode is driven by hand rather than with a plain ``for`` so the
+        # generator's own work (seek + read + colour convert) lands in its own span
+        # instead of being invisibly folded into the loop body.
+        frames = src.iter_frames(first, count)
+        while True:
+            with tm.span("decode"):
+                nxt = next(frames, None)
+            if nxt is None:
+                break
+            i, frame = nxt
             oi = i - start                     # <0 for the seed frame (not stored)
             for t in tiles:
                 rid = t["id"]
                 x0, y0, x1, y1 = t["source_box"]
                 ay0, ax0, ay1, ax1 = t["atlas_bbox"]
-                g = pres[rid].apply(frame[y0:y1, x0:x1])
+                with tm.span("preprocess"):
+                    g = pres[rid].apply(frame[y0:y1, x0:x1])
                 th, tw = ay1 - ay0, ax1 - ax0
 
                 gp = prev_g[rid]
                 if oi >= 0:
-                    out["intensity"][oi, ay0:ay1, ax0:ax1] = _reduce(g, block, th, tw)
+                    out["intensity"][oi, ay0:ay1, ax0:ax1] = _reduce(g, block, th, tw, tm)
                     if cached_texture is not None:
                         out["texture"][oi, ay0:ay1, ax0:ax1] = \
                             cached_texture[i, ay0:ay1, ax0:ax1]
@@ -152,40 +168,58 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                         # small scale, solve LK per pixel, then reduce speed to
                         # blocks. Solving once per block would couple the aperture
                         # problem to the user's display/block size.
-                        prods = tensor_products(gp, g)
-                        J = np.stack([cv2.GaussianBlur(prods[k], (0, 0), sigma)
-                                      for k in range(6)])
-                        uv = flow_from_tensor(J)                 # px/frame
-                        tensor_speed = np.hypot(uv[..., 0], uv[..., 1]) * fps
+                        with tm.span("tensor_products"):
+                            prods = tensor_products(gp, g)
+                        with tm.span("tensor_blur"):
+                            J = np.stack([cv2.GaussianBlur(prods[k], (0, 0), sigma)
+                                          for k in range(6)])
+                        with tm.span("flow_solve"):
+                            uv = flow_from_tensor(J)             # px/frame
+                            tensor_speed = np.hypot(uv[..., 0], uv[..., 1]) * fps
                         out["tensor_speed"][oi, ay0:ay1, ax0:ax1] = \
-                            _reduce(tensor_speed, block, th, tw)
+                            _reduce(tensor_speed, block, th, tw, tm)
                         out["change"][oi, ay0:ay1, ax0:ax1] = \
-                            _reduce(J[2], block, th, tw)
+                            _reduce(J[2], block, th, tw, tm)
                         # Appearance residual r = I_t + grad(I).v. Against cached
                         # block flow (px/s -> px/frame, upsampled) when given, else
                         # against the tensor's own per-pixel flow (already px/frame).
-                        if cached_uv is not None:
-                            U, V = cached_uv
-                            ub = cv2.resize(U[i, ay0:ay1, ax0:ax1] / fps,
-                                            (g.shape[1], g.shape[0]),
-                                            interpolation=cv2.INTER_NEAREST)
-                            vb = cv2.resize(V[i, ay0:ay1, ax0:ax1] / fps,
-                                            (g.shape[1], g.shape[0]),
-                                            interpolation=cv2.INTER_NEAREST)
-                        else:
-                            ub, vb = uv[..., 0], uv[..., 1]
-                        iy, ix = np.gradient(g)
-                        r = it + ix * ub + iy * vb
+                        with tm.span("appearance"):
+                            if cached_uv is not None:
+                                U, V = cached_uv
+                                ub = cv2.resize(U[i, ay0:ay1, ax0:ax1] / fps,
+                                                (g.shape[1], g.shape[0]),
+                                                interpolation=cv2.INTER_NEAREST)
+                                vb = cv2.resize(V[i, ay0:ay1, ax0:ax1] / fps,
+                                                (g.shape[1], g.shape[0]),
+                                                interpolation=cv2.INTER_NEAREST)
+                            else:
+                                ub, vb = uv[..., 0], uv[..., 1]
+                            iy, ix = np.gradient(g)
+                            r = it + ix * ub + iy * vb
                         out["appearance"][oi, ay0:ay1, ax0:ax1] = \
-                            _reduce(r * r, block, th, tw)
+                            _reduce(r * r, block, th, tw, tm)
                         if cached_texture is None:
+                            with tm.span("texture"):
+                                mineig = spatial_min_eigen(J)
                             out["texture"][oi, ay0:ay1, ax0:ax1] = \
-                                _reduce(spatial_min_eigen(J), block, th, tw)
+                                _reduce(mineig, block, th, tw, tm)
                 prev_g[rid] = g
+            if oi >= 0:
+                done = oi + 1
             if progress and (oi >= 0) and (oi % 20 == 0):
-                progress(oi + 1, n)
+                # The progress hook re-enters the GUI thread and can supersede or
+                # cancel the pass, so it is timed apart from the actual work.
+                with tm.span("progress_cb"):
+                    progress(oi + 1, n)
     finally:
         src.release()
+        # Logged from the finally so a pass cancelled mid-stream still reports its
+        # spans. A knob edit supersedes the running extraction by raising inside
+        # the progress callback, so during tuning -- exactly when these numbers are
+        # wanted -- most passes leave by the exception path. ``done`` distinguishes
+        # a partial line from a complete one.
+        tm.log(frames=n, done=done, tiles=len(tiles), grid=f"{ny}x{nx}",
+               block=block, scale=f"{scale:.3f}")
 
     if progress:
         progress(n, n)
@@ -269,9 +303,14 @@ def load_or_extract_channels(cache, sidecar_path: str | None = None,
     return res
 
 
-def _reduce(field: np.ndarray, block: int, th: int, tw: int) -> np.ndarray:
-    """Block-mean a tile field and force it to the tile's (th, tw) atlas shape."""
-    r = reduce_scalar_to_blocks(field, block, "mean", include_partial=True)
+def _reduce(field: np.ndarray, block: int, th: int, tw: int,
+            tm: Timer = _NO_TIMER) -> np.ndarray:
+    """Block-mean a tile field and force it to the tile's (th, tw) atlas shape.
+
+    Timing lives inside rather than at the five call sites, so every reduction in
+    a pass lands in one ``block_reduce`` span without wrapping each caller."""
+    with tm.span("block_reduce"):
+        r = reduce_scalar_to_blocks(field, block, "mean", include_partial=True)
     if r.shape != (th, tw):
         # Geometry drift between preprocess output and cached grid: crop/pad so the
         # channel aligns with the cached flow rather than silently misindexing.
