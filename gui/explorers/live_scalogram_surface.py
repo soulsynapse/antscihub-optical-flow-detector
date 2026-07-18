@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
+from enum import Enum
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
@@ -43,39 +44,89 @@ from gui.explorers.scalogram_explorer import ScalogramExplorer
 # default target width), matching the Preprocessing & Flow tab's convention.
 _AUTO_DS = 0.05
 
+# Idle labels for the two action buttons; each becomes "Stop" while its own pass
+# runs (see _set_busy).
+_EXTRACT_TEXT = "Extract"
+_PROCESS_TEXT = "Process whole video ▶"
 
-class _LiveExtractWorker(QThread):
+
+class _Busy(Enum):
+    """Which pass owns the decoder. Named rather than bare strings because
+    _set_busy silently disables both buttons for any value it does not
+    recognise, which a mistyped literal would make unrecoverable."""
+    EXTRACT = "extract"
+    PROCESS = "process"
+
+
+class _Cancelled(Exception):
+    """Raised inside a worker's progress callback to unwind a cancelled pass."""
+
+
+class _StreamWorker(QThread):
+    """Base for the two streaming passes, giving both a uniform cancel path.
+
+    ``cancel()`` is called from the GUI thread and only sets a flag; the worker
+    notices at its next progress tick (every 20 frames in ``_stream_channels``)
+    and raises, which unwinds through that function's ``finally`` and releases
+    the decoder. Each pass therefore ends on exactly one of ``done`` / ``failed``
+    / ``cancelled``, so the GUI has a single place to restore its buttons.
+    """
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+    progress = pyqtSignal(int, int)  # (frames done, total) during extraction
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def is_cancelled(self) -> bool:
+        return self._cancel
+
+    def _tick(self, done: int, total: int):
+        """Progress callback handed to the extractor; doubles as the cancel poll
+        since it is the only place the long pass calls back into us."""
+        if self._cancel:
+            raise _Cancelled
+        self.progress.emit(done, total)
+
+    def run(self):
+        try:
+            self._run()
+        except _Cancelled:
+            self.cancelled.emit()
+        except Exception as e:                     # surface any extraction error
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+    def _run(self):
+        raise NotImplementedError
+
+
+class _LiveExtractWorker(_StreamWorker):
     """Run a windowed structure-tensor pass off the GUI thread. A full-resolution
     window is a real streaming solve (seconds), so blocking here would freeze the
     knobs mid-drag."""
-    done = pyqtSignal(object)       # ChannelData
-    failed = pyqtSignal(str)
-    progress = pyqtSignal(int, int)  # (frames done, total) during extraction
 
     def __init__(self, video_path, cfg, replicates, start, n, dims, parent=None):
         super().__init__(parent)
         self._args = (video_path, cfg, replicates, start, n, dims)
 
-    def run(self):
+    def _run(self):
         video_path, cfg, reps, start, n, dims = self._args
         w, h, fps, fc = dims
-        try:
-            cd = live_channel_source(
-                video_path, cfg, reps, start=start, n=n,
-                width=w, height=h, fps=fps, frame_count=fc,
-                progress=lambda d, t: self.progress.emit(d, t))
-            self.done.emit(cd)
-        except Exception as e:                     # surface any extraction error
-            self.failed.emit(f"{type(e).__name__}: {e}")
+        cd = live_channel_source(
+            video_path, cfg, reps, start=start, n=n,
+            width=w, height=h, fps=fps, frame_count=fc, progress=self._tick)
+        self.done.emit(cd)
 
 
-class _ProcessWorker(QThread):
+class _ProcessWorker(_StreamWorker):
     """The whole-video commit: stream the WHOLE clip's channels once, then run the
     tuned detector over the selected region. No flow, no cache -- just the
     detection track. This is the one expensive pass, paid after tuning."""
-    done = pyqtSignal(object)       # DetectionResult
-    failed = pyqtSignal(str)
-    progress = pyqtSignal(int, int)  # (frames done, total) during the extract phase
     phase = pyqtSignal(str)          # a coarse phase change (e.g. detection start)
 
     def __init__(self, video_path, cfg, replicates, dims, region_index, params,
@@ -83,26 +134,28 @@ class _ProcessWorker(QThread):
         super().__init__(parent)
         self._args = (video_path, cfg, replicates, dims, region_index, params)
 
-    def run(self):
+    def _run(self):
         video_path, cfg, reps, dims, region_index, params = self._args
         w, h, fps, fc = dims
-        try:
-            cd = live_channel_source(
-                video_path, cfg, reps, start=0, n=None,
-                width=w, height=h, fps=fps, frame_count=fc,
-                progress=lambda d, t: self.progress.emit(d, t))
-            # Extraction (the whole-clip per-pixel tensor stream) is done; the band
-            # power + gate that follow are a much smaller slice of the wall time,
-            # but the phase note keeps the status honest across the handoff.
-            self.phase.emit("running detector")
-            res = detect_channel_region(
-                cd, region_index, params["channel_attr"],
-                freqs=default_freqs(fps), freq_band_hz=params["freq_band_hz"],
-                value_band=params["value_band"], count_band=params["count_band"],
-                detect_window=params["detect_window"], centered=params["centered"])
-            self.done.emit(res)
-        except Exception as e:
-            self.failed.emit(f"{type(e).__name__}: {e}")
+        cd = live_channel_source(
+            video_path, cfg, reps, start=0, n=None,
+            width=w, height=h, fps=fps, frame_count=fc, progress=self._tick)
+        # Extraction (the whole-clip per-pixel tensor stream) is done; the band
+        # power + gate that follow are a much smaller slice of the wall time,
+        # but the phase note keeps the status honest across the handoff.
+        # detect_channel_region has no progress hook, so this is the last cancel
+        # point -- a stop during detection lands here rather than mid-detector.
+        if self._cancel:
+            raise _Cancelled
+        self.phase.emit("running detector")
+        res = detect_channel_region(
+            cd, region_index, params["channel_attr"],
+            freqs=default_freqs(fps), freq_band_hz=params["freq_band_hz"],
+            value_band=params["value_band"], count_band=params["count_band"],
+            detect_window=params["detect_window"], centered=params["centered"])
+        if self._cancel:
+            raise _Cancelled
+        self.done.emit(res)
 
 
 class LiveScalogramSurface(QWidget):
@@ -140,6 +193,9 @@ class LiveScalogramSurface(QWidget):
         self._pending_pp = False        # is the running extract building a cache?
         self._pending_key: tuple | None = None
         self._pending_cfg: PipelineConfig | None = None
+        # Set when a knob change stops an in-flight extract: the replacement pass
+        # starts from the cancelled handler, once the old thread has unwound.
+        self._restart_extract = False
 
         # Coalesce rapid knob edits into a single re-extract on settle. Created
         # before the strip because the controls connect to it.
@@ -263,14 +319,14 @@ class LiveScalogramSurface(QWidget):
         statuscol.addWidget(self.graph_status_lbl)
         row.addLayout(statuscol, 1)
         row.addSpacing(8)
-        self.extract_btn = QPushButton("Extract")
-        self.extract_btn.clicked.connect(self.extract)
+        self.extract_btn = QPushButton(_EXTRACT_TEXT)
+        self.extract_btn.clicked.connect(self._on_extract_clicked)
         row.addWidget(self.extract_btn)
-        self.process_btn = QPushButton("Process whole video ▶")
+        self.process_btn = QPushButton(_PROCESS_TEXT)
         self.process_btn.setToolTip(
             "Run the tuned detector over the WHOLE clip (one streaming pass, no "
             "flow, no cache) and navigate the detections below.")
-        self.process_btn.clicked.connect(self.process_whole_video)
+        self.process_btn.clicked.connect(self._on_process_clicked)
         row.addWidget(self.process_btn)
         outer.addLayout(row)
 
@@ -304,10 +360,48 @@ class LiveScalogramSurface(QWidget):
         n = min(n, self.frame_count - start)
         return start, n
 
+    # -- button state --------------------------------------------------------
+    def _set_busy(self, which: _Busy | None):
+        """Reflect which pass is running in the two action buttons: the running
+        one becomes Stop, the other is disabled (only one streaming pass at a
+        time). ``None`` restores the idle labels."""
+        extracting = which is _Busy.EXTRACT
+        processing = which is _Busy.PROCESS
+        self.extract_btn.setText("Stop" if extracting else _EXTRACT_TEXT)
+        self.process_btn.setText("Stop" if processing else _PROCESS_TEXT)
+        self.extract_btn.setEnabled(which is None or extracting)
+        self.process_btn.setEnabled(which is None or processing)
+
+    def _on_extract_clicked(self):
+        if self._worker is not None:
+            self._request_stop(self._worker, "extract")
+        else:
+            self.extract()
+
+    def _on_process_clicked(self):
+        if self._proc_worker is not None:
+            self._request_stop(self._proc_worker, "whole-video pass")
+        else:
+            self.process_whole_video()
+
+    def _request_stop(self, worker, what: str):
+        """Ask a running pass to unwind. It stops at its next progress tick, so
+        both buttons stay disabled until the worker's ``cancelled`` lands."""
+        worker.cancel()
+        self.extract_btn.setEnabled(False)
+        self.process_btn.setEnabled(False)
+        self.status_lbl.setText(f"stopping the {what}…")
+
     # -- extraction ----------------------------------------------------------
     def extract(self):
-        if self._worker is not None or self._proc_worker is not None:
-            return                                  # a pass is already running
+        if self._proc_worker is not None:
+            return                          # the expensive commit owns the decoder
+        if self._worker is not None:
+            # A knob settled mid-extract: that pass is now stale, so supersede it
+            # rather than dropping the edit. The restart runs once it unwinds.
+            self._restart_extract = True
+            self._request_stop(self._worker, "extract")
+            return
         self._debounce.stop()
         start, n = self._window()
         if n < 2:
@@ -324,7 +418,7 @@ class LiveScalogramSurface(QWidget):
         self._pending_key = self._pp_signature(cfg, start, n) if fits else None
         self._pending_cfg = cfg
         extract_cfg = self._cfg_block1(cfg) if fits else cfg
-        self.extract_btn.setEnabled(False)
+        self._set_busy(_Busy.EXTRACT)
         self._extract_t0 = time.monotonic()
         self._extract_ctx = (f"block {cfg.flow.block_size}, "
                              f"norm {cfg.preprocess.normalize}")
@@ -336,13 +430,14 @@ class LiveScalogramSurface(QWidget):
             self._dims, self)
         self._worker.done.connect(self._on_extracted)
         self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_extract_cancelled)
         self._worker.progress.connect(self._on_extract_progress)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
     def _on_extract_progress(self, done: int, total: int):
-        if self._worker is None:
-            return
+        if self._worker is None or self._worker.is_cancelled():
+            return          # keep the "stopping…" note; a tick may still be in flight
         pct = 100.0 * done / max(1, total)
         self.status_lbl.setText(
             f"extracting… {done}/{total} frames ({pct:.0f}%) · "
@@ -350,7 +445,7 @@ class LiveScalogramSurface(QWidget):
 
     def _on_extracted(self, cd):
         self._worker = None
-        self.extract_btn.setEnabled(True)
+        self._set_busy(None)
         cfg = self._pending_cfg or self._build_cfg()
         if self._pending_pp:                         # cd is the block=1 pixel cache
             self._pp = cd
@@ -360,6 +455,15 @@ class LiveScalogramSurface(QWidget):
             self._pp = None
             self._pp_key = None
             display = cd
+        if self._restart_extract:
+            # A knob change asked to supersede this pass, but it finished before
+            # the cancel reached a tick, so `cancelled` never fired. Its channels
+            # are still a valid cache for those settings -- keep them, skip the
+            # now-stale display, and run the pass the user actually asked for.
+            # Leaving the flag set here would also make the next Stop restart.
+            self._restart_extract = False
+            self.extract()
+            return
         self._show_channel_data(display)
 
     def _show_channel_data(self, cd):
@@ -389,7 +493,12 @@ class LiveScalogramSurface(QWidget):
     def _on_block_changed(self):
         """Block changed: re-reduce the cached pixel channels (instant) if they
         cover this window, else fall back to a full (block=1) extract."""
-        if self._worker is not None or self._proc_worker is not None:
+        if self._proc_worker is not None:
+            return
+        if self._worker is not None:
+            # Mid-extract: even a cache hit would be overwritten by the pass in
+            # flight, so supersede it with a full re-extract at the new block.
+            self.extract()
             return
         self._block_debounce.stop()
         start, n = self._window()
@@ -410,8 +519,23 @@ class LiveScalogramSurface(QWidget):
 
     def _on_failed(self, msg: str):
         self._worker = None
-        self.extract_btn.setEnabled(True)
+        self._restart_extract = False
+        self._set_busy(None)
         self.status_lbl.setText(f"extract failed: {msg}")
+
+    def _on_extract_cancelled(self):
+        """The stopped pass produced nothing, so the pixel cache and the pending
+        bookkeeping it would have filled are left as they were."""
+        self._worker = None
+        self._pending_pp = False
+        self._pending_key = None
+        self._pending_cfg = None
+        self._set_busy(None)
+        if self._restart_extract:      # a knob change superseded it; run the new one
+            self._restart_extract = False
+            self.extract()
+            return
+        self.status_lbl.setText("extract stopped")
 
     def _swap_explorer(self, cd):
         if self._placeholder is not None:
@@ -448,8 +572,7 @@ class LiveScalogramSurface(QWidget):
             self.status_lbl.setText("select a replicate before processing")
             return
         cfg = self._build_cfg()
-        self.process_btn.setEnabled(False)
-        self.extract_btn.setEnabled(False)
+        self._set_busy(_Busy.PROCESS)
         flo, fhi = params["freq_band_hz"]
         self._proc_t0 = time.monotonic()
         self._proc_ctx = (f"{flo:.2f}–{fhi:.2f} Hz on {params['channel_attr']}")
@@ -461,14 +584,15 @@ class LiveScalogramSurface(QWidget):
             params["region_index"], params, self)
         self._proc_worker.done.connect(self._on_processed)
         self._proc_worker.failed.connect(self._on_process_failed)
+        self._proc_worker.cancelled.connect(self._on_process_cancelled)
         self._proc_worker.progress.connect(self._on_proc_progress)
         self._proc_worker.phase.connect(self._on_proc_phase)
         self._proc_worker.finished.connect(self._proc_worker.deleteLater)
         self._proc_worker.start()
 
     def _on_proc_progress(self, done: int, total: int):
-        if self._proc_worker is None:
-            return
+        if self._proc_worker is None or self._proc_worker.is_cancelled():
+            return          # keep the "stopping…" note; a tick may still be in flight
         pct = 100.0 * done / max(1, total)
         self.status_lbl.setText(
             f"processing whole video · extracting {done}/{total} frames "
@@ -476,15 +600,14 @@ class LiveScalogramSurface(QWidget):
             f"{self._eta(done, total, self._proc_t0)}")
 
     def _on_proc_phase(self, phase: str):
-        if self._proc_worker is None:
+        if self._proc_worker is None or self._proc_worker.is_cancelled():
             return
         self.status_lbl.setText(
             f"processing whole video · {phase} · {self._proc_ctx}…")
 
     def _on_processed(self, res):
         self._proc_worker = None
-        self.process_btn.setEnabled(True)
-        self.extract_btn.setEnabled(True)
+        self._set_busy(None)
         self.navigator.set_result(res, self.fps)
         self.navigator.setVisible(True)
         n = len(res.detected_intervals())
@@ -494,9 +617,16 @@ class LiveScalogramSurface(QWidget):
 
     def _on_process_failed(self, msg: str):
         self._proc_worker = None
-        self.process_btn.setEnabled(True)
-        self.extract_btn.setEnabled(True)
+        self._set_busy(None)
         self.status_lbl.setText(f"process failed: {msg}")
+
+    def _on_process_cancelled(self):
+        """Stopped mid-commit: the navigator keeps whatever earlier result it
+        holds rather than being cleared by a pass that never finished."""
+        self._proc_worker = None
+        self._set_busy(None)
+        self.status_lbl.setText(
+            "whole-video pass stopped — settings are free to change")
 
     @staticmethod
     def _eta(done: int, total: int, t0: float) -> str:
@@ -530,8 +660,14 @@ class LiveScalogramSurface(QWidget):
             self._explorer.toggle_playback()
 
     def closeEvent(self, e):
+        self._restart_extract = False
+        # A knob edited just before the close leaves a debounce armed; let it fire
+        # and it re-enters extract() on a surface that is on its way out.
+        self._debounce.stop()
+        self._block_debounce.stop()
         for w in (self._worker, self._proc_worker):
             if w is not None:
+                w.cancel()      # unwind at the next tick instead of waiting it out
                 w.wait()
         self._worker = self._proc_worker = None
         if self._explorer is not None:
