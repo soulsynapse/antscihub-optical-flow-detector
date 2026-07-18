@@ -1,7 +1,13 @@
 # Current design decisions
 
-Status: current as of 2026-07-16. This document describes the live configuration
+Status: current as of 2026-07-17. This document describes the live configuration
 version 3 workflow. The archived handoffs are historical inputs, not overrides.
+
+The flow pipeline below remains the path for flow-derived features and the
+Behavior tab. Alongside it, a **tensor/scalogram detection path** now runs the
+whole isolate-a-behavior loop without an optical-flow cache; its decisions are in
+"The tensor/scalogram path runs without a flow cache" and "Commit means running
+the detector, not building a cache" near the end of this document.
 
 ## Replicates come before flow
 
@@ -150,6 +156,67 @@ time-major atlas so Zarr reads remain efficient. Metadata maps atlas tiles back
 to exact source-frame boxes, and every spatial feature respects those tile
 boundaries.
 
+## The tensor/scalogram path runs without a flow cache
+
+The structure-tensor channels an explorer detects on — `tensor_speed`, change
+energy, intensity, and an appearance residual — need only geometry and the video,
+not the optical-flow solve. The flow cache only ever fed two of them: the
+cached-flow-speed channel and the residual measured against *cached* flow. So the
+detection loop was decoupled from the cache.
+
+`core.channel_source.ChannelData` carries what the scalogram explorer needs —
+cache-meta-shaped geometry plus per-block channel time series — from either an
+open cache (`cache_channel_source`, five channels) or a live windowed pass over a
+bare video (`live_channel_source`, four channels). The explorer takes a
+`ChannelData`, not a cache, and greys out the channels a live source cannot
+provide. The appearance residual on the live path is measured against the tensor's
+**own** per-pixel flow (`I_t + ∇I·v` with `v` from `flow_from_tensor`), not cached
+`u`/`v`, which removes the last flow-array dependency; this is the
+`flow_residual(J)` flavor anticipated in the expanded-cache plan.
+
+The preprocessing controls that actually feed the tensor channels — `downsample`,
+`block_size`, `normalize` — are live knobs on the surface. All three are upstream
+of the tensor solve, so changing one re-extracts the window rather than
+transforming the existing result; that cost is accepted because a window is short.
+`normalize` is a per-frame pixel op (z-score is ~invariant for `tensor_speed`, a
+gradient-ratio solve, and reshapes change/intensity); `block_size` is a geometry
+op whose expensive per-pixel tensor solve is actually block-size independent (only
+the final block reduction depends on it — a latent optimization, not yet needed).
+`registration` and `bg_subtract` do not apply to this path (they need fitted
+assets the pass does not reconstruct) and are flagged approximated. **Temporal
+denoise is forced off** for windowed extraction: it is stateful from frame zero,
+so an arbitrary mid-clip window cannot reproduce its state. This is what makes
+true random-access windows honest — pick any 10 s and pay only for those frames.
+
+## Commit means running the detector, not building a cache
+
+For a behavior isolable by a band on a tensor channel, "commit" is running the
+tuned detector over the whole clip and navigating the result — not writing a flow
+cache. *Process whole video* streams the clip once and applies the detector,
+retaining only the per-block band power `(T, B)` and the detection tracks. It
+never materializes the full `(F, T, B)` scalogram cube (~17 GB for a long clip):
+`core.wavelet.morlet_band_power` derives the zero-pad length from the whole bank's
+largest scale so a band sum matches a full-cube slice exactly, yet transforms only
+the band's scales, chunked over blocks — ~440 MB for one channel over a whole clip.
+
+The detection formulas (in-band count, windowed mean over D, positive gate,
+per-frame clump) live in `core/detection.py` as pure functions that **both** the
+explorer preview and the whole-clip pass call. This is deliberate: if the two
+forked, you could navigate to a detection found over the whole clip, re-open its
+window to verify, and see a different result — which would make the tool
+untrustworthy at exactly the moment it matters. The whole-clip result becomes a
+navigation timeline (gate plus largest-clump strength); clicking a detection loads
+its window back for verification. Because the band power is retained, value-band
+and detection-window re-tuning is instant, while a frequency-band or channel
+change requires a fresh pass.
+
+A flow cache still earns its keep for flow-derived features (coherence,
+divergence, curl, direction oscillation) and for instant re-query of an arbitrary
+frequency band across a whole clip (which needs the retained full cube). The
+Behavior tab remains flow-cache-only; whether it eventually reads a tensor-channel
+sidecar is deferred (next-steps). This path is not yet validated for detection
+accuracy on marked footage.
+
 ## Explorers stay partitioned by measurement domain
 
 The three sibling explorers deliberately divide the signal space: the speed
@@ -196,10 +263,14 @@ speed's.
 Draw mode and fixed-size stamping start enabled because most experimental layouts
 use repeated boxes. The first drag sets the stamp size; later clicks place boxes.
 
-Processing completion and cache opening stay on Preprocessing & Flow. The
-application only redirects to Replicates when valid geometry is missing. Opening
-a cache enables Behavior Classification without assuming which inspection step
-the user wants next.
+The tabs are Replicates → Preprocessing (live) → Flow cache (commit) → Behavior
+Classification, in that order, reflecting that the tensor detection loop is the
+primary path and the flow pass is a demoted, optional commit. Loading a video
+enables the first three tabs and lands on Replicates; Behavior stays disabled
+until a completed flow cache is opened. The live preprocessing surface builds
+lazily — only when it is shown with a video and at least one replicate box, and it
+rebuilds only when the video or replicate geometry actually changes, so editing
+boxes on another tab does not trigger a windowed extraction.
 
 ## Cache compatibility is explicit
 

@@ -37,11 +37,26 @@ see `README.md` and `docs/decisions.md`; historical handoffs are under
 
 ## Architecture touchpoints (stable enough to rely on)
 
-- **`gui/state.py::AppState`** is the single shared hub. The three tabs never
+- **`gui/state.py::AppState`** is the single shared hub. The four tabs never
   reference each other — they talk only through `AppState` signals
   (`video_loaded`, `cache_opened`, `rois_changed`, `frame_changed`,
   `behaviors_changed`, `status`, `request_tab`). To make one tab react to
   another's change, wire it through a state signal, not a direct call.
+- **Tabs are `MainWindow.tabs` indices 0-3:** 0 Replicates (`tab2`), 1
+  Preprocessing (live) (`tab_live`), 2 Flow cache / commit (`tab1`), 3 Behavior
+  (`tab3`). The `tabN` field names predate the reorder — go by the index/label,
+  not the number in the attribute. Behavior (3) is disabled until a cache opens.
+- **The tensor/scalogram detection path is cache-independent.** `ScalogramExplorer`
+  takes a `core.channel_source.ChannelData` (from `cache_channel_source` or
+  `live_channel_source`), not a raw cache. `core.tensor_channels.extract_channels_live`
+  streams a windowed structure-tensor pass over a bare video;
+  `core.wavelet.morlet_band_power` + `core.detection` (`detect_channel_region`,
+  and the shared count/window/gate/clump functions the explorer also calls) run
+  the detector; `gui/explorers/live_scalogram_surface.py` +
+  `gui/tab_live_preprocess.py` host the live-tuning surface and the whole-video
+  commit, and `gui/explorers/detection_timeline.py` is the navigation strip. When
+  touching detection math, change `core/detection.py` — never fork a formula into
+  the explorer, or the preview and the whole-clip pass will disagree.
 - **Per-video data lives in sidecar files next to the video**, via
   `AppState.video_sidecar(kind)` → `<video-path-without-ext>.<kind>.json`
   (returns `None` when no video loaded). Current kinds: `rois` (Tab 1 replicate

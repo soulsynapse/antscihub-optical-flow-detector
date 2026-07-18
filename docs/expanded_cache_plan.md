@@ -1,7 +1,10 @@
 # Expanded cache: dynamics, identity, and unsupervised behavior mapping
 
-Status: proposed (2026-07-16). This is a forward plan, not live configuration.
-See `decisions.md` for the current v3 workflow this extends.
+Status: partly built (2026-07-17). Phase 3 (the scalogram explorer) shipped and
+was extended into a live, cacheless detection surface; the "fold the cached
+scalogram into `run_pipeline`" step was reframed away from a cache entirely. See
+"Status update" at the end and `decisions.md` ("The tensor/scalogram path runs
+without a flow cache"). This document keeps the original forward plan for context.
 
 ## Why
 
@@ -124,3 +127,31 @@ power; do not re-decode):**
 Later (out of scope until 1-3 validate): fold the winning cached form into
 `run_pipeline`; add the color channel with a picker sharing color_detector_v2's
 settings; wire external-track sampling for per-individual embedding.
+
+## Status update (2026-07-17)
+
+Phases 1-3 are done, and the storage question in the "STORAGE WARNING" above was
+resolved by *not caching the scalogram at all* for the detection use case.
+
+- **Phase 3 explorer shipped and grew.** `gui/explorers/scalogram_explorer.py`
+  exists as designed (frequency band + value band + per-block density + count
+  sweep). It now takes a `core.channel_source.ChannelData` instead of a raw cache,
+  so it opens on a bare video, and it is embedded in a live preprocessing surface
+  (`gui/explorers/live_scalogram_surface.py`, tab `gui/tab_live_preprocess.py`)
+  where `downsample`/`block_size`/`normalize` are live knobs over a short window.
+- **The "second decode" the plan wanted to remove is instead made optional.** The
+  tensor channels stream on demand (`core.tensor_channels.extract_channels_live`);
+  the `flow_residual(J)`-style appearance flavor the plan preferred is the live
+  path's default (residual against the tensor's own flow, no cached `u`/`v`).
+  `sigma` remains a fixed build-time constant as anticipated.
+- **The scalogram storage problem was sidestepped, not solved.** Rather than
+  choosing hop-subsampled / multiband / sparse to *cache* a scalogram, the
+  detection use case never persists one: `core.wavelet.morlet_band_power` computes
+  a whole-clip band sum without materializing the `(F, T, B)` cube, and the
+  "commit" is running the detector over the clip (`core/detection.py`,
+  `detect_channel_region`) to produce a detection track, not a cache. Caching a
+  scalogram form is only back on the table if arbitrary-band re-query across a
+  whole clip (rather than a re-pass) becomes a requirement.
+- **Still future, unchanged:** the color/identity channel, external-track
+  sampling for per-individual embedding, and the full unsupervised map (t-SNE /
+  watershed). Those remain the out-of-scope items above.

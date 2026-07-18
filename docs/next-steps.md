@@ -128,6 +128,46 @@ adjacent neighbor. This also lets the CLAHE-tiling question be revisited — tes
 Do not size the halo for full Farnebäck support if that reaches into a neighbor;
 the isolation contract (`validate_replicates`) stays. See KNOWN_ISSUES.md.
 
+## 10. Validate the tensor detection path against marked footage
+
+The live tensor detection loop (root README: "Live tensor detection") has
+offscreen tests for the math and plumbing but no accuracy validation. Reuse the
+per-video marks and saved boxes (as in §2) to report precision, recall,
+false-positive time and bout-boundary error for a behavior isolated on a tensor
+channel, and compare it against the flow-cache Behavior tab on the same behavior
+where both apply. This is what decides whether the tensor path can stand alone for
+energetic/rhythmic behaviors.
+
+Do not treat a clean-looking navigation strip as validation — the same caution as
+§2. Confirm that a detection you navigate to actually contains the behavior in its
+loaded window.
+
+## 11. Decide persistence for whole-clip tensor channels
+
+The whole-video pass currently re-streams the clip each time. `extract_channels`
+already has a sidecar (keyed by frame count and channel version); extend it to the
+live path so re-opening a clip skips the structure-tensor pass, and so re-tuning a
+frequency band (which needs a fresh transform, not just retained band power) does
+not re-stream. Keep it small and clearly invalidated on geometry/preprocess
+change — it caches channels, not a scalogram, and must never masquerade as a flow
+cache. Hold until the workflow has been felt on real footage (a sidecar you don't
+need is just stale-state risk).
+
+## 12. Whether the Behavior tab reads a tensor sidecar (deferred)
+
+The Behavior tab is flow-cache-only. The whole-clip detection track is already a
+behavior output produced without flow, so the trajectory is for Behavior to
+consume a tensor-channel sidecar for tensor-isolable behaviors. This was
+explicitly deferred and must not shape the current design; revisit only after §10
+shows the tensor path is accurate enough to stand alone.
+
+## Note on §3
+
+The live preprocessing surface already provides arbitrary-window inspection with
+true random access (denoise forced off), which is the interactive half of §3 for
+the tensor path. §3 still stands for the *flow* Test mode, which starts at frame
+zero and must preserve warm-up for denoise/background/spectral state.
+
 ## Approaches deliberately not on the near-term path
 
 - Returning to full-frame flow as the production default. The measured cost is
