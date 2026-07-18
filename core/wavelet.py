@@ -66,3 +66,60 @@ def morlet_power(x: np.ndarray, fs: float, freqs_hz: np.ndarray) -> np.ndarray:
         w = _fft.ifft(buf, axis=0, workers=-1, overwrite_x=True)[:T]
         out[i] = w.real ** 2 + w.imag ** 2
     return out[:, :, 0] if squeeze else out
+
+
+def band_indices(freqs_hz: np.ndarray, flo: float, fhi: float) -> tuple[int, int]:
+    """Frequency rows [i, j) covering [flo, fhi] Hz on a sorted bank; an empty
+    span snaps to the single nearest scale. Matches the scalogram explorer's
+    band picker so a whole-clip pass and the window preview index identically."""
+    freqs = np.asarray(freqs_hz, float)
+    i = int(np.searchsorted(freqs, flo, "left"))
+    j = int(np.searchsorted(freqs, fhi, "right"))
+    if j <= i:
+        i = int(np.argmin(np.abs(freqs - flo)))
+        j = i + 1
+    return i, j
+
+
+def morlet_band_power(x: np.ndarray, fs: float, freqs_hz: np.ndarray,
+                      i: int, j: int, block_chunk: int = 512) -> np.ndarray:
+    """Scalogram power summed over frequency rows [i, j). ``x`` (T,) or (T,B) ->
+    (T,) or (T,B) float32.
+
+    Numerically identical to ``morlet_power(x, fs, freqs_hz)[i:j].sum(axis=0)``
+    but never materializes the full (F, T, B) cube: it derives the zero-pad
+    length from the WHOLE bank's largest scale (so the band sum matches a
+    full-cube slice exactly), yet transforms only the band's scales, chunked over
+    block columns so a whole-clip (T~30k, B~thousands) pass stays memory-bounded.
+    """
+    x = np.asarray(x, np.float32)
+    squeeze = x.ndim == 1
+    if squeeze:
+        x = x[:, None]
+    T, B = x.shape
+    dt = 1.0 / fs
+    scales_all = morlet_scales(freqs_hz)
+    band = scales_all[i:j]
+    if band.size == 0:
+        k = int(np.clip(i, 0, len(scales_all) - 1))
+        band = scales_all[k:k + 1]
+    support = int(np.ceil(np.sqrt(2.0) * scales_all.max() / dt))
+    n = _fft.next_fast_len(T + support)
+    omega = 2.0 * np.pi * np.fft.fftfreq(n, d=dt)
+    heavi = omega > 0
+    daughters = [
+        (np.sqrt(2.0 * np.pi * s / dt) * np.pi ** -0.25 * heavi *
+         np.exp(-0.5 * (s * omega - W0) ** 2)).astype(np.complex64)
+        for s in band]
+    out = np.zeros((T, B), np.float32)
+    for c0 in range(0, B, max(1, block_chunk)):
+        c1 = min(B, c0 + max(1, block_chunk))
+        Xf = _fft.fft(x[:, c0:c1], n=n, axis=0, workers=-1)
+        acc = np.zeros((T, c1 - c0), np.float32)
+        buf = np.empty_like(Xf)
+        for d in daughters:
+            np.multiply(Xf, d[:, None], out=buf)
+            w = _fft.ifft(buf, axis=0, workers=-1, overwrite_x=True)[:T]
+            acc += w.real ** 2 + w.imag ** 2
+        out[:, c0:c1] = acc
+    return out[:, 0] if squeeze else out

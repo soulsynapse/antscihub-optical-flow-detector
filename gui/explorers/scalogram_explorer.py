@@ -49,7 +49,9 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                              QWidget)
 
 from core.channel_source import cache_channel_source
-from core.wavelet import default_freqs, morlet_power
+from core.detection import (detect_gate, inband_count, largest_clump_per_frame,
+                            window_bounds, windowed_mean)
+from core.wavelet import band_indices, default_freqs, morlet_power
 from gui.video_panel import FrameView
 from gui.explorers.speed_explorer import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
                                           TXT, TXT_DIM, DensityPlot, MiniPlot,
@@ -660,12 +662,7 @@ class ScalogramExplorer(QWidget):
     def _band_indices(self) -> tuple[int, int]:
         """[i, j) slice on the sorted frequency axis for the current band."""
         flo, fhi = self.scalo_plot.band_hz()
-        i = int(np.searchsorted(self.freqs, flo, "left"))
-        j = int(np.searchsorted(self.freqs, fhi, "right"))
-        if j <= i:                              # empty band: snap to nearest scale
-            i = int(np.argmin(np.abs(self.freqs - flo)))
-            j = i + 1
-        return i, j
+        return band_indices(self.freqs, flo, fhi)
 
     def _refresh_densities(self):
         """Re-sum every CACHED channel cube over the current frequency band into
@@ -883,17 +880,9 @@ class ScalogramExplorer(QWidget):
         return self.density_plots.get(self.channel)
 
     def _window_bounds(self, W):
-        """Prefix-sum bounds per frame for the detection window D; centered or
-        trailing per the checkbox. Windows truncate at the clip edges; neff keeps
-        the means honest there."""
-        t = np.arange(self.T)
-        if self.centered:
-            lo = np.maximum(0, t - W // 2)
-            hi = np.minimum(self.T, t + (W - W // 2))
-        else:
-            hi = t + 1
-            lo = np.maximum(0, hi - W)
-        return hi, lo, (hi - lo).astype(np.float32)
+        """Prefix-sum bounds per frame for the detection window D (shared with the
+        whole-video pass so the two agree)."""
+        return window_bounds(self.T, W, self.centered)
 
     def _recompute_sweep(self):
         self._recompute_counts()
@@ -910,8 +899,7 @@ class ScalogramExplorer(QWidget):
                 pl.set_series(np.zeros(0, np.float32))
             return
         lo, hi = dp.band()
-        inband = (m >= lo) & (m <= hi) & np.isfinite(m)
-        count = inband.sum(axis=1).astype(np.float32)
+        count = inband_count(m, lo, hi)
         self.count_plot.set_series(count)
         self.count_plot.set_cursor(self.frame)
         self._recompute_windowed_count(count)
@@ -924,12 +912,7 @@ class ScalogramExplorer(QWidget):
             self.count_w_plot.set_series(np.zeros(0, np.float32))
             self._recompute_detect()
             return
-        if self.sweep_win <= 1:
-            windowed = count.astype(np.float32)
-        else:
-            c = np.concatenate([[0.0], np.cumsum(count, dtype=np.float64)])
-            hi, lo, neff = self._window_bounds(self.sweep_win)
-            windowed = ((c[hi] - c[lo]) / neff).astype(np.float32)
+        windowed = windowed_mean(count, self.sweep_win, self.centered)
         self.count_w_plot.set_series(windowed)
         self.count_w_plot.set_cursor(self.frame)
         self._recompute_detect()
@@ -938,8 +921,7 @@ class ScalogramExplorer(QWidget):
         blo, bhi = self.count_w_plot.band()
         y = self.count_w_plot.y
         self.detect_plot.set_series(
-            ((y >= blo) & (y <= bhi)).astype(np.float32) if y.size
-            else np.zeros(0, np.float32))
+            detect_gate(y, blo, bhi) if y.size else np.zeros(0, np.float32))
         self.detect_plot.set_cursor(self.frame)
 
     def _recompute_clump(self):
@@ -961,18 +943,7 @@ class ScalogramExplorer(QWidget):
         lo, hi = dp.band()
         self._set_phase(f"computing connected clumps ({m.shape[0]} frames)…",
                         paint=True)
-        largest = np.zeros(m.shape[0], np.float32)
-        for t in range(m.shape[0]):
-            cols = m[t]
-            passing = (cols >= lo) & (cols <= hi) & np.isfinite(cols)
-            if not passing.any():
-                continue
-            grid = np.zeros((dy, dx), np.uint8)
-            grid[gy, gx] = passing.astype(np.uint8)
-            n_lab, _, stats, _ = cv2.connectedComponentsWithStats(
-                grid, connectivity=8)
-            if n_lab > 1:
-                largest[t] = float(stats[1:, cv2.CC_STAT_AREA].max())
+        largest = largest_clump_per_frame(m, lo, hi, dy, dx, gy, gx)
         self.clump_plot.set_series(largest)
         self.clump_plot.set_cursor(self.frame)
 
