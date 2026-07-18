@@ -506,7 +506,9 @@ Consequences, in the order they bite:
 3. **The knob must be legible about what it buys.** A user choosing 50% must be
    able to see which steps shorten and by how much. `core/timing.py` already
    emits exactly these spans, so the cost model can be built from measured data
-   rather than asserted.
+   rather than asserted. **This is Batch M, and it is not optional polish** — an
+   opt-in knob with no visible upside just gets refused, which trades silent
+   degradation for silently infeasible projects. Ship M with K.
 
 **Scale and block size are separable levers, and they pay for different things
 — do not conflate them in the UI.**
@@ -624,14 +626,119 @@ on — background models are fitted assets the cache cannot reconstruct. Do not
 build on it. The `J_tt` route sidesteps that objection entirely, since it is
 recomputed from the frames like everything else.
 
+### Batch M — the downsampling decision tool (new window) · new `gui/downsample_dialog.py`
+Pops up from the downsample control. Design approved; not yet built.
+
+**The problem it exists to solve.** Batch K makes downsampling opt-in and off by
+default, which is right, but a bare "downsample?" knob produces exactly one
+behaviour: *"I don't want my data to be worse, so I won't touch it."* That is not
+a decision, it is an avoidance, and it makes large projects infeasible for no
+examined reason. Many projects genuinely need full resolution; **many do not**,
+and for those the difference is whether the project happens at all. The tool's job
+is to make the middle ground reachable and legible so the choice is strategic.
+
+**REQUIRED: this reasoning must be written out in the window itself, in prose, on
+open.** Not a tooltip, not docs. It states plainly that (a) downsampling can be
+what makes a project computationally feasible, and (b) it is deliberately NOT
+assumed on the user's behalf, precisely so that computationally expensive projects
+are not silently thrown away by a default. Both halves, together — one without the
+other produces either the avoidance above or the silent degradation Batch K
+forbids. Write it as real explanatory text.
+
+**Layout — split (approved).**
+
+```
+┌─ Downsampling — what you gain and lose ──────────────────┐
+│ Replicate: [rep17 ▾]      Corpus: [3000] hours           │
+├───────────────────────────┬──────────────────────────────┤
+│  PROJECT TIME / STORAGE   │   WHAT THE ANIMAL LOOKS LIKE │
+│ 125d┤●                    │  ┌────────┐    ┌────┐        │
+│     │ ╲                   │  │        │    │    │        │
+│  60d┤  ●╲                 │  │  1.00  │    │0.50│        │
+│     │    ╲●___            │  │ 297 px │    │148 │        │
+│  30d┤        ●━━━●━━━●    │  └────────┘    └────┘        │
+│     └─┬───┬───┬───┬───┬   │   full          pick         │
+│      1.0 .75 .50 .25 .12  │                              │
+│              ▲ KNEE       │  ▓▓ what the detector sees ▓▓│
+│   past here: lose pixels, │  ┌────────┐    ┌────┐        │
+│   save almost no time     │  │ change │    │chg │        │
+├───────────────────────────┴──────────────────────────────┤
+│ AT 0.50 →  4.2 px per body length  ·  62 d  ·  0.9 TB    │
+│ AT 1.00 →  8.4 px per body length  ·  125 d ·  0.9 TB    │
+│                         [ Use 0.50 ]  [ Keep 1.00 ]      │
+└──────────────────────────────────────────────────────────┘
+```
+
+**The knee is the single most valuable thing here and is invisible today.** Wall
+time has a hard decode floor, so below some scale the user gives up resolution and
+buys *nothing*: measured, 1300 -> 650 is a 4x pixel cut for ~13% wall time. Nobody
+can guess that. Marking it turns the question from "how brave am I" into "here is
+the efficient frontier, pick a point on it." Compute the knee from the measured
+cost model rather than hardcoding it — `core/timing.py` already emits the spans
+per stage, and the two-lever table under Batch K says which stages each knob
+shortens.
+
+**Both levers, kept visually distinct** (see the Batch K table): `downsample` is
+the compute lever and carries the "may decide what is detectable" warning;
+`block_size` is the storage lever and does not. Do not fuse them into one
+"quality" slider — a storage-limited user would pay a sensitivity cost for
+nothing.
+
+**Calibration sub-tool — broader than just body length.** The user should be able
+to draw a line against a **known fiducial** (ruler, scale bar, arena feature of
+known size) to establish px/mm, AND draw a line along the animal to establish body
+length, and similar measurements in the same spirit. Feeds the existing fields
+rather than inventing new ones: `core/roi.py:83-84` already has `pixels_per_mm`
+and `body_length_mm`, and `core/roi.py:418` already establishes the convention
+`working_px_per_mm = pixels_per_mm * downsample`. So "working px per body length"
+at a given scale is exactly `pixels_per_mm * body_length_mm * scale`. Writing back
+also benefits exports and `speed_body_lengths_s`, which read the same fields.
+Fall back to working px across the replicate box when uncalibrated — geometric,
+always available, just not organism-relative.
+
+**Empirical panel — scoped, and it is the point of the whole thing.** Run the
+detector at each candidate scale over the loaded window and report events found.
+Label it exactly: *evidence on THIS clip and THIS behaviour, not a general
+sensitivity guarantee.* This is the mechanism by which Batch K's "must be
+demonstrated per behaviour/species, never assumed" actually gets satisfied — it
+turns the principle into something a user can execute in a minute instead of an
+instruction they cannot act on. Costs a pass per scale; open the window instantly
+and populate this panel asynchronously (Batch B's `_StreamWorker` + `cancel()`
+already give the pattern).
+
+**Do NOT invent a quality score.** No single number summarizing "how much worse".
+Everything shown is either measured wall clock, measured storage, a rendered
+image, or an event count on a named clip. The withdrawn `sig_corr` reading under
+the sweep entry is the cautionary case: an aggregate that looks authoritative and
+does not mean what it appears to.
+
+**Anchors.** Dialog pattern: `gui/mask_dialog.py` (94 lines, `QDialog` +
+`FrameView` with `draw_enabled` / `box_drawn`) is the closest existing model and
+also the precedent for a draw-on-frame tool. `FrameView` is in
+`gui/video_panel.py`. Launch point: next to the downsample spin box in
+`gui/explorers/live_scalogram_surface.py:206-215`. Detector entry:
+`core/detection.py:167 detect_channel_region`. Cost model input: `core/timing.py`
+spans plus the measured tables under Batch K.
+
+**Depends on K** (the scale-1.0 default and the two-lever split are what this
+tool presents). Build after K, and it pairs naturally with J, since the corpus-
+hours field is the same feasibility question a batch run asks.
+
 ### Suggested order (revised after the sweep + the Batch K decision)
-**K -> I -> J**, and J is now materially more urgent than it was.
+**K -> M -> I -> J**, and J is now materially more urgent than it was.
 
 K first: it is small (delete an auto branch, flip a default, rewrite one test
 file) and it is the principle everything else has to respect — landing I or J
-first would bake the old default into artifacts or into a batch run. Then I,
-which under the new default is the *only* remaining decode lever and is lossless,
-so it costs nothing scientifically. Then J.
+first would bake the old default into artifacts or into a batch run.
+
+**M immediately after K, not later.** K alone is a half-shipped change: it makes
+downsampling opt-in and off by default, which without M leaves users with a knob
+they will refuse to touch on principle, and therefore with projects that do not
+fit their compute. M is what converts the default from an avoidance into a
+decision. Shipping K without M is arguably worse than shipping neither.
+
+Then I, which under the new default is the *only* remaining decode lever and is
+lossless, so it costs nothing scientifically. Then J.
 
 **Why J moved up.** The default just got ~4x more expensive by deliberate choice,
 so single-process throughput drops to ~1.03x realtime and is no longer close to
