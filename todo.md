@@ -724,6 +724,33 @@ spans plus the measured tables under Batch K.
 tool presents). Build after K, and it pairs naturally with J, since the corpus-
 hours field is the same feasibility question a batch run asks.
 
+**Build the panels as reusable components, not baked into this dialog.** Batch N
+is the same tool for `block_size` and should share all of it — cost model,
+corpus projection, frontier curve, evidence panel, empirical panel, calibration.
+Knowing that up front is the difference between one shared widget set and two
+divergent dialogs.
+
+### Batch N — the same decision tool for block size (stub, not yet elaborated)
+A sibling pop-out for `block_size`, **built on shared machinery with Batch M** —
+build M's pieces as reusable components rather than baking them into one dialog:
+the cost model over `core/timing.py` spans, the corpus-hours input and its
+time/storage projection, the frontier curve with its knee marker, the
+render-at-each-setting evidence panel, the scoped empirical detection panel, and
+the calibration sub-tool. Same discipline: explanatory prose on open, and no fused
+quality score.
+
+The one substantive difference, which sets what its "what you lose" panel shows:
+`downsample` and `block_size` lose *different things*. Downsampling loses detail
+within a block (the per-pixel field feeding the tensor solve is coarser);
+block size loses **spatial localization** (fewer, larger grid cells, so clump area
+and where-in-the-arena resolution degrade) while the per-pixel math is untouched.
+So N's evidence panel is about grid granularity and clump resolution, not image
+sharpness. Per the Batch K table it is the storage lever (-13x storage for -13%
+compute), and it does not carry downsampling's "may decide what is detectable"
+warning in the same form.
+
+Elaborate when M is built and it is clear which parts genuinely generalized.
+
 ### Suggested order (revised after the sweep + the Batch K decision)
 **K -> M -> I -> J**, and J is now materially more urgent than it was.
 
