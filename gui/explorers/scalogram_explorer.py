@@ -841,8 +841,8 @@ class ScalogramExplorer(QWidget):
             f, t, b = cube.shape
             parts.append(f"cube {f}×{t}×{b} ({self._fmt_bytes(cube.nbytes)})")
         parts.append(f"channels {self._fmt_bytes(self._channels_bytes)}")
-        flo, fhi = self.scalo_plot.band_hz()
-        parts.append(f"band {flo:.2f}–{fhi:.2f} Hz")
+        # The frequency band is deliberately absent: ScalogramPlot already draws
+        # it in its own title, right above the handles you drag to set it.
         text = "   ·   ".join(parts)
         self._status_lbl.setText(text)
         if self._status_relay is not None:

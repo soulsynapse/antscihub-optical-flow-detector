@@ -26,8 +26,8 @@ from dataclasses import replace
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout,
-                             QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel,
+                             QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
 from core.channel_source import (LIVE_CHANNELS, live_channel_source,
                                  reduce_channel_data)
@@ -179,8 +179,11 @@ class LiveScalogramSurface(QWidget):
 
     # -- config strip --------------------------------------------------------
     def _build_strip(self, cfg: PipelineConfig) -> QWidget:
-        box = QGroupBox("Live preprocessing  ·  no flow cache")
+        # A bare container, not a titled QGroupBox: the title + frame inset cost
+        # ~1cm of vertical space to say what the tab label already says.
+        box = QWidget()
         outer = QVBoxLayout(box)
+        outer.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
 
         row.addWidget(QLabel("Window start"))
@@ -208,7 +211,11 @@ class LiveScalogramSurface(QWidget):
         self.ds_spin.setRange(_AUTO_DS, 1.0)
         self.ds_spin.setSingleStep(0.05)
         self.ds_spin.setDecimals(3)
-        self.ds_spin.setSpecialValueText("auto")
+        # "auto" is derived from the source width and is fixed for this clip, so
+        # resolve it once and show the factor it actually stands for.
+        auto_scale = PreprocessConfig(downsample=None).resolve_downsample(
+            self._dims[0])
+        self.ds_spin.setSpecialValueText(f"auto ({auto_scale:.3f})")
         self.ds_spin.setValue(cfg.preprocess.downsample
                               if cfg.preprocess.downsample else _AUTO_DS)
         self.ds_spin.valueChanged.connect(self._debounce.start)
