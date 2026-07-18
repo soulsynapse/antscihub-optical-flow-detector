@@ -287,8 +287,24 @@ retention). Do last.
   be rebuilt before comparing detection results across it** — the numbers moved
   for a good reason but the key does not know that.
 
-- **Throughput is now decode-bound, and that is a hardware wall.** Measured after
-  the ROI batch, and it invalidates the "optimize the top span" instinct:
+- **Throughput is now decode-bound, and that is a hardware wall.**
+  **SCOPE (added later): this holds at the OLD default scale ~0.245 only. The
+  Batch K decision (scale 1.0) moves the bottleneck back onto math** — H.264
+  decode is whole-frame and crop is a post-decode filter, so the decode floor
+  stays ~3.8 s per 479 frames either way:
+
+  | | extract | ~decode | ~math |
+  |---|---|---|---|
+  | scale 0.245 | 4.69 s | ~3.8 s | ~0.9 s (**19%**) |
+  | scale 1.0 | 19.41 s | ~3.8 s | ~15.6 s (**80%**) |
+
+  So "do not optimize the math" below is correct for the old default and WRONG
+  under the new one; compute levers (Batch L) are worth having again. The
+  hardware-wall conclusion about multi-process scaling still stands regardless,
+  since it is about decode.
+
+  Original entry, measured after the ROI batch, invalidating the "optimize the
+  top span" instinct at the scale it was measured at:
 
   | 479 frames (20 s of 5312x2988) | |
   |---|---|
@@ -316,11 +332,120 @@ retention). Do last.
   not the path. GPU decode is a real but small win; it is a flag
   (`-hwaccel cuda` before `-i`), not a project, if it is ever wanted.
 
+- **`DEFAULT_TARGET_WIDTH` sweep — RUN. It refutes the plan's cost model, and
+  concludes the constant is in the wrong units.** `scripts/sweep_target_width.py`,
+  `GX010047c2` 5312x2988, 7 replicates, 479 frames (20 s), channel
+  `tensor_speed`. Method: block_size tracks the target width (64/32/16/8) so the
+  **block grid is identical (41x5) at every rung** — localization is held fixed
+  and the only variable is how many working pixels average into each block.
+  Thresholds are matched by quantile per rung (value band at q90 of that rung's
+  own band power, gate at q85 of its own windowed count).
+
+  **Read the timing column, not the `sig_corr` columns.** `sig_corr` is retained
+  below only because the withdrawal note explains what it cannot show; it is a
+  stability metric, NOT a detection-quality metric — see "What this sweep does
+  NOT establish". Every durable conclusion here rests on wall clock.
+
+  | width | block | scale | rel.px | **extract** | sig_corr 6-10 Hz | sig_corr 1-3 Hz |
+  |---|---|---|---|---|---|---|
+  | 5200 | 64 | 0.979 | 1.00 | **19.1 s** | 1.000 (ref) | 1.000 (ref) |
+  | 2600 | 32 | 0.490 | 0.25 | **6.8 s** | 0.925 | 0.962 |
+  | 1300 (old default) | 16 | 0.245 | 0.06 | **4.6 s** | 0.767 | 0.884 |
+  | 650 | 8 | 0.122 | 0.02 | **4.1 s** | 0.519 | 0.794 |
+
+  **1. Downsampling below the current default buys almost nothing — the plan's
+  cost model is wrong.** The plan assumed "halving the per-replicate target is 4x
+  rather than 16x", i.e. that width is a strong compute lever downward. Measured:
+  1300 -> 650 is a 4x pixel cut for **~13% wall time**. The pass is pinned near
+  the decode floor at these scales, so there is nothing left to save. This is pure
+  wall clock and does not depend on any sensitivity claim.
+
+  **2. Upward, the pixel cost IS paid in full — but off a baseline decode
+  dominated.** 5200 is 16.7x the pixels of 1300 for **~4.1x** the wall time, and
+  2600 is 4x the pixels for ~1.45x. The sub-linear *total* is Amdahl, not a shadow
+  that absorbs the work: decode is a fixed ~3.8 s floor that dominated the 4.69 s
+  baseline, while the math itself scaled roughly in proportion (~0.9 s -> ~15.6 s,
+  i.e. ~16x). So at scale 1.0 the math is paid at full freight — which is exactly
+  why compute levers (Batch L) become interesting again, and why the "~16x makes
+  the live surface unusable" claim that shelved Batch K is still wrong: the wall
+  cost is 4.1x, not 16x.
+
+  Findings 1 and 2 are the durable half — both are wall clock — and together they
+  say: **there is no throughput argument for downsampling below the current
+  default, and the cost of abandoning it upward is 4.1x rather than 16x.** Neither
+  depends on the sensitivity question below.
+
+  **What this sweep does NOT establish — the sensitivity half is withdrawn.**
+  An earlier version of this entry read the `sig_corr` column as sensitivity loss
+  and concluded 1300 was under-resolved. That inference does not hold:
+
+  - `sig_corr` is the region-MEAN band power over every block in a replicate,
+    including empty background. On sparse events it largely measures whether the
+    noise floors agree, not whether events are detected. It is a *stability*
+    metric, not a detection-quality metric.
+  - Scoring detection quality needs labelled events. `marks.json` currently holds
+    **one** span, so that evaluation cannot be run yet at all.
+  - `GX010047c2` is adversarially hard by design and is used as a stress case, so
+    degradation measured on it does not generalize to ordinary footage in either
+    direction.
+
+  The frequency-dependent spread (1-3 Hz degrades less than 6-10 Hz at every
+  rung) is consistent with small fast structures being averaged away, which is
+  mechanistically plausible — but it is a hypothesis this metric cannot confirm,
+  and the 6-10 Hz band's top edge sits above the 0.8*Nyquist reliability warning
+  `validate_bands` already emits at this clip's 23.98 fps.
+
+  **3. The real conclusion: `DEFAULT_TARGET_WIDTH` is in the wrong units, so no
+  sweep of it can have a transferable answer.** `1300 / source_width` makes the
+  physical working scale a function of how the camera was framed — same animal
+  and same behaviour at a different sensor resolution or crop resolves to a
+  different scale. The tool has to work across fps, resolution, behaviour, and
+  species, so any constant tuned against one clip is overfitted by construction.
+  This is why every previous attempt to "price" the constant stalled.
+
+  What transfers is **organism-relative**: how many working pixels the smallest
+  moving structure of interest spans. That reframing is an argument *for* Batch K
+  rather than a prerequisite of it — a replicate box is one arena holding one
+  animal, so resolving scale from replicate width is a proxy for
+  pixels-per-animal, i.e. it moves scale from sensor-relative to
+  organism-relative units. The quantity to choose is then a per-replicate working
+  width with a documented physical meaning (per-species preset, or derived from
+  arena calibration where it exists), NOT a global frame width. Batch K should be
+  specified that way, and Batch I's manifest should record the resolved
+  per-replicate scale and the rule that produced it, so footage transcoded at
+  different scales stays comparable.
+
+  **Still open, and blocked on labels rather than on measurement:** how many
+  pixels-per-animal the detector actually needs. That is a question about the
+  organism and the behaviour, answerable only against labelled events across more
+  than one species/fps. Timings above vary run-to-run by ~25% (2600 measured
+  5.3 s and 6.8 s); the ratios are sound, the absolute seconds are not.
+
 ### Batch I — ROI pre-transcode (todo 23) · new file + `channel_source`
 The one lever that removes the decode wall. Cut each source once into
-per-replicate clips at working resolution plus a manifest (geometry, scale,
-source hash, fps at full precision), and teach the extraction path to consume the
-manifest instead of the original. Every later pass then decodes ~1/16 the pixels.
+per-replicate clips plus a manifest (geometry, scale, source hash, fps at full
+precision), and teach the extraction path to consume the manifest instead of the
+original. Every later pass then decodes ~1/16 the pixels.
+
+**Why this beats the live ROI crop that already exists.** H.264 decode is
+whole-frame: the `crop` in `ReplicateVideoSource`'s filter graph runs *after* the
+frame is decoded, so the live path still pays full decode cost and only saves the
+downstream per-pixel work. That is why the decode floor measures ~3.8 s per 479
+frames regardless of crop or scale. Pre-transcoding makes the *stored file* small,
+so subsequent decodes genuinely decode fewer pixels — it is the only thing here
+that moves that floor.
+
+**Crop is lossless; scale is lossy. Batch I should do only the crop by default.**
+Under the Batch K decision, the pre-transcode must cut to the replicate box at
+**scale 1.0** unless the user has explicitly asked for downsampling. Cropping
+discards only pixels no replicate owns, so it cannot change any detection result
+— it is a pure decode win and is safe to apply unconditionally. Rescaling would
+bake a sensitivity decision into artifacts that cost a full re-decode to
+regenerate, which is exactly what the principle forbids. The manifest therefore
+records the resolved per-replicate scale *and the rule that produced it*, so
+clips transcoded under different settings are never silently compared. This also
+makes I the main throughput lever now that scale is pinned at 1.0: for these
+~297 px replicates the crop alone is ~1/16 the pixels off the decoder.
 
 **It moves the bottleneck to the math, which is the point.** The already-cropped
 `rep3_intermittent_crop` (462x456) spends 3-5% on decode and ~7.8 s on math — a
@@ -333,33 +458,199 @@ precision in the manifest (see the seek bug fixed in the ROI batch).
 ### Batch J — headless batch driver (todo 24) · new CLI + `core` only
 No-GUI entry point: video + replicate JSON -> detection results on disk, plus
 file-level job partitioning. This is what gets linear scaling, because each node
-brings its own decode capacity: 3000 h / 10x / 50 nodes ~ 6 h. Pairs with I (a
-batch run should consume pre-transcoded ROI clips). Also needs a memory note: the
-channel arrays are (n, ny, nx) float32 x 5 — ~354 MB per hour of 24 fps footage,
-so a multi-hour clip wants chunked writes rather than one in-memory pass.
+brings its own decode capacity. Pairs with I (a batch run should consume
+pre-transcoded ROI clips).
 
-### Batch K — replicate-aware auto downsample (todo 25) · `core/config.py` + tests
-Was already flagged as the keystone under Batch C and has its own shelved writeup
-in `tests/test_auto_downsample.py`. Restated as a numbered item because it is a
-**correctness** gap, not a tuning preference, and it is the only remaining one:
-today a pre-cropped video and an equivalent uncropped box resolve to different
-physical scales, so results are not comparable across those two workflows. The
-`auto (0.245)` in the UI is the source-width number, i.e. provisional.
-Sweep `DEFAULT_TARGET_WIDTH` (1300) against detection output on a known clip
-before paying the ~16x pixels; halving the per-replicate target is 4x rather than
-16x and may cost no sensitivity at all. Passes are now ~5x realtime, so the sweep
-that was previously painful is quick.
+**Throughput assumption updated by the Batch K decision — the old "3000 h / 10x /
+50 nodes ~ 6 h" no longer applies.** That used the 10.8x-realtime decode ceiling
+measured at the old default scale. At scale 1.0 a single-process pass is ~1.03x
+realtime (19.41 s per 19.97 s of footage) because the work is now math-bound, not
+decode-bound. The compensation is that **math-bound work parallelizes across
+processes where decode did not** — the flat-past-4-workers ceiling above was a
+decode property. So per-node throughput needs re-measuring at scale 1.0 with N
+workers before any node-count estimate is quoted; do not carry the 10x figure
+forward.
 
-- **Then: Batch D/E** if perceived UI lag matters more than throughput. Note D/E
-  are `gui/explorers/scalogram_explorer.py`, which is the widget inside **tab 2 ·
-  Preprocessing (live)** (`tab_live_preprocess.py` -> `live_scalogram_surface.py`),
-  not the shelved flow-cache tab.
+Storage per the measured table under Batch K: ~289 MB/h of 24 fps footage at
+block 64 (the (n, ny, nx) float32 x 5 channel arrays), rising to ~3.6 GB/h if
+block_size does not track scale. Either way a multi-hour clip wants chunked writes
+rather than one in-memory pass.
 
-### Suggested order
-K (correctness, cheap, blocks nothing) -> I (removes the decode wall) -> then
-either J (HPC fan-out) or D/E (interactive polish), depending on whether the next
-milestone is a big batch run or day-to-day use. F is worth folding into whichever
-comes first, since 18 is a real speed win.
+### Batch K — downsampling becomes an opt-in cost lever (todo 25) · `core/config.py` + tests
+
+**DECISION (supersedes the auto-downsample framing entirely).** Default to **no
+downsampling, scale 1.0**. Downsampling stops being an automatic behaviour keyed
+to frame width and becomes an explicit user-wielded knob for reducing compute or
+storage.
+
+**Why, and this is the governing principle for the whole tool:** if the pipeline
+silently downsamples by default, it has already decided which behaviours are
+detectable — *the tool defines the data collected rather than the other way
+around.* Coarser resolution may well be sufficient for a given behaviour, but
+that has to be **demonstrated per behaviour/species, never assumed**. Detection
+sensitivity is a scientific result about the organism, not a default constant.
+
+Consequences, in the order they bite:
+
+1. **`DEFAULT_TARGET_WIDTH` and `resolve_downsample`'s auto branch go away** as
+   defaults. `PreprocessConfig.downsample=None` should mean 1.0, not
+   `1300/src_width`. The `auto (0.245)` text Batch A added to the UI goes with
+   it. This also closes the original correctness gap for free: at scale 1.0 a
+   pre-cropped video and an equivalent uncropped box trivially agree, because
+   neither is rescaled. `tests/test_auto_downsample.py` should be rewritten to
+   assert *that* invariant rather than `resolve_replicate_downsample`.
+2. **The eventual denomination is pixels per body length**, roughly — an
+   organism-relative unit, so a target transfers across sensor and framing. Not
+   needed to ship the default-1.0 change; needed once the knob grows a "target a
+   metric" mode. Per-species presets or arena calibration are the likely inputs.
+3. **The knob must be legible about what it buys.** A user choosing 50% must be
+   able to see which steps shorten and by how much. `core/timing.py` already
+   emits exactly these spans, so the cost model can be built from measured data
+   rather than asserted.
+
+**Scale and block size are separable levers, and they pay for different things
+— do not conflate them in the UI.**
+
+| lever | shortens | cost axis |
+|---|---|---|
+| `downsample` (scale) | decode(ROI) · preprocess · tensor_products · tensor_blur · flow_solve · appearance · texture — every per-pixel stage | **compute** |
+| `block_size` | output grid cells, hence cache size, wavelet and detection | **storage** |
+
+Scale leaves the block grid alone if `block_size` tracks it, and `block_size`
+leaves per-pixel compute alone entirely. A user who is storage-limited wants
+`block_size`; a user who is compute-limited wants `downsample`. Presenting one
+"quality" slider would hide that.
+
+**Priced (from the sweep above):** scale 1.0 on `GX010047c2` costs ~4.1x the
+current default's wall time, landing at ~1.03x realtime single-process. That is the price of the
+principle, and it is accepted deliberately. The answer to it is more nodes
+(Batch J) and less decode (Batch I), not a quieter default.
+
+**What `block_size` does when scale goes to 1.0 (resolved below).** Going to scale
+1.0 without touching `block_size=16` also multiplies the output grid, because
+blocks are measured in *working* pixels. On `GX010047c2` (7 replicates, ~297 px
+wide):
+
+**Measured** (479 frames, 7 replicates, extrapolated to 24 fps):
+
+| | extract | grid | storage/h | 3000 h |
+|---|---|---|---|---|
+| today: scale 0.245, block 16 | 4.69 s | 41x5 = 205 | 289 MB | ~0.9 TB |
+| scale 1.0, block 16 | 22.69 s | 139x19 = 2641 | 3.6 GB | **~11 TB** |
+| **scale 1.0, block 64** | **19.41 s** | 41x5 = 205 | 289 MB | **~0.9 TB** |
+| scale 0.245, block 64 | 4.06 s | 20x2 = 40 | 56 MB | ~0.2 TB |
+
+**RESOLVED: block_size tracks scale by default (row 3).** It keeps today's
+storage and today's localization while still feeding the per-pixel tensor solve
+full-resolution pixels — blocks cover the same source area as today, but fine
+motion reaches the solve before being averaged away, which is where the
+sensitivity argument lives. Row 2's finer localization is a separate opt-in
+decision at ~12x storage, not something to inherit silently from the scale
+change.
+
+**The two levers are NOT interchangeable — measured, not asserted.** Rows 1 vs 3
+vs 2 separate them cleanly:
+
+| lever | compute | storage |
+|---|---|---|
+| `block_size` 16 -> 64 | **-13%** | -5x to -13x |
+| `downsample` 1.0 -> 0.245 | **-4.8x** | -13x |
+
+`block_size` is close to a pure *storage* lever: 13x less data for 13% less
+compute, because the per-pixel stages run at working resolution regardless of
+block size. A compute-limited user gets almost nothing from it; only
+`downsample` touches that. So the UI must expose both separately — a
+storage-limited user reaching for a single fused "quality" slider would pay a
+sensitivity cost they had no need to pay. Only the `downsample` lever carries
+the "this may decide what is detectable" warning.
+
+### Batch L — quiet-tile gating (DEFERRED, design recorded) · `core/tensor_channels.py`
+Wanted, but explicitly not now. Recorded so the reasoning is not re-derived.
+
+**The idea.** TRex/TGrabs (Walter & Couzin 2021) and idtracker.ai reduce data by
+subtracting a background model, thresholding to blobs, and running everything
+downstream on blobs only. The same *data reduction* is available here without any
+background model, because the structure tensor already computes the discriminant:
+`change` is `<I_t^2>` per block, documented as `J_tt` (`core/tensor_channels.py:8`)
+— squared frame differencing, i.e. the crudest form of background subtraction, as
+a first-class channel.
+
+**Gate within the frame, not with a lagged rolling window.** The pass runs
+`tensor_products -> tensor_blur -> flow_solve -> appearance -> texture ->
+block_reduce`. `I_t^2` falls out of `tensor_products`, which is early and cheap
+(~7% of the measured profile), while `flow_solve` / `appearance` / `texture` are
+the expensive per-pixel work downstream. So: compute products everywhere, then
+skip the remaining stages for block-tiles below threshold and write a known-quiet
+value. No fitted asset, no lag.
+
+**Must be tile gating, not pixel masking.** Masking background pixels saves
+nothing — the per-pixel stages are vectorized over the whole tile and a mask does
+not skip work in a dense array op. A scattered gather breaks the math outright,
+since `tensor_blur` is a spatial convolution and the structure tensor is a
+neighbourhood operator. Only *contiguous block-tile* gating both saves work and
+preserves the fixed grid the atlas, `block_weight_plane` and
+`region_blocks_and_grid` all assume.
+
+**Why this fits the Eulerian design and TRex's blob extraction does not.** TRex is
+Lagrangian: the blob IS the unit of analysis, so non-blob pixels are genuinely
+nothing. Here detection is per-block band power on a fixed grid, and background
+blocks are the baseline the statistics are computed against (in-band block *count*
+per region, clump area). A gated block therefore needs a defined contribution to
+the count and the clump — it cannot simply vanish.
+
+**Do this measurement first: tile occupancy.** Gating pays only if most tiles are
+quiet most of the time. Computable today from the `change` channel of an ordinary
+pass, no new machinery: what fraction of block-cells fall below a candidate
+threshold, across footage types. ~90% quiet means gating removes most of the math;
+~40% means bookkeeping overhead eats it. Same shape of cheap up-front measurement
+the width sweep turned out to need.
+
+**Threshold validation is unusually tractable here, and is not optional.** The
+gate and the detector read the SAME quantity, so the gate can be expressed in
+units of the detector's own sensitivity floor ("gate at X% of floor") rather than
+as an independent calibration. Use that. The hazard is the one the Batch K
+decision names: gating decides what is detectable. Its failure mode is *worse*
+than downsampling's — downsampling loses small/fast structures and fails
+uniformly, whereas a variance/change gate loses low-contrast, slow, subtle motion
+and fails **selectively on quiet behaviour**, which is often the behaviour of
+interest (stillness, antennal movement, slow postural shift). Deleted signal is
+indistinguishable from "nothing happened". Off by default, same as downsampling.
+
+**Note on existing code:** `bg_subtract` (median/MOG2) has stubs in
+`core/preprocess.py` and config fields in `core/config.py:61`, but is not built
+out and is deliberately forced off for the tensor path
+(`core/tensor_channels.py:176`), which flags results `approximated` when it was
+on — background models are fitted assets the cache cannot reconstruct. Do not
+build on it. The `J_tt` route sidesteps that objection entirely, since it is
+recomputed from the frames like everything else.
+
+### Suggested order (revised after the sweep + the Batch K decision)
+**K -> I -> J**, and J is now materially more urgent than it was.
+
+K first: it is small (delete an auto branch, flip a default, rewrite one test
+file) and it is the principle everything else has to respect — landing I or J
+first would bake the old default into artifacts or into a batch run. Then I,
+which under the new default is the *only* remaining decode lever and is lossless,
+so it costs nothing scientifically. Then J.
+
+**Why J moved up.** The default just got ~4x more expensive by deliberate choice,
+so single-process throughput drops to ~1.03x realtime and is no longer close to
+sufficient for 3000 h. Fan-out is what pays for the principle. Note the
+compensation recorded under J: at scale 1.0 the work is math-bound, and math
+parallelizes across processes where decode did not.
+
+D/E (interactive polish) slip behind J unless day-to-day use becomes the
+near-term milestone; they live in `gui/explorers/scalogram_explorer.py`, the
+widget inside **tab 2 · Preprocessing (live)** (`tab_live_preprocess.py` ->
+`live_scalogram_surface.py`), not the shelved flow-cache tab. F is still worth
+folding into whichever lands first, since 18 is a real speed win.
+
+Not blocking any of the above, and explicitly deferred: **Batch L** (quiet-tile
+gating — wanted, design recorded, not now), the pixels-per-body-length
+denomination, and the per-behaviour sensitivity study that would justify any
+non-1.0 default. The latter two need labelled events; `marks.json` has one span.
+L becomes more attractive after K, since K is what makes math the bottleneck
+again.
 
 ### Shelved (todo 8, 9)
 `gui/tab1_flow.py` and `gui/tab3_behavior.py` are unmaintained. Do not fix them if a
