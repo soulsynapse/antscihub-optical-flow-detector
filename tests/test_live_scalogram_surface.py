@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +11,7 @@ os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
 
 from PyQt6.QtWidgets import QApplication
 
+from gui.explorers import live_scalogram_surface
 from gui.explorers.live_scalogram_surface import (_Busy, _Cancelled,
                                                   _StreamWorker,
                                                   LiveScalogramSurface)
@@ -295,19 +297,18 @@ class CostSampleTests(_SurfaceTestCase):
         self.assertEqual(surface._cost_samples, {})
         self.assertEqual(surface._cost_model(), (None, None))
 
-    def test_re_recording_a_key_still_identifies_the_newest_block(self):
+    def test_re_recording_a_key_still_identifies_the_newest_regime(self):
         # dict order keeps a re-recorded key at its ORIGINAL position, so the
         # newest sample cannot be read off insertion order.
         surface = self._surface()
         surface._record_cost_sample(self._cd(1.0, 32, 4.0))
-        surface._record_cost_sample(self._cd(1.0, 64, 5.0))
-        surface._record_cost_sample(self._cd(0.5, 32, 2.0))
         surface._record_cost_sample(self._cd(1.0, 32, 4.1))
-        self.assertEqual(surface._last_cost_key, (1.0, 32))
-        model, block = surface._cost_model()
-        # Only the block-32 samples, so the fit is over two distinct scales.
-        self.assertFalse(model.provisional)
-        self.assertEqual(model.n_samples, 2)
+        surface._record_cost_sample(self._cd(0.5, 16, 2.0))
+        self.assertEqual(surface._last_cost_key, (0.5, 16))
+        # Both are pinned (tracked would be 64 and 32), but to DIFFERENT blocks,
+        # so they are two regimes of one sample each and neither can be fitted.
+        model, _block = surface._cost_model()
+        self.assertTrue(model.provisional)
 
     def test_model_stays_provisional_while_only_one_scale_is_measured(self):
         surface = self._surface()
@@ -353,14 +354,244 @@ class CostSampleTests(_SurfaceTestCase):
 
     def test_ties_between_regimes_go_to_the_newest(self):
         surface = self._surface()
-        surface._record_cost_sample(self._cd(1.0, 1, 8.0))
+        surface._record_cost_sample(self._cd(1.0, 1, 8.0))     # pinned block 1
         surface._record_cost_sample(self._cd(0.5, 1, 3.0))
-        surface._record_cost_sample(self._cd(1.0, 64, 6.0))
-        surface._record_cost_sample(self._cd(0.5, 64, 2.5))
+        surface._record_cost_sample(self._cd(1.0, 64, 6.0))    # tracked (64·1.0)
+        surface._record_cost_sample(self._cd(0.5, 32, 2.5))    # tracked (64·0.5)
         model, block = surface._cost_model()
         self.assertEqual(model.n_samples, 2)
-        # The block-64 pair is newest, so its (cheaper) wall times drive the fit.
+        # The tracked pair is newest, so its (cheaper) wall times drive the fit.
+        self.assertIsNone(block)
         self.assertAlmostEqual(model.seconds_per_frame(1.0) * 100, 6.0, places=6)
+
+    def test_a_tracked_sweep_is_one_regime_not_one_group_per_scale(self):
+        """The dialog's empirical sweep runs at the production block, which on
+        the `auto` default means the block MOVES with the scale by design. Group
+        on the raw block and every row lands alone, leaving the model provisional
+        forever -- the exact opposite of what running the sweep is for."""
+        surface = self._surface()
+        for scale, block, wall in ((1.0, 64, 6.0), (0.5, 32, 2.5),
+                                   (0.25, 16, 1.6)):
+            surface._record_cost_sample(self._cd(scale, block, wall))
+        model, block = surface._cost_model()
+        self.assertFalse(model.provisional)
+        self.assertEqual(model.n_samples, 3)
+        # None, not a number: no single block describes these passes, and there
+        # is no upper-bound caveat to make because this IS what production does.
+        self.assertIsNone(block)
+        self.assertIsNotNone(model.knee_scale())
+
+    def test_a_pinned_block_sweep_reports_that_block(self):
+        surface = self._surface()
+        surface._record_cost_sample(self._cd(1.0, 16, 5.0), 16)
+        surface._record_cost_sample(self._cd(0.5, 16, 2.0), 16)
+        _model, block = surface._cost_model()
+        self.assertEqual(block, 16)
+
+    def test_a_pass_pinned_to_the_block_tracking_would_pick_stays_pinned(self):
+        """The regime cannot be read off the resolved block. Pin Block to 64 and
+        sweep: at scale 1.0 tracking would ALSO have chosen 64, so inferring
+        would file the reference row as tracked, split the sweep into two groups
+        and drop the widest, highest-leverage point from the fit."""
+        surface = self._surface()
+        for scale, wall in ((1.0, 6.0), (0.5, 3.0), (0.25, 2.0)):
+            surface._record_cost_sample(self._cd(scale, 64, wall), 64)
+        model, block = surface._cost_model()
+        self.assertEqual(block, 64)
+        self.assertEqual(model.n_samples, 3)        # not 2
+
+    def test_a_pass_with_no_measured_wall_is_not_a_sample(self):
+        # A zero-cost point drags the fitted decode floor toward zero, which is
+        # what puts the knee where aggressive downsampling looks free.
+        surface = self._surface()
+        surface._record_cost_sample(self._cd(1.0, 64, 0.0))
+        self.assertEqual(surface._cost_samples, {})
+
+
+class EvidencePanelTests(_QtTestCase):
+    """Panel states that only showed up by driving the real window."""
+
+    @staticmethod
+    def _ev(scale, detected, grid=(4, 4), block=8):
+        from core.evidence import ScaleEvidence
+        import numpy as np
+        return ScaleEvidence(scale=scale, block=block, grid=grid, frames=4,
+                             wall=1.0, window_start=0,
+                             detected=np.asarray(detected, bool), intervals=[])
+
+    def _panel(self):
+        from gui.cost_panels import EvidencePanel
+        p = EvidencePanel("scope")
+        self.addCleanup(p.deleteLater)
+        return p
+
+    def test_pending_rows_are_retired_when_a_sweep_ends_early(self):
+        """A stopped sweep left its remaining rows reading "waiting" forever,
+        claiming passes were still coming with nothing running -- and a
+        half-filled table that looks live invites reading the scales that did
+        run as the whole comparison."""
+        p = self._panel()
+        p.begin(["1.00", "0.50", "0.25"])
+        p.add_row("1.00", self._ev(1.0, [0, 1, 1, 0]))
+        p.finish("stopped")
+        self.assertEqual(p._rows["0.50"][-1].text(), "not run")
+        self.assertEqual(p._rows["0.25"][-1].text(), "not run")
+        self.assertNotEqual(p._rows["1.00"][-1].text(), "not run")
+
+    def test_a_void_reference_suppresses_every_comparison(self):
+        p = self._panel()
+        p.begin(["1.00", "0.50"])
+        p.void_comparison("fires on every frame")
+        ref = self._ev(1.0, [1, 1, 1, 1])
+        p.add_row("1.00", ref)
+        p.add_row("0.50", self._ev(0.5, [1, 1, 1, 1]), ref)
+        for label in ("1.00", "0.50"):
+            self.assertNotIn("kept", p._rows[label][3].text())
+        self.assertIn("not evidence", p.status.text())
+
+    def test_the_void_warning_outranks_the_closing_note(self):
+        p = self._panel()
+        p.begin(["1.00"])
+        p.void_comparison("fires on every frame")
+        p.add_row("1.00", self._ev(1.0, [1, 1]))
+        p.finish("Done. These counts are this clip...")
+        self.assertIn("not evidence", p.status.text())
+
+    def test_a_grid_mismatch_is_flagged_rather_than_ranked_through(self):
+        # The count band counts blocks, so rows on different grids are
+        # thresholded on different quantities.
+        p = self._panel()
+        p.begin(["1.00", "0.50"])
+        ref = self._ev(1.0, [0, 1, 1, 0], grid=(8, 8))
+        p.add_row("1.00", ref)
+        p.add_row("0.50", self._ev(0.5, [0, 1, 0, 0], grid=(4, 4)), ref)
+        self.assertIn("differs", p._rows["0.50"][4].text())
+        self.assertNotIn("differs", p._rows["1.00"][4].text())
+
+
+class EvidenceSweepTests(_SurfaceTestCase):
+    """The empirical panel end to end: real passes, real detector, real dialog.
+
+    Driven rather than mocked because the two things this had to fix are both
+    properties of an actual pass -- that the sweep resolves the PRODUCTION block
+    (the live surface's own extracts run at block=1, where block_reduce is 62% of
+    the wall time) and that its rows are therefore usable cost samples.
+    """
+
+    _PARAMS = {"channel_attr": "change", "region_index": 0,
+               "freq_band_hz": (1.0, 5.0),
+               "value_band": (0.0, float("inf")),
+               "count_band": (0.0, float("inf")),
+               "detect_window": 3, "centered": True}
+
+    def _tuned(self, **over):
+        surface = self._surface()
+        surface._explorer = MagicMock()
+        surface._explorer.detection_params.return_value = dict(self._PARAMS,
+                                                               **over)
+        return surface
+
+    def _pump(self, surface, timeout=120.0):
+        """Pump the event loop until the worker has signalled in. Sleeps rather
+        than spinning: a bare processEvents loop drains an empty queue far faster
+        than the passes run and would time out on a working sweep."""
+        deadline = time.monotonic() + timeout
+        while surface._evi_worker is not None and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        self.app.processEvents()
+        self.assertIsNone(surface._evi_worker, "evidence sweep did not finish")
+
+    def _sweep(self, surface, scales):
+        surface._start_evidence(scales)
+        self._pump(surface)
+
+    def test_a_sweep_produces_a_row_and_a_cost_sample_per_scale(self):
+        surface = self._tuned()
+        dlg = MagicMock()
+        surface._dlg = dlg
+        self._sweep(surface, [1.0, 0.5])
+        self.assertEqual(dlg.add_evidence.call_count, 2)
+        rows = [c.args[0] for c in dlg.add_evidence.call_args_list]
+        self.assertEqual([r.scale for r in rows], [1.0, 0.5])
+        # Each row is also a sample, keyed at the block a production run uses.
+        self.assertEqual(set(surface._cost_samples), {(1.0, 64), (0.5, 32)})
+        self.assertTrue(all(b > 1 for _s, b in surface._cost_samples))
+
+    def test_the_sweep_is_what_moves_the_model_out_of_the_block_1_regime(self):
+        """The two fixes are one fix. Before the sweep the only samples come
+        from the live block=1 pixel cache, which overstates a batch run; after
+        it, the model is fitted in the tracked (production) regime."""
+        surface = self._tuned()
+        surface._record_cost_sample(CostSampleTests._cd(1.0, 1, 9.0))
+        surface._record_cost_sample(CostSampleTests._cd(0.5, 1, 4.0))
+        self.assertEqual(surface._cost_model()[1], 1)
+        surface._dlg = MagicMock()
+        self._sweep(surface, [1.0, 0.5])
+        model, block = surface._cost_model()
+        self.assertIsNone(block)            # tracked: no upper-bound caveat
+        self.assertFalse(model.provisional)
+        self.assertEqual(model.n_samples, 2)
+
+    def test_rows_reach_a_real_dialog_and_redraw_the_frontier(self):
+        from gui.downsample_dialog import DownsampleDialog
+        surface = self._tuned()
+        w, h, fps, _fc = surface._dims
+        dlg = DownsampleDialog([{"id": 0, "label": "all",
+                                 "frac": (0.0, 0.0, 1.0, 1.0)}],
+                               src_width=w, src_height=h, fps=fps,
+                               current_scale=1.0, model=None)
+        self.addCleanup(dlg.deleteLater)
+        surface._dlg = dlg
+        dlg.evidence_requested.connect(surface._start_evidence)
+        self.assertEqual(dlg.plot._values, [])          # nothing measured yet
+        dlg._on_run_evidence()
+        self._pump(surface)
+        # The reference row is held so later rows are read against it, and the
+        # sweep's samples have produced a drawable frontier from nothing.
+        self.assertIsNotNone(dlg._evidence_ref)
+        self.assertAlmostEqual(dlg._evidence_ref.scale, 1.0, places=6)
+        self.assertFalse(dlg._model.provisional)
+        self.assertGreater(len(dlg.plot._values), 1)
+        self.assertEqual(len(dlg.evidence._rows), 5)
+
+    def test_a_sweep_is_refused_until_there_is_something_to_reproduce(self):
+        surface = self._surface()
+        ok, why = surface._evidence_ready()
+        self.assertFalse(ok)
+        self.assertIn("Extract", why)
+        surface = self._tuned(region_index=-1)
+        ok, why = surface._evidence_ready()
+        self.assertFalse(ok)
+        self.assertIn("replicate", why)
+
+    def test_a_sweep_owns_the_decoder(self):
+        surface = self._tuned()
+        surface._evi_worker = MagicMock()
+        surface.extract = LiveScalogramSurface.extract.__get__(surface)
+        with patch("gui.explorers.live_scalogram_surface._LiveExtractWorker") as W:
+            surface.extract()
+            surface.process_whole_video()
+        W.assert_not_called()
+        self.assertIsNone(surface._proc_worker)
+        surface._evi_worker = None
+
+    def test_a_failing_scale_does_not_abort_the_remaining_rows(self):
+        surface = self._tuned()
+        dlg = MagicMock()
+        surface._dlg = dlg
+        real = live_scalogram_surface.measure_scale
+
+        def flaky(video_path, cfg, reps, **kw):
+            if abs(cfg.preprocess.downsample - 0.5) < 1e-9:
+                raise RuntimeError("boom")
+            return real(video_path, cfg, reps, **kw)
+
+        with patch.object(live_scalogram_surface, "measure_scale", flaky):
+            self._sweep(surface, [1.0, 0.5, 0.35])
+        self.assertEqual(dlg.add_evidence.call_count, 2)
+        dlg.evidence_failed.assert_called_once()
+        self.assertAlmostEqual(dlg.evidence_failed.call_args.args[0], 0.5)
 
 
 if __name__ == "__main__":

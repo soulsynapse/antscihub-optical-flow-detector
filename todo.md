@@ -861,6 +861,54 @@ corpus projection, frontier curve, evidence panel, empirical panel, calibration.
 Knowing that up front is the difference between one shared widget set and two
 divergent dialogs.
 
+#### Batch M (second slice, BUILT): the empirical panel and the block regime
+`core/evidence.py`, `gui/cost_panels.py:EvidencePanel`, sweep wiring in
+`live_scalogram_surface.py`. The two fixes landed together because they are one
+mechanism: the sweep runs a pass per scale at the **production block**, so each
+row is simultaneously the sensitivity evidence and the cost sample the live
+surface could not produce. Measured on GX010047c2 (7 reps, 96-frame window): the
+live block=1 pass costs **11.0 s** against **4.2 s** for the same scale at block
+64, so the frontier was overstating a batch run by ~2.6x. Post-sweep the model
+fits 5 scales in the tracked regime, non-provisional, knee ~0.55–0.61. Whole
+sweep: ~12 s for 5 scales.
+
+**Grouping is by regime, not by block.** With `auto` the block tracks the scale
+by design, so grouping samples on the raw block would file a five-scale sweep as
+five one-sample groups and leave the model provisional forever — in exactly the
+workflow the sweep exists to serve. The regime is recorded from the config that
+ran (`FlowConfig.block_size`: `None` tracked, a number pinned), NOT inferred from
+the resolved block: for any pinned block there is a scale where tracking picks
+the same number (64 at 1.0, 32 at 0.5), and inferring misfiles that one pass.
+
+**Found by driving, not by tests — the default state produced a false pass.** A
+freshly built explorer has both bands wide open, so the gate is on for every
+frame; every scale then reported `kept 96 · missed 0 · added 0`. Five rows of
+"downsampling loses nothing", produced by a detector discriminating nothing, in
+the exact window whose job is to stop that conclusion being reached carelessly.
+`core.evidence.reference_caveat` now refuses the comparison when the reference
+gate is all-on or all-off, and the panel suppresses every kept/missed/added split
+behind a stated reason. Same class of bug: a stopped sweep left its remaining
+rows reading "waiting" forever, so a half-populated table looked live.
+
+**Open limitation, and it is the honest reading of the first real result.** With
+a discriminating tuning (value band at the p95 of reference band power) the sweep
+gave 1.00→60 frames, 0.75→55, 0.50→52, 0.35→31, 0.25→13 — monotone loss with
+**zero added frames at every scale**. That one-directional signature is what
+threshold drift looks like: downsampling averages pixels before differencing, so
+per-block band power falls with scale and a fixed absolute value band catches
+less. So the panel as built **cannot yet separate "0.25 is too coarse to resolve
+the behaviour" from "your threshold needs re-tuning at 0.25"** — it answers the
+operational question ("do my current settings still fire?") and not the physical
+one. The scope prose says so, but the fix is a re-tune-at-scale row: re-derive
+the value band at each scale by holding some tuning-invariant fixed (equal gate
+fraction, or the band at the same percentile of that scale's own band power) and
+report both rows. That would separate the two causes and is the natural next
+slice. Do not fold it into a single number.
+
+Still not built: the render-at-each-scale image panel and the draw-a-line
+calibration sub-tool (reading `pixels_per_mm` / `body_length_mm` off the
+replicate dicts works today, and shows "uncalibrated working px" without them).
+
 ### Batch N — the same decision tool for block size (stub, not yet elaborated)
 A sibling pop-out for `block_size`, **built on shared machinery with Batch M** —
 build M's pieces as reusable components rather than baking them into one dialog:

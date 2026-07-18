@@ -25,18 +25,30 @@ What it shows, and what it refuses to show
 * **No quality score.** Nothing here summarizes "how much worse" as one number.
   Every figure is measured wall clock, arithmetic storage, or a named setting.
 
-Not yet built (see todo.md Batch M): the render-at-each-scale evidence panel, the
-scoped empirical detection panel, and the draw-a-line calibration sub-tool. The
-empirical panel is the mechanism by which Batch K's "demonstrated per behaviour,
-never assumed" becomes something a user can actually execute, so until it lands
-this window argues feasibility more strongly than it argues sensitivity -- the
-preamble carries that weight in prose in the meantime, and the panels below are
-built as reusable components (``gui/cost_panels.py``) so Batch N's block-size
-sibling shares them rather than diverging.
+* The **empirical panel**: the tuned detector run at each candidate scale over
+  the loaded window, reporting the events it found and which of the reference
+  run's frames survived. This is where Batch K's "demonstrated per behaviour,
+  never assumed" becomes something a user executes in a minute rather than an
+  instruction they cannot act on. Without it the window argues feasibility much
+  harder than it argues sensitivity, and an asymmetric window biases toward
+  downsampling -- so it is not an optional extra, it is what makes the rest of
+  this window safe to show.
+
+Running the sweep repairs the frontier as a side effect, which is deliberate: the
+live surface tunes at ``block_size=1`` and a model fitted there overstates a
+production run's cost (see ``model_block`` below), while the evidence passes
+resolve the block the way a batch run would. One sweep therefore buys both a
+sensitivity answer and a cost model in the right regime.
+
+Not yet built (see todo.md Batch M): the render-at-each-scale image panel and the
+draw-a-line calibration sub-tool (reading ``pixels_per_mm`` / ``body_length_mm``
+off the replicate dicts works today). The panels below are built as reusable
+components (``gui/cost_panels.py``) so Batch N's block-size sibling shares them
+rather than diverging.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (QDialog, QDoubleSpinBox, QFormLayout, QFrame,
                              QGridLayout, QHBoxLayout, QLabel, QPushButton,
                              QSpinBox, QVBoxLayout, QWidget)
@@ -75,6 +87,20 @@ _WHY_NOT_ASSUMED = (
     "the cheapest scale."
 )
 
+_EVIDENCE_SCOPE = (
+    "<b>Evidence on THIS clip, THIS window and THIS behaviour — not a general "
+    "sensitivity guarantee.</b> Each row re-extracts the loaded window at that "
+    "scale and runs the detector you just tuned, unchanged. A scale that keeps "
+    "your events here has been shown to keep them <i>here</i>; it says nothing "
+    "about a different species, a different behaviour, a quieter animal, or a "
+    "clip shot at another distance. Note also what this cannot separate: the "
+    "value and count bands are absolute thresholds, and downsampling averages "
+    "pixels before differencing, so a lost event may mean the motion is no "
+    "longer resolved <i>or</i> that your threshold no longer sits where you put "
+    "it. Treat a row that loses frames as a reason to re-tune and re-check at "
+    "that scale, not as a settled result."
+)
+
 
 class _Readout(QFrame):
     """One `AT 0.50 → 4.2 px per body length · 62 d · 0.9 TB` line."""
@@ -107,7 +133,16 @@ class DownsampleDialog(QDialog):
     ``model`` is built from whatever passes have actually run; pass ``None`` and
     the window still opens (the frontier then reports it has nothing measured
     rather than inventing a curve).
+
+    The empirical sweep is NOT run here. This dialog owns no video, no decoder
+    and no detector settings -- it emits :attr:`evidence_requested` with the
+    scales to run and the owner (``gui/explorers/live_scalogram_surface.py``)
+    drives the passes off the GUI thread and feeds rows back through
+    :meth:`add_evidence`. That keeps the dialog free of threading and keeps every
+    panel in it reusable by Batch N's block-size sibling.
     """
+    evidence_requested = pyqtSignal(object)     # list[float] of scales to run
+    evidence_cancelled = pyqtSignal()
 
     def __init__(self, replicates: list[dict], src_width: int, src_height: int,
                  fps: float, current_scale: float, model: CostModel | None,
@@ -116,7 +151,7 @@ class DownsampleDialog(QDialog):
                  parent=None):
         super().__init__(parent)
         self.setWindowTitle("Downsampling — what you gain and what you lose")
-        self.resize(980, 720)
+        self.resize(980, 880)
         self._reps = list(replicates)
         self._src = (int(src_width), int(src_height))
         self._fps = float(fps)
@@ -138,10 +173,14 @@ class DownsampleDialog(QDialog):
         self._boxes_cache: list[tuple[int, int]] | None = None
         self._cells_cache: dict[tuple[float, int], int] = {}
 
+        # The reference row every other evidence row is read against, held so
+        # rows arriving one at a time can each be compared as they land.
+        self._evidence_ref = None
+
         root = QVBoxLayout(self)
         # Imported lazily-ish at module scope; kept here so the prose reads in
         # order with the layout it heads.
-        from gui.cost_panels import FrontierPlot, LeverPreamble
+        from gui.cost_panels import EvidencePanel, FrontierPlot, LeverPreamble
         root.addWidget(LeverPreamble(_WHY_OFFERED, _WHY_NOT_ASSUMED))
 
         root.addLayout(self._build_inputs())
@@ -151,6 +190,12 @@ class DownsampleDialog(QDialog):
         root.addWidget(self.plot, 1)
 
         root.addWidget(self._build_readouts())
+
+        self.evidence = EvidencePanel(_EVIDENCE_SCOPE)
+        self.evidence.run_requested.connect(self._on_run_evidence)
+        self.evidence.cancel_requested.connect(self.evidence_cancelled.emit)
+        root.addWidget(self.evidence)
+
         root.addLayout(self._build_buttons())
         self._refresh()
 
@@ -282,8 +327,9 @@ class DownsampleDialog(QDialog):
                 "decode runs on its own thread, so a single pass barely sees it. "
                 "The frontier is withheld rather than shown wrong: a one-pass "
                 "estimate under-prices aggressive downsampling several-fold. "
-                "Extract once more at a different Downsample value (0.5 is a "
-                "good second point) and reopen — two scales are enough.")
+                "Run the sweep below and the frontier appears: it times a pass "
+                "per scale, at the block a production run would use. (Extracting "
+                "once more at a different Downsample value also works.)")
         else:
             hours = [self._hours(s) for s in scales]
             knee = self._model.knee_scale(min_scale=min(scales))
@@ -321,7 +367,8 @@ class DownsampleDialog(QDialog):
                 "production pass. The times below therefore OVERSTATE what a "
                 "batch run would cost: read them as an upper bound and compare "
                 "scales against each other rather than trusting the absolute "
-                "figure.")
+                "figure. Running the sweep below replaces them — those passes "
+                "resolve the block as a production run does.")
         return "  ".join(parts)
 
     def _refresh_rows(self):
@@ -336,6 +383,52 @@ class DownsampleDialog(QDialog):
             row.set(f"AT {scale:.2f} →", "  ·  ".join(bits), emph)
         self.use_btn.setEnabled(abs(self._selected - 1.0) > 1e-9)
         self.use_btn.setText(f"Use {self._selected:.2f}")
+
+    # -- empirical sweep -----------------------------------------------------
+    def set_evidence_available(self, ok: bool, reason: str = ""):
+        """Called by the owner when it knows whether a sweep can run at all
+        (a window must be extracted and a replicate selected first)."""
+        self.evidence.set_available(ok, reason)
+
+    def _on_run_evidence(self):
+        from core.evidence import sweep_scales
+        scales = sweep_scales(self._current, CANDIDATE_SCALES)
+        self._evidence_ref = None
+        self.evidence.begin(
+            [f"{s:.2f}" for s in scales],
+            f"{len(scales)} passes over the loaded window, the reference "
+            f"({scales[0]:.2f}) first so a sweep you stop early is still "
+            f"readable. Each pass runs at the block a production run would use.")
+        self.evidence_requested.emit(scales)
+
+    def add_evidence(self, ev):
+        """One completed pass. The first row becomes the reference; the rest are
+        reported against it. Also refreshes the frontier's caveat, since these
+        passes are measured in the production block regime the live surface's
+        own samples are not."""
+        from core.evidence import reference_caveat
+        # The check runs on the reference BEFORE it is drawn, so a vacuous sweep
+        # is marked from its very first row rather than after the user has read
+        # four rows of apparent agreement.
+        if self._evidence_ref is None:
+            self.evidence.void_comparison(reference_caveat(ev))
+        self.evidence.add_row(f"{ev.scale:.2f}", ev, self._evidence_ref)
+        if self._evidence_ref is None:
+            self._evidence_ref = ev
+
+    def evidence_failed(self, scale: float, msg: str):
+        self.evidence.fail_row(f"{float(scale):.2f}", msg)
+
+    def evidence_finished(self, note: str):
+        self.evidence.finish(note)
+
+    def set_model(self, model: CostModel | None, model_block: int | None):
+        """Replace the cost model mid-dialog. The sweep produces samples at the
+        production block, so the frontier can go from withheld to drawn (and
+        from an upper bound to a real projection) without reopening the window."""
+        self._model = model
+        self._model_block = model_block
+        self._refresh()
 
     # -- actions -------------------------------------------------------------
     def _on_pick(self, scale: float):

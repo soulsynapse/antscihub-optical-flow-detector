@@ -34,6 +34,7 @@ from core.channel_source import (LIVE_CHANNELS, live_channel_source,
                                  reduce_channel_data)
 from core.config import FlowConfig, PipelineConfig, PreprocessConfig
 from core.cost_model import CostModel, PassSample
+from core.evidence import measure_scale
 from core.replicates import build_layout
 from core.detection import detect_channel_region
 from core.video import VideoSource
@@ -55,6 +56,10 @@ _AUTO_BLOCK = 0
 _EXTRACT_TEXT = "Extract"
 _PROCESS_TEXT = "Process whole video ▶"
 
+# "the caller did not say which block regime this pass ran in". Distinct from
+# None, which is a real regime (the block tracked the scale).
+_INFER = object()
+
 
 class _Busy(Enum):
     """Which pass owns the decoder. Named rather than bare strings because
@@ -62,6 +67,7 @@ class _Busy(Enum):
     recognise, which a mistyped literal would make unrecoverable."""
     EXTRACT = "extract"
     PROCESS = "process"
+    EVIDENCE = "evidence"
 
 
 class _Cancelled(Exception):
@@ -164,6 +170,56 @@ class _ProcessWorker(_StreamWorker):
         self.done.emit(res)
 
 
+class _EvidenceWorker(_StreamWorker):
+    """The downsample dialog's sweep: one extract + detect per candidate scale.
+
+    Two things land in one pass sequence, which is why they were built together.
+    Each pass answers *"does the detector I just tuned still fire at this
+    scale"*, and each pass is also a cost sample taken at the block a production
+    run would use -- unlike the live surface's own extracts, which run at
+    ``block_size=1`` so a Block change can re-reduce instead of re-extract, and
+    which therefore price a pass where ``block_reduce`` is 62% of the wall time
+    against ~15% in production.
+
+    A scale that fails does not abort the sweep: a row reporting the error is
+    more useful than losing the scales that would have run after it.
+    """
+    row = pyqtSignal(object)               # a completed ScaleEvidence
+    row_failed = pyqtSignal(float, str)
+    scale_started = pyqtSignal(float, int, int)     # (scale, index, total)
+
+    def __init__(self, video_path, cfg, replicates, dims, start, n,
+                 region_index, params, scales, parent=None):
+        super().__init__(parent)
+        self._args = (video_path, cfg, replicates, dims, start, n,
+                      region_index, params, list(scales))
+
+    def _run(self):
+        (video_path, cfg, reps, dims, start, n, region_index, params,
+         scales) = self._args
+        for i, s in enumerate(scales):
+            if self._cancel:
+                raise _Cancelled
+            self.scale_started.emit(float(s), i + 1, len(scales))
+            # Only the scale moves. The block comes from the user's own flow
+            # config, so `auto` tracks it (grid fixed in source pixels, count
+            # bands comparable) and a pinned block does not -- which the panel
+            # then flags rather than hiding.
+            cfg_s = replace(cfg, preprocess=replace(cfg.preprocess,
+                                                    downsample=float(s)))
+            try:
+                ev = measure_scale(video_path, cfg_s, reps, dims=dims,
+                                   start=start, n=n, region_index=region_index,
+                                   params=params, progress=self._tick)
+            except _Cancelled:
+                raise
+            except Exception as e:
+                self.row_failed.emit(float(s), f"{type(e).__name__}: {e}")
+                continue
+            self.row.emit(ev)
+        self.done.emit(None)
+
+
 class LiveScalogramSurface(QWidget):
     def __init__(self, video_path: str, replicates: list[dict],
                  base_cfg: PipelineConfig | None = None, parent=None):
@@ -209,7 +265,20 @@ class LiveScalogramSurface(QWidget):
         # reduction, so mixing those samples with block-reduced ones into one fit
         # would regress across two variables and attribute both to the scale.
         self._cost_samples: dict[tuple[float, int], PassSample] = {}
+        # The regime each sample was taken in, keyed the same way: None when the
+        # block tracked the scale, the pinned working block otherwise. Recorded
+        # from the config that ran rather than inferred by comparing the block to
+        # what tracking would have produced -- those coincide at some scale for
+        # any pinned block (64 at scale 1.0, 32 at 0.5), and inferring would then
+        # file that one pass in the wrong regime and drop it from the fit.
+        self._sample_regime: dict[tuple[float, int], int | None] = {}
         self._last_cost_key: tuple[float, int] | None = None
+        # The downsample dialog's empirical sweep, while one is running. Held on
+        # the surface rather than in the dialog because it owns the decoder and
+        # must not overlap the extract or the whole-video commit.
+        self._evi_worker: _EvidenceWorker | None = None
+        self._sweep_block_intent: int | None = None
+        self._dlg = None
 
         # Coalesce rapid knob edits into a single re-extract on settle. Created
         # before the strip because the controls connect to it.
@@ -432,8 +501,8 @@ class LiveScalogramSurface(QWidget):
 
     # -- extraction ----------------------------------------------------------
     def extract(self):
-        if self._proc_worker is not None:
-            return                          # the expensive commit owns the decoder
+        if self._proc_worker is not None or self._evi_worker is not None:
+            return                          # another pass owns the decoder
         if self._worker is not None:
             # A knob settled mid-extract: that pass is now stale, so supersede it
             # rather than dropping the edit. The restart runs once it unwinds.
@@ -481,51 +550,73 @@ class LiveScalogramSurface(QWidget):
             f"extracting… {done}/{total} frames ({pct:.0f}%) · "
             f"{self._extract_ctx}{self._eta(done, total, self._extract_t0)}")
 
-    def _record_cost_sample(self, cd):
+    def _record_cost_sample(self, cd, block_intent: int | None = _INFER):
         """Keep one timing sample per (scale, block) for the cost model.
 
         Overwrites rather than averages: the newest pass reflects the current
         machine state (thermal, other load), and todo.md records run-to-run
         spread of ~25% at fixed settings, so an average over a long session would
         blend conditions rather than reduce noise.
+
+        ``block_intent`` is the ``FlowConfig.block_size`` the pass ran under --
+        ``None`` for tracked, a number for pinned -- and it is what the regime
+        grouping uses. It has to be passed rather than derived from the resolved
+        block, because for any pinned block there is a scale at which tracking
+        would have produced the same number, and inferring would then file that
+        one pass in the wrong regime.
         """
         t = (getattr(cd, "meta", None) or {}).get("timing")
-        if not t or not t.get("frames"):
+        if not t or not t.get("frames") or float(t.get("wall", 0.0)) <= 0.0:
             return
         key = (round(float(t["scale"]), 6), int(t["block"]))
         self._cost_samples[key] = PassSample(
             scale=float(t["scale"]), frames=int(t["frames"]),
             wall=float(t["wall"]), spans=dict(t.get("spans") or {}))
+        self._sample_regime[key] = (self._infer_regime(*key)
+                                    if block_intent is _INFER else block_intent)
         # Tracked explicitly: re-recording an existing key keeps its original
         # insertion position, so dict order does not identify the newest sample.
         self._last_cost_key = key
 
-    def _cost_model(self) -> tuple[CostModel | None, int | None]:
-        """Fit within one block regime; returns ``(model, the regime's block)``.
+    @staticmethod
+    def _infer_regime(scale: float, block: int) -> int | None:
+        """Best-effort regime for a pass whose config is no longer to hand.
 
-        Samples must not be mixed across block sizes (block=1 does no reduction
-        at all), but "newest regime" is the wrong way to pick one: whether a pass
-        runs at block=1 depends on whether its per-pixel footprint fits the
-        budget, and that footprint scales with the square of the scale. So the
-        very act of dragging Downsample to compare scales splits the samples
-        across regimes, and always taking the newest would leave the model
-        provisional forever -- withholding the frontier in exactly the workflow
-        it exists to serve. Picking the regime with the most distinct scales
-        finds the fit if one exists anywhere; ties go to the newest.
+        Only a fallback: it cannot tell a pass pinned to 64 at scale 1.0 from a
+        tracked one, because they are the same pass. Callers that know the config
+        pass the intent instead.
+        """
+        if int(block) == FlowConfig(block_size=None).resolve_block_size(scale):
+            return None
+        return int(block)
+
+    def _cost_model(self) -> tuple[CostModel | None, int | None]:
+        """Fit within one regime; returns ``(model, fixed block or None)``.
+
+        Samples must not be mixed across regimes -- a block=1 pass does no
+        reduction at all and is much slower than a production pass -- but
+        "newest regime" is the wrong way to pick one: whether a live pass runs at
+        block=1 depends on whether its per-pixel footprint fits the budget, and
+        that footprint scales with the square of the scale, so dragging
+        Downsample to compare scales is itself what splits the samples. Picking
+        the regime with the most distinct scales finds the fit if one exists
+        anywhere; ties go to the newest.
+
+        The second element tells the dialog which regime the numbers came from:
+        a fixed block (``1`` in particular, which the dialog labels as an upper
+        bound) or ``None`` for the tracked regime, which needs no caveat because
+        it is what production does.
         """
         if not self._cost_samples:
             return None, None
-        groups: dict[int, list[PassSample]] = {}
-        for (_scale, block), s in self._cost_samples.items():
-            groups.setdefault(block, []).append(s)
-        newest_block = self._last_cost_key[1] if self._last_cost_key else None
+        groups: dict[int | None, list[PassSample]] = {}
+        for key, s in self._cost_samples.items():
+            groups.setdefault(self._sample_regime.get(key), []).append(s)
+        newest = (self._sample_regime.get(self._last_cost_key)
+                  if self._last_cost_key else object())
         block, samples = max(groups.items(),
                              key=lambda kv: (len({s.scale for s in kv[1]}),
-                                             kv[0] == newest_block))
-        # The block is returned alongside so the dialog can say which regime the
-        # numbers came from: a block=1 pass does no reduction and is much slower
-        # than a production pass, which would otherwise inflate its projection
-        # silently.
+                                             kv[0] == newest))
         return CostModel.fit(samples), block
 
     def _open_downsample_dialog(self):
@@ -537,16 +628,141 @@ class LiveScalogramSurface(QWidget):
             current_scale=float(self.ds_spin.value()),
             model=model, model_block=model_block, flow=self._build_cfg().flow,
             n_channels=len(LIVE_CHANNELS), parent=self)
-        if dlg.exec() and dlg.chosen_scale is not None:
+        dlg.evidence_requested.connect(self._start_evidence)
+        dlg.evidence_cancelled.connect(self._stop_evidence)
+        ok, why = self._evidence_ready()
+        dlg.set_evidence_available(ok, why)
+        self._dlg = dlg
+        try:
+            accepted = dlg.exec()
+        finally:
+            # A sweep still running when the window closes has nowhere to report
+            # to, and it holds the decoder the next extract needs. Unwind it here
+            # rather than letting it race the reopened dialog.
+            self._stop_evidence(wait=True)
+            self._dlg = None
+            # Parented to the surface, so without this each open leaves a live
+            # dialog behind whose Run button is still wired to _start_evidence.
+            dlg.deleteLater()
+        if accepted and dlg.chosen_scale is not None:
             # setValue fires valueChanged, which starts the re-extract debounce,
             # so choosing a scale here applies exactly as dragging the spin does.
             self.ds_spin.setValue(float(dlg.chosen_scale))
 
+    # -- the dialog's empirical sweep ----------------------------------------
+    def _evidence_ready(self) -> tuple[bool, str]:
+        """Whether a sweep can run, and why not when it cannot. Both reasons are
+        one action away, so the panel states them instead of just greying out."""
+        if self._explorer is None:
+            return False, ("Extract a window and tune the detector first — the "
+                           "sweep re-runs your settings, so there have to be "
+                           "settings.")
+        if self._explorer.detection_params()["region_index"] < 0:
+            return False, ("Select a replicate first: the detector runs over one "
+                           "region, so the sweep needs to know which.")
+        if self._worker is not None or self._proc_worker is not None:
+            return False, "Another pass is running; wait for it to finish."
+        return True, ""
+
+    def _start_evidence(self, scales):
+        ok, why = self._evidence_ready()
+        if not ok or self._evi_worker is not None:
+            if self._dlg is not None:
+                self._dlg.evidence_finished(why or "a sweep is already running")
+            return
+        self._debounce.stop()               # an armed knob edit must not cut in
+        self._block_debounce.stop()
+        start, n = self._window()
+        params = self._explorer.detection_params()
+        cfg = self._build_cfg()
+        # Every row of this sweep runs under one block intent, so record it once
+        # here rather than re-deriving it per row from the resolved block.
+        self._sweep_block_intent = cfg.flow.block_size
+        self._set_busy(_Busy.EVIDENCE)
+        self._evi_worker = _EvidenceWorker(
+            self.video_path, cfg, self.replicates, self._dims,
+            start, n, params["region_index"], params, scales, self)
+        self._evi_worker.row.connect(self._on_evidence_row)
+        self._evi_worker.row_failed.connect(self._on_evidence_row_failed)
+        self._evi_worker.scale_started.connect(self._on_evidence_scale)
+        self._evi_worker.done.connect(self._on_evidence_done)
+        self._evi_worker.failed.connect(self._on_evidence_failed)
+        self._evi_worker.cancelled.connect(self._on_evidence_cancelled)
+        self._evi_worker.finished.connect(self._evi_worker.deleteLater)
+        self._evi_worker.start()
+
+    def _stop_evidence(self, wait: bool = False):
+        w = self._evi_worker
+        if w is None:
+            return
+        w.cancel()
+        if wait:
+            # Only on teardown: the worker unwinds at its next progress tick, and
+            # blocking the GUI thread for that is preferable to leaving it
+            # decoding into a dialog that no longer exists.
+            w.wait()
+            self._evi_worker = None
+            self._set_busy(None)
+
+    def _on_evidence_scale(self, scale: float, i: int, total: int):
+        self.status_lbl.setText(
+            f"sweep {i}/{total} · extracting at scale {scale:.2f} and running "
+            f"the tuned detector…")
+
+    def _on_evidence_row(self, ev):
+        # The sweep's passes resolve the block as production would, so each row
+        # is also the cost sample the live surface cannot produce: this is what
+        # moves the frontier out of the block=1 regime, live, while the dialog
+        # is open. A pass whose timing is missing is dropped rather than entered
+        # as a zero-cost point, which would pull the fitted decode floor toward
+        # zero and put the knee where downsampling looks free.
+        sample = ev.pass_sample()
+        if ev.frames > 0 and sample.wall > 0.0:
+            key = (round(float(ev.scale), 6), int(ev.block))
+            self._cost_samples[key] = sample
+            self._sample_regime[key] = self._sweep_block_intent
+            self._last_cost_key = key
+        if self._dlg is not None:
+            self._dlg.add_evidence(ev)
+            self._dlg.set_model(*self._cost_model())
+
+    def _on_evidence_row_failed(self, scale: float, msg: str):
+        if self._dlg is not None:
+            self._dlg.evidence_failed(scale, msg)
+
+    def _on_evidence_done(self, _res):
+        self._evi_worker = None
+        self._set_busy(None)
+        self.status_lbl.setText("sweep done")
+        if self._dlg is not None:
+            self._dlg.evidence_finished(
+                "Done. These counts are this clip, this window and these "
+                "detector settings; a scale that held here still has to hold "
+                "for the other footage the project will run.")
+
+    def _on_evidence_failed(self, msg: str):
+        self._evi_worker = None
+        self._set_busy(None)
+        if self._dlg is not None:
+            self._dlg.evidence_finished(f"sweep failed: {msg}")
+
+    def _on_evidence_cancelled(self):
+        self._evi_worker = None
+        self._set_busy(None)
+        self.status_lbl.setText("sweep stopped")
+        if self._dlg is not None:
+            self._dlg.evidence_finished(
+                "Stopped. The rows that finished are still valid — each is an "
+                "independent pass, not a partial result.")
+
     def _on_extracted(self, cd):
         self._worker = None
         self._set_busy(None)
-        self._record_cost_sample(cd)
         cfg = self._pending_cfg or self._build_cfg()
+        # The regime is the block the PASS ran under, which is 1 whenever the
+        # per-pixel cache was built -- not the block cfg asks the display for.
+        self._record_cost_sample(cd, 1 if self._pending_pp
+                                 else cfg.flow.block_size)
         if self._pending_pp:                         # cd is the block=1 pixel cache
             self._pp = cd
             self._pp_key = self._pending_key
@@ -598,7 +814,7 @@ class LiveScalogramSurface(QWidget):
     def _on_block_changed(self):
         """Block changed: re-reduce the cached pixel channels (instant) if they
         cover this window, else fall back to a full (block=1) extract."""
-        if self._proc_worker is not None:
+        if self._proc_worker is not None or self._evi_worker is not None:
             return
         if self._worker is not None:
             # Mid-extract: even a cache hit would be overwritten by the pass in
@@ -668,7 +884,8 @@ class LiveScalogramSurface(QWidget):
 
     # -- whole-video commit --------------------------------------------------
     def process_whole_video(self):
-        if self._worker is not None or self._proc_worker is not None:
+        if (self._worker is not None or self._proc_worker is not None
+                or self._evi_worker is not None):
             return                                  # a pass is already running
         if self._explorer is None:
             self.status_lbl.setText("extract a window and tune it first")
@@ -771,11 +988,11 @@ class LiveScalogramSurface(QWidget):
         # and it re-enters extract() on a surface that is on its way out.
         self._debounce.stop()
         self._block_debounce.stop()
-        for w in (self._worker, self._proc_worker):
+        for w in (self._worker, self._proc_worker, self._evi_worker):
             if w is not None:
                 w.cancel()      # unwind at the next tick instead of waiting it out
                 w.wait()
-        self._worker = self._proc_worker = None
+        self._worker = self._proc_worker = self._evi_worker = None
         if self._explorer is not None:
             self._explorer.close()
         super().closeEvent(e)

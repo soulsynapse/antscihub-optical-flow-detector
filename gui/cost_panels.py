@@ -15,7 +15,8 @@ from __future__ import annotations
 
 from PyQt6.QtCore import QPointF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import QLabel, QSizePolicy, QWidget
+from PyQt6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QPushButton,
+                             QSizePolicy, QVBoxLayout, QWidget)
 
 _BG = QColor("#1b1f24")
 _AXIS = QColor("#5b6672")
@@ -210,3 +211,180 @@ class FrontierPlot(QWidget):
         if v >= 10:
             return f"{v:.0f}"
         return f"{v:.1f}"
+
+
+class EvidencePanel(QWidget):
+    """Run the tuned detector at each candidate setting and show what it found.
+
+    This is the sensitivity half of a lever dialog and the reason the dialog is
+    defensible at all. A window that shows only a frontier answers "can I afford
+    full resolution", never "can I afford to lose it", and a user reading an
+    asymmetric window downsamples for the reason the tool put in front of them.
+    Batch K's rule -- that a coarser setting must be *demonstrated* to still
+    resolve the behaviour -- is executable here and nowhere else in the tool.
+
+    Every cell is a count on a named clip: events, flagged frames, and the
+    kept/missed/added split against the reference row. No summary score, and the
+    scope caption is not optional -- an event count that does not say which clip
+    and which behaviour it came from will be read as a general guarantee, which
+    is the exact claim the panel exists to avoid making.
+    """
+    run_requested = pyqtSignal()
+    cancel_requested = pyqtSignal()
+
+    _HEAD = ("setting", "events", "frames", "vs reference", "grid", "pass")
+
+    def __init__(self, scope_note: str, run_text: str = "Run the detector at each scale",
+                 parent=None):
+        super().__init__(parent)
+        self._rows: dict[str, list[QLabel]] = {}
+        self._running = False
+        self._void: str | None = None       # why the comparison carries no info
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 4, 0, 0)
+
+        cap = QLabel(scope_note)
+        cap.setWordWrap(True)
+        cap.setTextFormat(Qt.TextFormat.RichText)
+        cap.setStyleSheet(
+            "color:#e6c07b; background:#2b2620; border:1px solid #4a3f2c;"
+            "border-radius:4px; padding:8px; font-size:12px;")
+        lay.addWidget(cap)
+
+        self.grid = QGridLayout()
+        self.grid.setHorizontalSpacing(14)
+        self.grid.setVerticalSpacing(2)
+        for c, h in enumerate(self._HEAD):
+            lab = QLabel(h)
+            lab.setStyleSheet("color:#8fa3b5; font-size:11px; font-weight:700;")
+            self.grid.addWidget(lab, 0, c)
+        lay.addLayout(self.grid)
+
+        row = QHBoxLayout()
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#8fa3b5; font-size:11px;")
+        self.run_btn = QPushButton(run_text)
+        self.run_btn.clicked.connect(self._on_click)
+        row.addWidget(self.status, 1)
+        row.addWidget(self.run_btn)
+        lay.addLayout(row)
+
+    # -- state ---------------------------------------------------------------
+    def _on_click(self):
+        (self.cancel_requested if self._running else self.run_requested).emit()
+
+    def set_available(self, ok: bool, reason: str = ""):
+        """Disable the run with a stated reason. Silence would read as a broken
+        button; the reasons here (no window extracted, no region selected) are
+        all things the user can fix in one action -- and once fixed the reason
+        has to go, or the panel contradicts its own enabled button."""
+        self.run_btn.setEnabled(bool(ok))
+        if not ok:
+            self.status.setText(reason)
+        elif not self._rows:
+            self.status.setText("")
+
+    def begin(self, labels: list[str], note: str = ""):
+        """Lay out one pending row per setting before any pass has run, so the
+        cost of the sweep is visible up front rather than arriving as a surprise
+        stall."""
+        self._running = True
+        self._void = None
+        self.run_btn.setText("Stop")
+        self.run_btn.setEnabled(True)
+        self._clear()
+        for lab in labels:
+            self._set_row(lab, [lab, "…", "", "", "", "waiting"], dim=True)
+        self.status.setText(note)
+
+    def void_comparison(self, reason: str | None):
+        """Mark the reference as unable to support a comparison at all.
+
+        Set from the reference row (see ``core.evidence.reference_caveat``). Once
+        set, no row prints a kept/missed/added split: a detector that fires on
+        every frame agrees with itself perfectly at every scale, and printing
+        that as "kept 96 · missed 0" would be a passing grade awarded for a
+        vacuous test -- the single most misleading thing this panel could do.
+        """
+        self._void = reason
+        if reason:
+            self.status.setText(self._void_text())
+
+    def _void_text(self) -> str:
+        return f"⚠ These rows are not evidence: {self._void}."
+
+    def add_row(self, label: str, ev, ref=None):
+        """One completed pass. ``ref`` is the reference row's evidence (the
+        first, full-resolution pass); ``None`` marks this row as the reference."""
+        kept_txt, grid_txt = "reference", f"{ev.grid[0]}×{ev.grid[1]}"
+        warn = False
+        if self._void:
+            kept_txt = "no comparison — see below"
+            warn = True
+        elif ref is not None:
+            kept, missed, added = ev.agreement_with(ref)
+            kept_txt = f"kept {kept} · missed {missed} · added {added}"
+            if tuple(ev.grid) != tuple(ref.grid):
+                # The count band counts blocks. A different grid counts a
+                # different number of them, so the two rows are thresholded on
+                # different quantities -- comparable only if the block tracks
+                # the scale, which is what auto does and a pinned block does not.
+                warn = True
+                grid_txt += " ⚠ differs"
+        self._set_row(label, [
+            label,
+            str(ev.n_events),
+            str(ev.n_detected_frames),
+            kept_txt,
+            f"{grid_txt} · block {ev.block}",
+            f"{ev.wall:.1f} s",
+        ], warn=warn)
+
+    def fail_row(self, label: str, msg: str):
+        self._set_row(label, [label, "—", "", msg, "", ""], warn=True)
+
+    def finish(self, note: str):
+        """End the sweep, however it ended.
+
+        Any row still pending is retired to "not run". A stopped sweep is the
+        common case and leaving its remaining rows reading "waiting" would claim
+        passes are still coming when nothing is running -- worse here than
+        cosmetically, because a half-populated table that looks live invites
+        reading the scales that DID run as the whole comparison.
+        """
+        self._running = False
+        self.run_btn.setText("Run again")
+        self.run_btn.setEnabled(True)
+        # A void comparison outranks the closing note: the note says the sweep
+        # completed, which is true and, on its own, exactly the wrong thing to
+        # leave on screen when the rows mean nothing.
+        self.status.setText(self._void_text() if self._void else note)
+        for cells in self._rows.values():
+            if cells[-1].text() == "waiting":
+                cells[1].setText("—")
+                cells[-1].setText("not run")
+                for c in cells:
+                    c.setStyleSheet(
+                        "font-family:Consolas; font-size:12px; color:#6b7885;")
+
+    # -- rows ----------------------------------------------------------------
+    def _clear(self):
+        for cells in self._rows.values():
+            for c in cells:
+                c.setParent(None)
+                c.deleteLater()
+        self._rows.clear()
+
+    def _set_row(self, label: str, cells: list[str], *, dim=False, warn=False):
+        if label not in self._rows:
+            made = [QLabel() for _ in self._HEAD]
+            r = len(self._rows) + 1
+            for c, lab in enumerate(made):
+                self.grid.addWidget(lab, r, c)
+            self._rows[label] = made
+        colour = "#6b7885" if dim else ("#e6a23c" if warn else "#c8d2dc")
+        for lab, text in zip(self._rows[label], cells):
+            lab.setText(text)
+            lab.setStyleSheet(
+                f"font-family:Consolas; font-size:12px; color:{colour};")
