@@ -211,7 +211,8 @@ class ScalogramExplorer(QWidget):
 
     def __init__(self, cache=None, video_path: str | None = None, *,
                  state=None, sidecar_path: str | None = None,
-                 channel_data=None, own_shortcuts: bool = True, parent=None):
+                 channel_data=None, own_shortcuts: bool = True,
+                 own_status: bool = True, parent=None):
         super().__init__(parent)
         if state is not None and cache is None and channel_data is None:
             cache = state.cache
@@ -220,6 +221,11 @@ class ScalogramExplorer(QWidget):
         # When embedded in a host that owns Space (the live surface / main
         # window), skip our own Space shortcut so the two do not fight over it.
         self._own_shortcuts = own_shortcuts
+        # When embedded, the host displays the status line (in its own strip): skip
+        # rendering our internal copy and mirror the text to the host-supplied
+        # relay label instead (see set_status_relay).
+        self._own_status = own_status
+        self._status_relay = None
 
         # Source of geometry + channels. A ChannelData decouples us from the
         # cache: it comes either from an open cache (all five channels) or a live
@@ -354,13 +360,14 @@ class ScalogramExplorer(QWidget):
 
     @classmethod
     def from_channel_data(cls, channel_data, video_path: str | None = None,
-                          own_shortcuts: bool = True,
+                          own_shortcuts: bool = True, own_status: bool = True,
                           parent=None) -> "ScalogramExplorer":
         """Standalone explorer over a ChannelData (e.g. a live windowed source),
         decoding its own video for the overlay."""
         return cls(channel_data=channel_data,
                    video_path=video_path or channel_data.meta.get("video_path"),
-                   own_shortcuts=own_shortcuts, parent=parent)
+                   own_shortcuts=own_shortcuts, own_status=own_status,
+                   parent=parent)
 
     # -- view-state carry-over (survives a live re-extract rebuild) ----------
     def capture_view_state(self) -> dict:
@@ -549,7 +556,8 @@ class ScalogramExplorer(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse)
         self._status_lbl.setStyleSheet(
             "color:#e0a94a; font-family:Consolas; font-size:11px;")
-        left.addWidget(self._status_lbl)
+        if self._own_status:
+            left.addWidget(self._status_lbl)
         root.addLayout(left, 3)
 
         scroll = QScrollArea()
@@ -835,7 +843,19 @@ class ScalogramExplorer(QWidget):
         parts.append(f"channels {self._fmt_bytes(self._channels_bytes)}")
         flo, fhi = self.scalo_plot.band_hz()
         parts.append(f"band {flo:.2f}–{fhi:.2f} Hz")
-        self._status_lbl.setText("   ·   ".join(parts))
+        text = "   ·   ".join(parts)
+        self._status_lbl.setText(text)
+        if self._status_relay is not None:
+            self._status_relay.setText(text)
+
+    def set_status_relay(self, label) -> None:
+        """Mirror the status line into a host-supplied QLabel (the live surface's
+        top strip). The direct reference matters: ``_set_phase(paint=True)`` force-
+        repaints this label so a 'computing…' phase shows *during* the blocking
+        GUI-thread step, which a queued signal could not do. Pushes the current
+        text immediately so the host is not blank until the next state change."""
+        self._status_relay = label
+        self._update_status()
 
     def _set_phase(self, phase: str, *, paint: bool = False) -> None:
         """Set the current-activity string and refresh the line. ``paint=True``
@@ -843,8 +863,15 @@ class ScalogramExplorer(QWidget):
         GUI-thread step so the label shows the step *while* it stalls."""
         self._phase = phase
         self._update_status()
-        if paint and hasattr(self, "_status_lbl"):
-            self._status_lbl.repaint()
+        if paint:
+            # Force a synchronous repaint of whichever label is actually visible so
+            # the phase shows *while* the blocking step that follows stalls the
+            # event loop. The relay (when hosted) is the one on screen.
+            target = self._status_relay
+            if target is None and hasattr(self, "_status_lbl"):
+                target = self._status_lbl
+            if target is not None:
+                target.repaint()
 
     def _settle_phase(self):
         """Return the line to a resting state -- but never stomp a build that is

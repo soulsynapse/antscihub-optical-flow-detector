@@ -21,13 +21,18 @@ independent (a future optimization, not needed now). See the branch plan.
 """
 from __future__ import annotations
 
+import time
+from dataclasses import replace
+
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout,
                              QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
-from core.channel_source import live_channel_source
+from core.channel_source import (LIVE_CHANNELS, live_channel_source,
+                                 reduce_channel_data)
 from core.config import FlowConfig, PipelineConfig, PreprocessConfig
+from core.replicates import build_layout
 from core.detection import detect_channel_region
 from core.video import VideoSource
 from core.wavelet import default_freqs
@@ -45,6 +50,7 @@ class _LiveExtractWorker(QThread):
     knobs mid-drag."""
     done = pyqtSignal(object)       # ChannelData
     failed = pyqtSignal(str)
+    progress = pyqtSignal(int, int)  # (frames done, total) during extraction
 
     def __init__(self, video_path, cfg, replicates, start, n, dims, parent=None):
         super().__init__(parent)
@@ -54,8 +60,10 @@ class _LiveExtractWorker(QThread):
         video_path, cfg, reps, start, n, dims = self._args
         w, h, fps, fc = dims
         try:
-            cd = live_channel_source(video_path, cfg, reps, start=start, n=n,
-                                     width=w, height=h, fps=fps, frame_count=fc)
+            cd = live_channel_source(
+                video_path, cfg, reps, start=start, n=n,
+                width=w, height=h, fps=fps, frame_count=fc,
+                progress=lambda d, t: self.progress.emit(d, t))
             self.done.emit(cd)
         except Exception as e:                     # surface any extraction error
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -67,6 +75,8 @@ class _ProcessWorker(QThread):
     detection track. This is the one expensive pass, paid after tuning."""
     done = pyqtSignal(object)       # DetectionResult
     failed = pyqtSignal(str)
+    progress = pyqtSignal(int, int)  # (frames done, total) during the extract phase
+    phase = pyqtSignal(str)          # a coarse phase change (e.g. detection start)
 
     def __init__(self, video_path, cfg, replicates, dims, region_index, params,
                  parent=None):
@@ -77,8 +87,14 @@ class _ProcessWorker(QThread):
         video_path, cfg, reps, dims, region_index, params = self._args
         w, h, fps, fc = dims
         try:
-            cd = live_channel_source(video_path, cfg, reps, start=0, n=None,
-                                     width=w, height=h, fps=fps, frame_count=fc)
+            cd = live_channel_source(
+                video_path, cfg, reps, start=0, n=None,
+                width=w, height=h, fps=fps, frame_count=fc,
+                progress=lambda d, t: self.progress.emit(d, t))
+            # Extraction (the whole-clip per-pixel tensor stream) is done; the band
+            # power + gate that follow are a much smaller slice of the wall time,
+            # but the phase note keeps the status honest across the handoff.
+            self.phase.emit("running detector")
             res = detect_channel_region(
                 cd, region_index, params["channel_attr"],
                 freqs=default_freqs(fps), freq_band_hz=params["freq_band_hz"],
@@ -108,6 +124,22 @@ class LiveScalogramSurface(QWidget):
         self._worker: _LiveExtractWorker | None = None
         self._proc_worker: _ProcessWorker | None = None
         self._pending_state: dict | None = None
+        # Progress-readout timing/context, set when each pass starts.
+        self._extract_t0 = 0.0
+        self._extract_ctx = ""
+        self._proc_t0 = 0.0
+        self._proc_ctx = ""
+        # Pixel-level (block_size=1) channel cache for the current window: a Block
+        # change re-reduces this instead of re-extracting (the per-pixel tensor
+        # solve is block independent). Keyed by everything upstream of the block:
+        # window (start, n), downsample, normalize. None when the per-pixel
+        # footprint would exceed the budget (then Block falls back to re-extract).
+        self._pp: object | None = None
+        self._pp_key: tuple | None = None
+        self._pp_budget = 2 * 1024 ** 3
+        self._pending_pp = False        # is the running extract building a cache?
+        self._pending_key: tuple | None = None
+        self._pending_cfg: PipelineConfig | None = None
 
         # Coalesce rapid knob edits into a single re-extract on settle. Created
         # before the strip because the controls connect to it.
@@ -115,6 +147,13 @@ class LiveScalogramSurface(QWidget):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(500)
         self._debounce.timeout.connect(self.extract)
+
+        # Block changes re-reduce the cached per-pixel channels (fast), so they get
+        # their own shorter-settle handler distinct from the re-extract debounce.
+        self._block_debounce = QTimer(self)
+        self._block_debounce.setSingleShot(True)
+        self._block_debounce.setInterval(250)
+        self._block_debounce.timeout.connect(self._on_block_changed)
 
         root = QVBoxLayout(self)
         root.addWidget(self._build_strip(cfg))
@@ -181,8 +220,9 @@ class LiveScalogramSurface(QWidget):
         self.block_spin.setValue(int(cfg.flow.block_size))
         self.block_spin.setToolTip(
             "Pixels per block. Sets the scalogram grid (and cube memory); the "
-            "per-pixel tensor solve is block-size independent.")
-        self.block_spin.valueChanged.connect(self._debounce.start)
+            "per-pixel tensor solve is block-size independent, so a change here "
+            "re-reduces the cached pixels instead of re-extracting.")
+        self.block_spin.valueChanged.connect(self._block_debounce.start)
         row.addWidget(self.block_spin)
 
         row.addWidget(QLabel("Normalize"))
@@ -196,7 +236,26 @@ class LiveScalogramSurface(QWidget):
         self.norm_combo.currentTextChanged.connect(self._debounce.start)
         row.addWidget(self.norm_combo)
 
-        row.addStretch(1)
+        # Two stacked, right-aligned status lines sit inline to the left of the
+        # action buttons and take the row's slack: the extract / whole-video
+        # compute on top, and the hosted explorer's graph-compute line just below
+        # it. Darker orange + larger so they read against the light control strip.
+        status_css = ("color:#c2691a; font-family:Consolas; font-size:12px; "
+                      "font-weight:600;")
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet(status_css)
+        self.status_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.graph_status_lbl = QLabel("")
+        self.graph_status_lbl.setStyleSheet(status_css)
+        self.graph_status_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        statuscol = QVBoxLayout()
+        statuscol.setSpacing(1)
+        statuscol.addWidget(self.status_lbl)
+        statuscol.addWidget(self.graph_status_lbl)
+        row.addLayout(statuscol, 1)
+        row.addSpacing(8)
         self.extract_btn = QPushButton("Extract")
         self.extract_btn.clicked.connect(self.extract)
         row.addWidget(self.extract_btn)
@@ -207,11 +266,6 @@ class LiveScalogramSurface(QWidget):
         self.process_btn.clicked.connect(self.process_whole_video)
         row.addWidget(self.process_btn)
         outer.addLayout(row)
-
-        self.status_lbl = QLabel("")
-        self.status_lbl.setStyleSheet(
-            "color:#e0a94a; font-family:Consolas; font-size:11px;")
-        outer.addWidget(self.status_lbl)
 
         self._sync_window_label()
         # denoise is deliberately absent: it is stateful from frame zero and
@@ -255,25 +309,97 @@ class LiveScalogramSurface(QWidget):
         cfg = self._build_cfg()
         if self._explorer is not None:
             self._pending_state = self._explorer.capture_view_state()
+        # Extract at pixel level (block=1) when the per-pixel footprint fits, so a
+        # later Block change is a cheap re-reduce; over budget, extract directly at
+        # the block (no cache, Block falls back to re-extract).
+        fits = self._perpixel_fits(cfg, n)
+        self._pending_pp = fits
+        self._pending_key = self._pp_signature(cfg, start, n) if fits else None
+        self._pending_cfg = cfg
+        extract_cfg = self._cfg_block1(cfg) if fits else cfg
         self.extract_btn.setEnabled(False)
+        self._extract_t0 = time.monotonic()
+        self._extract_ctx = (f"block {cfg.flow.block_size}, "
+                             f"norm {cfg.preprocess.normalize}")
         self.status_lbl.setText(
             f"extracting {n} frames from {start / self.fps:.2f} s "
-            f"(block {cfg.flow.block_size}, norm {cfg.preprocess.normalize})…")
+            f"({self._extract_ctx})…")
         self._worker = _LiveExtractWorker(
-            self.video_path, cfg, self.replicates, start, n, self._dims, self)
+            self.video_path, extract_cfg, self.replicates, start, n,
+            self._dims, self)
         self._worker.done.connect(self._on_extracted)
         self._worker.failed.connect(self._on_failed)
+        self._worker.progress.connect(self._on_extract_progress)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
+
+    def _on_extract_progress(self, done: int, total: int):
+        if self._worker is None:
+            return
+        pct = 100.0 * done / max(1, total)
+        self.status_lbl.setText(
+            f"extracting… {done}/{total} frames ({pct:.0f}%) · "
+            f"{self._extract_ctx}{self._eta(done, total, self._extract_t0)}")
 
     def _on_extracted(self, cd):
         self._worker = None
         self.extract_btn.setEnabled(True)
+        cfg = self._pending_cfg or self._build_cfg()
+        if self._pending_pp:                         # cd is the block=1 pixel cache
+            self._pp = cd
+            self._pp_key = self._pending_key
+            display = reduce_channel_data(cd, cfg, self.replicates)
+        else:
+            self._pp = None
+            self._pp_key = None
+            display = cd
+        self._show_channel_data(display)
+
+    def _show_channel_data(self, cd):
         approx = " · approximated" if cd.approximated else ""
         self.status_lbl.setText(
             f"window {cd.window_start / self.fps:.2f} s · {cd.n_frames} frames · "
             f"{cd.meta['grid'][0]}×{cd.meta['grid'][1]} blocks{approx}")
         self._swap_explorer(cd)
+
+    # -- pixel-cache helpers -------------------------------------------------
+    def _pp_signature(self, cfg: PipelineConfig, start: int, n: int) -> tuple:
+        """Everything upstream of the block size: a change here invalidates the
+        cached per-pixel channels, a Block change does not."""
+        scale = cfg.preprocess.resolve_downsample(self._dims[0])
+        return (start, n, round(float(scale), 6), cfg.preprocess.normalize)
+
+    def _perpixel_fits(self, cfg: PipelineConfig, n: int) -> bool:
+        w, h = self._dims[0], self._dims[1]
+        scale = cfg.preprocess.resolve_downsample(w)
+        ny, nx = build_layout(self.replicates, w, h, scale, 1).atlas_grid
+        return n * ny * nx * len(LIVE_CHANNELS) * 4 <= self._pp_budget
+
+    @staticmethod
+    def _cfg_block1(cfg: PipelineConfig) -> PipelineConfig:
+        return replace(cfg, flow=replace(cfg.flow, block_size=1))
+
+    def _on_block_changed(self):
+        """Block changed: re-reduce the cached pixel channels (instant) if they
+        cover this window, else fall back to a full (block=1) extract."""
+        if self._worker is not None or self._proc_worker is not None:
+            return
+        self._block_debounce.stop()
+        start, n = self._window()
+        if n < 2:
+            self.status_lbl.setText("window too short at this start position")
+            return
+        cfg = self._build_cfg()
+        if self._pp is not None and self._pp_key == self._pp_signature(cfg, start, n):
+            if self._explorer is not None:
+                self._pending_state = self._explorer.capture_view_state()
+            self.status_lbl.setText(
+                f"re-reducing to block {cfg.flow.block_size} — no re-extract…")
+            self.status_lbl.repaint()
+            self._show_channel_data(
+                reduce_channel_data(self._pp, cfg, self.replicates))
+        else:
+            self.extract()
 
     def _on_failed(self, msg: str):
         self._worker = None
@@ -287,9 +413,14 @@ class LiveScalogramSurface(QWidget):
             self._placeholder = None
         old = self._explorer
         new = ScalogramExplorer.from_channel_data(
-            cd, video_path=self.video_path, own_shortcuts=False, parent=self._host)
+            cd, video_path=self.video_path, own_shortcuts=False,
+            own_status=False, parent=self._host)
         self._host_lay.addWidget(new)
         self._explorer = new
+        # The explorer no longer renders its own status line; mirror it into the
+        # strip's second orange line. A direct relay (not a signal) so the
+        # explorer can force a synchronous repaint of it before blocking work.
+        new.set_status_relay(self.graph_status_lbl)
         if self._pending_state is not None:
             new.apply_view_state(self._pending_state)
             self._pending_state = None
@@ -313,17 +444,35 @@ class LiveScalogramSurface(QWidget):
         self.process_btn.setEnabled(False)
         self.extract_btn.setEnabled(False)
         flo, fhi = params["freq_band_hz"]
+        self._proc_t0 = time.monotonic()
+        self._proc_ctx = (f"{flo:.2f}–{fhi:.2f} Hz on {params['channel_attr']}")
         self.status_lbl.setText(
             f"processing whole video ({self.frame_count} frames) · "
-            f"{flo:.2f}–{fhi:.2f} Hz on {params['channel_attr']}… this is the "
-            f"one expensive pass")
+            f"{self._proc_ctx}… starting the one expensive pass")
         self._proc_worker = _ProcessWorker(
             self.video_path, cfg, self.replicates, self._dims,
             params["region_index"], params, self)
         self._proc_worker.done.connect(self._on_processed)
         self._proc_worker.failed.connect(self._on_process_failed)
+        self._proc_worker.progress.connect(self._on_proc_progress)
+        self._proc_worker.phase.connect(self._on_proc_phase)
         self._proc_worker.finished.connect(self._proc_worker.deleteLater)
         self._proc_worker.start()
+
+    def _on_proc_progress(self, done: int, total: int):
+        if self._proc_worker is None:
+            return
+        pct = 100.0 * done / max(1, total)
+        self.status_lbl.setText(
+            f"processing whole video · extracting {done}/{total} frames "
+            f"({pct:.0f}%) · {self._proc_ctx}"
+            f"{self._eta(done, total, self._proc_t0)}")
+
+    def _on_proc_phase(self, phase: str):
+        if self._proc_worker is None:
+            return
+        self.status_lbl.setText(
+            f"processing whole video · {phase} · {self._proc_ctx}…")
 
     def _on_processed(self, res):
         self._proc_worker = None
@@ -341,6 +490,20 @@ class LiveScalogramSurface(QWidget):
         self.process_btn.setEnabled(True)
         self.extract_btn.setEnabled(True)
         self.status_lbl.setText(f"process failed: {msg}")
+
+    @staticmethod
+    def _eta(done: int, total: int, t0: float) -> str:
+        """A ' · ~Ns left' / ' · ~N.N min left' suffix from the rate so far. Empty
+        until a frame has landed so the estimate is not division-by-zero noise."""
+        if done <= 0 or total <= done:
+            return ""
+        elapsed = time.monotonic() - t0
+        if elapsed <= 0:
+            return ""
+        remaining = (total - done) * elapsed / done
+        if remaining < 90:
+            return f" · ~{remaining:.0f}s left"
+        return f" · ~{remaining / 60:.1f} min left"
 
     def _focus_frame(self, center: int):
         """A detection was chosen: load a window centered on it for verification."""

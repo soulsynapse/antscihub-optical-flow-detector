@@ -25,7 +25,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from core.replicates import build_layout
-from core.tensor_channels import extract_channels_live, load_or_extract_channels
+from core.tensor_channels import (_tiles_from_meta, extract_channels_live,
+                                  load_or_extract_channels)
 from core.video import VideoSource
 
 # Channels a live (cacheless) source provides, in the explorer's UI order. All are
@@ -131,3 +132,76 @@ def live_channel_source(video_path: str, cfg, replicates: list[dict], *,
     channels = {k: np.asarray(res[k], np.float32) for k in LIVE_CHANNELS}
     return ChannelData(meta=meta, channels=channels, window_start=wstart,
                        approximated=bool(res["meta"].get("approximated", False)))
+
+
+def _reduce_stack(field: np.ndarray, block: int, th: int, tw: int) -> np.ndarray:
+    """Batched block-mean of a ``(T, H, W)`` per-pixel field to ``(T, th, tw)``.
+
+    Numerically identical to ``tensor_channels._reduce`` (include_partial nan-mean
+    then crop/pad to the tile's atlas shape) but reduces the whole time axis in one
+    vectorized pass instead of frame-by-frame. Partial edge cells always hold at
+    least one real pixel, so no all-NaN mean arises."""
+    n = field.shape[0]
+    if block <= 1:
+        red = field.astype(np.float32, copy=False)
+        ny, nx = field.shape[1], field.shape[2]
+    else:
+        hh, ww = field.shape[1], field.shape[2]
+        ny = (hh + block - 1) // block
+        nx = (ww + block - 1) // block
+        x = field.astype(np.float32, copy=False)
+        ph, pw = ny * block - hh, nx * block - ww
+        if ph or pw:
+            x = np.pad(x, ((0, 0), (0, ph), (0, pw)), constant_values=np.nan)
+        x = x.reshape(n, ny, block, nx, block).transpose(0, 1, 3, 2, 4)
+        x = x.reshape(n, ny, nx, block * block)
+        red = np.nanmean(x, axis=3, dtype=np.float32).astype(np.float32)
+    if (ny, nx) == (th, tw):
+        return red
+    out = np.zeros((n, th, tw), np.float32)         # geometry drift: crop/pad
+    yy, xx = min(th, ny), min(tw, nx)
+    out[:, :yy, :xx] = red[:, :yy, :xx]
+    return out
+
+
+def reduce_channel_data(pp: ChannelData, cfg, replicates: list[dict]
+                        ) -> ChannelData:
+    """Re-reduce a pixel-level (``block_size=1``) live ChannelData to the block grid
+    in ``cfg`` WITHOUT re-extracting.
+
+    The per-pixel structure-tensor solve is block-size independent, so a Block
+    change is only the cheap block-mean over already-extracted per-pixel fields.
+    The result is identical block-for-block to a fresh ``live_channel_source`` at
+    that block (the block=1 atlas stores the exact working-resolution field, and
+    reducing it is the same nan-mean the extractor would have run)."""
+    src = pp.meta
+    if int(src.get("block_size", 0)) != 1:
+        raise ValueError("reduce_channel_data expects a block_size=1 source")
+    block = int(cfg.flow.block_size)
+    if block <= 1:
+        return pp                                    # already pixel-level
+    w, h = int(src["src_width"]), int(src["src_height"])
+    fps = float(src["fps"])
+    n = int(src["n_frames"])
+    ws = int(getattr(pp, "window_start", src.get("window_start", 0)))
+    meta_n = synth_live_meta(src["video_path"], cfg, replicates, width=w, height=h,
+                             fps=fps, frame_count=n)
+    ny_a, nx_a = map(int, meta_n["grid"])
+    # Both tile lists come from build_layout over the same replicates (sorted by
+    # id), so they align by position: block=1 pixel regions -> block-N atlas cells.
+    src_tiles = _tiles_from_meta(src)
+    dst_tiles = _tiles_from_meta(meta_n)
+    channels = {}
+    for name, arr in pp.channels.items():
+        arr = np.asarray(arr, np.float32)
+        out = np.zeros((n, ny_a, nx_a), np.float32)
+        for st, dt in zip(src_tiles, dst_tiles):
+            sy0, sx0, sy1, sx1 = st["atlas_bbox"]
+            dy0, dx0, dy1, dx1 = dt["atlas_bbox"]
+            field = arr[:, sy0:sy1, sx0:sx1]
+            out[:, dy0:dy1, dx0:dx1] = _reduce_stack(field, block,
+                                                     dy1 - dy0, dx1 - dx0)
+        channels[name] = out
+    meta = {**meta_n, "n_frames": n, "window_start": ws}
+    return ChannelData(meta=meta, channels=channels, window_start=ws,
+                       approximated=pp.approximated)
