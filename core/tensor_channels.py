@@ -35,7 +35,7 @@ from core.preprocess import Preprocessor
 from core.structure_tensor import (flow_from_tensor, spatial_min_eigen,
                                    tensor_products)
 from core.timing import Timer
-from core.video import VideoSource, prefetch
+from core.video import ReplicateVideoSource, VideoSource, prefetch
 
 CHANNELS = ("intensity", "change", "appearance", "texture", "tensor_speed")
 CHANNEL_VERSION = 3     # bump when the extraction math changes (sidecar key)
@@ -67,6 +67,74 @@ def _tiles_from_meta(meta: dict) -> list[dict]:
             "work_height": int(t.get("work_height", (y1 - y0) * int(meta["block_size"]))),
         })
     return tiles
+
+
+class _MetaTile:
+    """The four attributes ``ReplicateVideoSource`` reads off a tile.
+
+    ``_tiles_from_meta`` yields dicts (it also has to serve a whole-frame
+    fallback that no real ``ReplicateLayout`` can express), so the ROI decoder
+    gets this adapter rather than a reconstructed ``ReplicateTile`` -- there is
+    no layout to rebuild here, only geometry that meta already carries.
+    """
+
+    __slots__ = ("replicate_id", "source_box", "work_width", "work_height")
+
+    def __init__(self, key: int, t: dict):
+        self.replicate_id = key
+        self.source_box = t["source_box"]
+        self.work_width = t["work_width"]
+        self.work_height = t["work_height"]
+
+
+class _MetaLayout:
+    def __init__(self, tiles: list[_MetaTile]):
+        self.tiles = tiles
+
+
+def _roi_layout(tiles: list[dict]) -> _MetaLayout:
+    """Adapt meta tiles for the ROI decoder, keyed by list position.
+
+    Position, not ``t["id"]``: the whole-frame fallback tile has id ``None``,
+    and ``crop`` keys with ``int(...)``. The caller pairs a tile with its atlas
+    slot by position anyway, so this cannot drift.
+    """
+    return _MetaLayout([_MetaTile(i, t) for i, t in enumerate(tiles)])
+
+
+def _open_roi(video_path: str, tiles: list[dict], first: int, count: int,
+              fps: float):
+    """``(decoder, frame_iter)`` for the FFmpeg ROI path, or ``(None, None)``.
+
+    The first frame is pulled here rather than in the loop so a decoder that
+    builds fine but fails on contact -- a filter graph FFmpeg rejects, a codec it
+    cannot seek -- falls back to full-frame decode instead of killing the pass.
+    Only construction is guarded in the pipeline's copy of this; the live surface
+    starts a pass on every knob edit, so a hard failure there is far more costly.
+    """
+    try:
+        roi = ReplicateVideoSource(video_path, _roi_layout(tiles), count,
+                                   start=first, fps=fps)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return None, None
+
+    inner = roi.iter_frames()
+    try:
+        head = next(inner)
+    except (StopIteration, OSError, RuntimeError, ValueError):
+        # StopIteration included deliberately: a decoder that yields nothing is
+        # as useless as one that raises, and both should fall back rather than
+        # hand the caller an empty pass.
+        roi.release()
+        return None, None
+
+    def frames():
+        # A generator, not itertools.chain, so close() propagates through the
+        # yield from and shuts the FFmpeg reader down -- prefetch relies on that.
+        yield head
+        yield from inner
+
+    return roi, frames()
 
 
 def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
@@ -135,8 +203,11 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
 
     tm = Timer("extract_channels")
     done = 0            # stored frames, so a cancelled pass can report how far it got
-    src = VideoSource(video_path)
-    frames = None
+    # ROI decode first: FFmpeg crops, greyscales and downsamples each replicate
+    # box in its own process, so the ~92% of a 5.3K frame no replicate owns never
+    # crosses into Python. Falls back to full-frame OpenCV when unavailable.
+    roi, frames = _open_roi(video_path, tiles, first, count, fps)
+    src = None if roi is not None else VideoSource(video_path)
     try:
         # The decode is driven by hand rather than with a plain ``for`` so the
         # generator's own work (seek + read + colour convert) lands in its own span
@@ -144,7 +215,8 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
         # that decode runs on its own thread, so the span now measures how long
         # this loop *waits* for a frame -- near zero when the overlap is working,
         # and still the honest number when decode is the bottleneck.
-        frames = prefetch(src.iter_frames(first, count))
+        frames = prefetch(frames if roi is not None
+                          else src.iter_frames(first, count))
         while True:
             with tm.span("decode"):
                 nxt = next(frames, None)
@@ -152,12 +224,19 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                 break
             i, frame = nxt
             oi = i - start                     # <0 for the seed frame (not stored)
-            for t in tiles:
+            for ti, t in enumerate(tiles):
                 rid = t["id"]
                 x0, y0, x1, y1 = t["source_box"]
                 ay0, ax0, ay1, ax1 = t["atlas_bbox"]
                 with tm.span("preprocess"):
-                    g = pres[rid].apply(frame[y0:y1, x0:x1])
+                    # On the ROI path the crop is already gray and already at the
+                    # tile's work size, so Preprocessor's downsample/grayscale
+                    # steps collapse to no-ops and the remaining steps (normalize,
+                    # mask, ...) run on identical input. Same geometry either way,
+                    # because both derive it from the same source_box and scale.
+                    owned = (roi.crop(frame, ti) if roi is not None
+                             else frame[y0:y1, x0:x1])
+                    g = pres[rid].apply(owned)
                 th, tw = ay1 - ay0, ax1 - ax0
 
                 gp = prev_g[rid]
@@ -225,7 +304,7 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
             if frames is not None:
                 frames.close()
         finally:
-            src.release()
+            (src if src is not None else roi).release()
         # Logged from the finally so a pass cancelled mid-stream still reports its
         # spans. A knob edit supersedes the running extraction by raising inside
         # the progress callback, so during tuning -- exactly when these numbers are

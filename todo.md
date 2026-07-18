@@ -228,6 +228,62 @@ retention). Do last.
   The `DEFAULT_TARGET_WIDTH` sweep is still unrun and still the right way to
   price the replicate-aware-downsample correctness gap.
 
+- **ROI decode on the live path — done.** `ReplicateVideoSource` now serves the
+  tensor path, not just `core/pipeline.py`. Two additions made it usable there:
+  a windowed `start=` (input `-ss`, absolute frame indices out) and a first-frame
+  probe in `_open_roi` so a decoder that builds but fails on contact falls back
+  to full-frame instead of killing the pass. `_MetaTile`/`_roi_layout` adapt the
+  meta tile dicts, keyed by list position because the whole-frame fallback tile
+  has `id=None`.
+
+  **Measured, same clip/replicates as the prefetch A/B above** (5312x2988, 479
+  frames, 7 replicates, scale 0.245):
+
+  - full-frame: **10.41 s** — decode 35% · preprocess 27% · block_reduce 19%
+  - ROI decode: **4.10 s** — block_reduce 31% · decode 22% · tensor_blur 11%
+
+  **2.54x.** decode+preprocess went 63% → 27%, exactly the span the note above
+  predicted this would subsume. The pass is now ~5x faster than realtime; at the
+  start of Batch C it was 1.7x *slower*. Small clip (462x456, scale 1.0, nothing
+  to crop): 8.43 s → 7.78 s, no regression. **`block_reduce` is now the largest
+  span** and is the next lever if throughput still matters.
+
+  **It is also more accurate than what it replaced, which was not expected.**
+  Three-way comparison against a float32 reference (gray in float, resize in
+  float, no uint8 round trip), gate disagreement averaged over 7 regions x 3
+  thresholds: roi-vs-full **8.07%**, full-vs-reference **7.36%**, roi-vs-reference
+  **2.37%**. So the ~8% the two decoders disagree by is mostly the *existing*
+  full-frame path's own quantization error, and the ROI path is ~3x closer to
+  ground truth. Two reasons: output is `gray16le`, so area-averaging a 4x4 patch
+  of 8-bit samples is not re-rounded to 8 bits (0.528 → 0.364 grey-levels RMS);
+  and at scale 1.0 FFmpeg reads the luma plane directly where OpenCV round-trips
+  yuv420p → BGR → gray (0.69 RMS + 1.28 bias).
+  **The `format=gray16le` must come AFTER `scale` in the filter graph** — before
+  it, swscale converts first and scales a gray16 input, measuring 3.80 RMS, far
+  worse than plain 8-bit. That ordering is load-bearing and easy to "tidy" wrong.
+
+  Seek verified frame-accurate at 0/1/7/100/373/1000/5000/11000 on both a 23.976
+  and a 59.94 fps clip. Cancel re-stress-tested at 7 cut points: no lingering
+  threads, no orphaned ffmpeg processes, clean pass afterwards.
+
+  Review fixes applied: **the seek divided the frame index by a caller-supplied
+  fps, so a rounded value shifted the window** — 24.0 for 24000/1001 lands 3
+  frames early by frame 11000, silently; the container's own rate is now read and
+  overrides anything passed in (regression test confirmed to fail against the old
+  behaviour). Also: `Preprocessor._downsample` skips the resize when the input is
+  already at target size (the ROI path made it a 610 us/tile/frame no-op, verified
+  bit-identical); merged duplicated except clauses. New
+  `tests/test_replicate_video_source.py` (11 tests) — this decoder had **no**
+  coverage at all despite `core/pipeline.py` already depending on it.
+
+  **Two things left open, deliberately.** (1) Only the *first* frame is probed,
+  so an FFmpeg failure at frame 9000 of a whole-video commit still kills the pass
+  rather than falling back — a mid-stream retry needs `prev_g` and the partial
+  output arrays reset, which is its own change. (2) The flow cache key does not
+  include the decoder or its bit depth, so **caches built before this change must
+  be rebuilt before comparing detection results across it** — the numbers moved
+  for a good reason but the key does not know that.
+
 - **Then: Batch D/E** if perceived UI lag matters more than throughput.
 
 ### Shelved (todo 8, 9)

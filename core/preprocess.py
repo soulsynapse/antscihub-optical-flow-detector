@@ -113,6 +113,13 @@ class Preprocessor:
     def _downsample(self, bgr: np.ndarray) -> np.ndarray:
         if self.scale >= 1.0:
             return bgr
+        if bgr.shape[:2] == (self.height, self.width):
+            # Already at the target size: the ROI decoder scales inside FFmpeg,
+            # so this would be a resize to the size it already is. INTER_AREA at
+            # scale 1 is bit-identical to its input (verified), so skipping is
+            # free of any numerical change -- and it is not free to run: 610 us
+            # per call on a 760x730 tile, once per replicate per frame.
+            return bgr
         # INTER_AREA is the correct choice for shrinking: it area-averages, which
         # low-pass filters before decimating. INTER_LINEAR would alias high
         # spatial frequencies into the flow field.
