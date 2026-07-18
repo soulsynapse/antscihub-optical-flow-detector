@@ -17,6 +17,7 @@ from gui.state import AppState
 from gui.tab1_flow import Tab1Flow
 from gui.tab2_replicates import Tab2Replicates
 from gui.tab3_behavior import Tab3Behavior
+from gui.tab_live_preprocess import TabLivePreprocess
 
 
 class MainWindow(QMainWindow):
@@ -32,13 +33,18 @@ class MainWindow(QMainWindow):
         self.tab1 = Tab1Flow(self.state)
         self.tab2 = Tab2Replicates(self.state)
         self.tab3 = Tab3Behavior(self.state)
+        self.tab_live = TabLivePreprocess(self.state)
+        # Tensor path primary: live preprocessing is the main surface; the flow
+        # pass is demoted to an optional commit step. Tab indices: 0 Replicates,
+        # 1 Live preprocessing, 2 Flow commit, 3 Behavior.
         self.tabs.addTab(self.tab2, "1 · Replicates")
-        self.tabs.addTab(self.tab1, "2 · Preprocessing && Flow")
-        self.tabs.addTab(self.tab3, "3 · Behavior Classification")
+        self.tabs.addTab(self.tab_live, "2 · Preprocessing (live)")
+        self.tabs.addTab(self.tab1, "3 · Flow cache (commit)")
+        self.tabs.addTab(self.tab3, "4 · Behavior Classification")
         self.setCentralWidget(self.tabs)
 
         # Replicates must be defined before flow. Behavior needs a cache.
-        self.tabs.setTabEnabled(2, False)
+        self.tabs.setTabEnabled(3, False)
 
         self.status = QLabel("Open a video to begin.")
         self.statusBar().addWidget(self.status)
@@ -88,6 +94,7 @@ class MainWindow(QMainWindow):
         sc("Ctrl+1", lambda: self.tabs.setCurrentIndex(0))
         sc("Ctrl+2", lambda: self.tabs.setCurrentIndex(1))
         sc("Ctrl+3", lambda: self.tabs.setCurrentIndex(2))
+        sc("Ctrl+4", lambda: self.tabs.setCurrentIndex(3))
 
     def _toggle_play(self):
         # Prefer the video the user actually clicked. Both VideoPanel and the
@@ -101,7 +108,7 @@ class MainWindow(QMainWindow):
                 return
             widget = widget.parentWidget()
 
-        panel = {0: self.tab2.video, 2: self.tab3.video}.get(
+        panel = {0: self.tab2.video, 3: self.tab3.video}.get(
             self.tabs.currentIndex())
         if panel:
             panel.toggle_playback()
@@ -118,15 +125,17 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Could not open video", str(e))
 
     def _on_cache_opened(self):
-        self.tabs.setTabEnabled(0, True)
-        self.tabs.setTabEnabled(1, True)
-        self.tabs.setTabEnabled(2, True)
+        for i in range(4):
+            self.tabs.setTabEnabled(i, True)
 
     def _on_video_loaded(self):
         # ROI-first workflow: draw/import ownership boxes before processing.
+        # Live preprocessing (1) and the flow commit (2) open with the video;
+        # Behavior (3) still needs a completed cache.
         self.tabs.setTabEnabled(0, True)
         self.tabs.setTabEnabled(1, True)
-        self.tabs.setTabEnabled(2, False)
+        self.tabs.setTabEnabled(2, True)
+        self.tabs.setTabEnabled(3, False)
         self.tabs.setCurrentIndex(0)
 
     def _about(self):

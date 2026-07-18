@@ -209,12 +209,15 @@ class ScalogramExplorer(QWidget):
 
     def __init__(self, cache=None, video_path: str | None = None, *,
                  state=None, sidecar_path: str | None = None,
-                 channel_data=None, parent=None):
+                 channel_data=None, own_shortcuts: bool = True, parent=None):
         super().__init__(parent)
         if state is not None and cache is None and channel_data is None:
             cache = state.cache
         self.state = state
         self.cache = cache
+        # When embedded in a host that owns Space (the live surface / main
+        # window), skip our own Space shortcut so the two do not fight over it.
+        self._own_shortcuts = own_shortcuts
 
         # Source of geometry + channels. A ChannelData decouples us from the
         # cache: it comes either from an open cache (all five channels) or a live
@@ -324,7 +327,7 @@ class ScalogramExplorer(QWidget):
         if self._event_filter_app is not None:
             self._event_filter_app.installEventFilter(self)
         self._space_shortcut = None
-        if state is None:
+        if state is None and self._own_shortcuts:
             self._space_shortcut = QShortcut(
                 QKeySequence(Qt.Key.Key_Space.value), self)
             self._space_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -349,12 +352,50 @@ class ScalogramExplorer(QWidget):
 
     @classmethod
     def from_channel_data(cls, channel_data, video_path: str | None = None,
+                          own_shortcuts: bool = True,
                           parent=None) -> "ScalogramExplorer":
         """Standalone explorer over a ChannelData (e.g. a live windowed source),
         decoding its own video for the overlay."""
         return cls(channel_data=channel_data,
                    video_path=video_path or channel_data.meta.get("video_path"),
-                   parent=parent)
+                   own_shortcuts=own_shortcuts, parent=parent)
+
+    # -- view-state carry-over (survives a live re-extract rebuild) ----------
+    def capture_view_state(self) -> dict:
+        """The tuning context worth preserving when the live surface rebuilds this
+        explorer with a fresh ChannelData: which channel, where the cursor and
+        detection window are, and the frequency band you dragged."""
+        return {
+            "channel": self.channel,
+            "frame": self.frame,
+            "sweep_win": self.sweep_win,
+            "centered": self.centered,
+            "freq_band": (self.scalo_plot.band_lo, self.scalo_plot.band_hi),
+        }
+
+    def apply_view_state(self, st: dict) -> None:
+        """Restore a captured view state onto this (freshly built) explorer."""
+        ch = st.get("channel")
+        if ch in self.chan_checks and self._channel_available(ch):
+            self.channel = ch
+            self.chan_checks[ch].setChecked(True)   # fires _on_channel_toggled
+        sw = st.get("sweep_win")
+        if sw:
+            self.sweep_win = max(1, min(max(2, self.T - 1), int(sw)))
+            self.sweep_win_slider.setValue(self.sweep_win)
+        if "centered" in st:
+            self.centered = bool(st["centered"])
+            self.centered_chk.setChecked(self.centered)
+        fb = st.get("freq_band")
+        if fb is not None:
+            self.scalo_plot.band_lo, self.scalo_plot.band_hi = fb
+            self.scalo_plot.set_band_active(True)
+            self.scalo_plot.update()
+        frame = st.get("frame")
+        if frame is not None:
+            self._apply_frame(int(frame))
+        if self.active_region_index >= 0:
+            self._on_freq_band_committed()
 
     # -- scope / geometry ----------------------------------------------------
     def _regions_for_index(self, idx: int) -> list[dict]:
