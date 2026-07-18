@@ -25,22 +25,32 @@ What it shows, and what it refuses to show
 * **No quality score.** Nothing here summarizes "how much worse" as one number.
   Every figure is measured wall clock, arithmetic storage, or a named setting.
 
-* The **empirical panel**: the tuned detector run at each candidate scale over
-  the loaded window, reporting the events it found and which of the reference
-  run's frames survived. This is where Batch K's "demonstrated per behaviour,
-  never assumed" becomes something a user executes in a minute rather than an
-  instruction they cannot act on. Without it the window argues feasibility much
-  harder than it argues sensitivity, and an asymmetric window biases toward
-  downsampling -- so it is not an optional extra, it is what makes the rest of
-  this window safe to show.
+* The **sweep**: a real extraction pass timed at each candidate scale, at the
+  block a production run would use, with the storage that setting costs beside
+  it. This is also what repairs the frontier -- the live surface tunes at
+  ``block_size=1`` and a model fitted there overstates a batch run by ~2.6x
+  (see ``model_block`` below), while the sweep's passes resolve the block the way
+  a batch run would.
 
-Running the sweep repairs the frontier as a side effect, which is deliberate: the
-live surface tunes at ``block_size=1`` and a model fitted there overstates a
-production run's cost (see ``model_block`` below), while the evidence passes
-resolve the block the way a batch run would. One sweep therefore buys both a
-sensitivity answer and a cost model in the right regime.
+What this window does NOT try to answer
+---------------------------------------
+Whether a coarser scale still *detects* your behaviour. An empirical detection
+panel briefly lived here -- the tuned detector run at each scale, reporting events
+kept and lost -- and it was removed as misleading rather than merely unhelpful.
+The value and count bands are absolute thresholds, and downsampling averages
+pixels before differencing, so per-block band power falls with scale and a fixed
+threshold catches less whether or not the behaviour is still resolved. Measured
+on real footage the loss was monotone with ZERO added frames at any scale, which
+is the signature of threshold drift, not of lost structure. A table that looks
+measured and does not mean what it appears to is exactly the withdrawn
+``sig_corr`` failure the plan warns against.
 
-Not yet built (see todo.md Batch M): the render-at-each-scale image panel and the
+Detectability is decided in the live surface and the whole-video pass, which is
+what they are for. This window prices the lever and states the consequence in
+prose; it does not pretend to have measured a sensitivity it cannot separate from
+a threshold artifact.
+
+Not built (see todo.md Batch M): the render-at-each-scale image panel and the
 draw-a-line calibration sub-tool (reading ``pixels_per_mm`` / ``body_length_mm``
 off the replicate dicts works today). The panels below are built as reusable
 components (``gui/cost_panels.py``) so Batch N's block-size sibling shares them
@@ -59,6 +69,7 @@ from core.cost_model import (CostModel, atlas_cells, boxes_from_tiles,
                              format_bytes, format_duration,
                              storage_bytes_per_hour,
                              working_px_per_body_length)
+from core.scale_sweep import storage_rises_below
 
 # The candidate scales offered, matching the approved layout. Not a continuous
 # slider: the decision is which point on the frontier to take, and a handful of
@@ -87,18 +98,16 @@ _WHY_NOT_ASSUMED = (
     "the cheapest scale."
 )
 
-_EVIDENCE_SCOPE = (
-    "<b>Evidence on THIS clip, THIS window and THIS behaviour — not a general "
-    "sensitivity guarantee.</b> Each row re-extracts the loaded window at that "
-    "scale and runs the detector you just tuned, unchanged. A scale that keeps "
-    "your events here has been shown to keep them <i>here</i>; it says nothing "
-    "about a different species, a different behaviour, a quieter animal, or a "
-    "clip shot at another distance. Note also what this cannot separate: the "
-    "value and count bands are absolute thresholds, and downsampling averages "
-    "pixels before differencing, so a lost event may mean the motion is no "
-    "longer resolved <i>or</i> that your threshold no longer sits where you put "
-    "it. Treat a row that loses frames as a reason to re-tune and re-check at "
-    "that scale, not as a settled result."
+_SWEEP_NOTE = (
+    "<b>Each row is a real extraction pass over the loaded window, timed on this "
+    "machine at the block a production run would use.</b> That is what makes the "
+    "curve above a measurement rather than an estimate — and the live tuning "
+    "surface cannot supply it, because it extracts at block 1 so that a Block "
+    "change can re-reduce instead of re-extract, which costs ~2.6× a production "
+    "pass. Storage is arithmetic over the real layout, not a measurement, so it "
+    "is exact. <b>These rows say what a scale COSTS, not whether it still "
+    "resolves your behaviour</b> — that is decided in the tuning surface and the "
+    "whole-video pass."
 )
 
 
@@ -134,15 +143,15 @@ class DownsampleDialog(QDialog):
     the window still opens (the frontier then reports it has nothing measured
     rather than inventing a curve).
 
-    The empirical sweep is NOT run here. This dialog owns no video, no decoder
-    and no detector settings -- it emits :attr:`evidence_requested` with the
-    scales to run and the owner (``gui/explorers/live_scalogram_surface.py``)
-    drives the passes off the GUI thread and feeds rows back through
-    :meth:`add_evidence`. That keeps the dialog free of threading and keeps every
-    panel in it reusable by Batch N's block-size sibling.
+    The sweep is NOT run here. This dialog owns no video and no decoder -- it
+    emits :attr:`sweep_requested` with the scales to time and the owner
+    (``gui/explorers/live_scalogram_surface.py``) drives the passes off the GUI
+    thread and feeds rows back through :meth:`add_sweep_row`. That keeps the
+    dialog free of threading and keeps every panel in it reusable by Batch N's
+    block-size sibling.
     """
-    evidence_requested = pyqtSignal(object)     # list[float] of scales to run
-    evidence_cancelled = pyqtSignal()
+    sweep_requested = pyqtSignal(object)        # list[float] of scales to time
+    sweep_cancelled = pyqtSignal()
 
     def __init__(self, replicates: list[dict], src_width: int, src_height: int,
                  fps: float, current_scale: float, model: CostModel | None,
@@ -173,14 +182,16 @@ class DownsampleDialog(QDialog):
         self._boxes_cache: list[tuple[int, int]] | None = None
         self._cells_cache: dict[tuple[float, int], int] = {}
 
-        # The reference row every other evidence row is read against, held so
-        # rows arriving one at a time can each be compared as they land.
-        self._evidence_ref = None
+        # The reference (full-resolution) pass, held so later rows can express
+        # their speedup against it as they land, and every completed pass so the
+        # table can be re-rendered against the final model when the sweep ends.
+        self._sweep_ref = None
+        self._sweep_rows: list = []
 
         root = QVBoxLayout(self)
         # Imported lazily-ish at module scope; kept here so the prose reads in
         # order with the layout it heads.
-        from gui.cost_panels import EvidencePanel, FrontierPlot, LeverPreamble
+        from gui.cost_panels import FrontierPlot, LeverPreamble, SweepPanel
         root.addWidget(LeverPreamble(_WHY_OFFERED, _WHY_NOT_ASSUMED))
 
         root.addLayout(self._build_inputs())
@@ -191,10 +202,10 @@ class DownsampleDialog(QDialog):
 
         root.addWidget(self._build_readouts())
 
-        self.evidence = EvidencePanel(_EVIDENCE_SCOPE)
-        self.evidence.run_requested.connect(self._on_run_evidence)
-        self.evidence.cancel_requested.connect(self.evidence_cancelled.emit)
-        root.addWidget(self.evidence)
+        self.sweep = SweepPanel(_SWEEP_NOTE)
+        self.sweep.run_requested.connect(self._on_run_sweep)
+        self.sweep.cancel_requested.connect(self.sweep_cancelled.emit)
+        root.addWidget(self.sweep)
 
         root.addLayout(self._build_buttons())
         self._refresh()
@@ -333,11 +344,15 @@ class DownsampleDialog(QDialog):
         else:
             hours = [self._hours(s) for s in scales]
             knee = self._model.knee_scale(min_scale=min(scales))
+            store = [self._storage(s) for s in scales]
             self.plot.set_curve(
                 scales, hours, labels=[f"{s:g}" for s in scales], knee=knee,
                 selected=self._selected,
                 y_label=f"projected wall time for {self.corpus_spin.value():g} h "
-                        f"of footage, single process")
+                        f"of footage, single process",
+                second=store, second_label="cache storage (dashed)",
+                second_fmt=format_bytes,
+                rise_below=storage_rises_below(scales, store))
             self.note.setText(self._note_text(knee))
         self._refresh_rows()
 
@@ -357,6 +372,23 @@ class DownsampleDialog(QDialog):
                 f"you give up more resolution than you gain.")
         parts.append(f"Fitted from {m.n_samples} measured passes on this machine "
                      f"and this footage; it is not a portable constant.")
+        # The two-lever claim, stated where it is visible rather than asserted in
+        # docs. Phrased as "does not fall" rather than "is flat" because it is
+        # not flat: the block and the cell count round independently, so the
+        # curve jitters (measured, up to 19% on a single full-frame replicate,
+        # and non-monotone). What holds is the decision-relevant part -- reaching
+        # for Downsample to save disk is reaching for the wrong knob.
+        scales = list(CANDIDATE_SCALES)
+        store = [self._storage(s) for s in scales]
+        at_full = store[scales.index(1.0)] if 1.0 in scales else max(store)
+        if at_full > 0 and min(store) >= 0.9 * at_full:
+            worst = max(store)
+            rises = "; at some scales it is higher" if worst > at_full else ""
+            parts.append(
+                f"Storage (dashed) does not fall as you downsample{rises}. The "
+                f"block tracks the scale, so the grid stays fixed in source "
+                f"pixels and the cache is the same size — block size is the "
+                f"storage lever, this one is purely compute.")
         # The projected block tracks each scale, so it differs row to row; the
         # caveat is about the regime the MEASUREMENT came from, and naming a
         # single projected block here would contradict the per-row labels.
@@ -384,43 +416,51 @@ class DownsampleDialog(QDialog):
         self.use_btn.setEnabled(abs(self._selected - 1.0) > 1e-9)
         self.use_btn.setText(f"Use {self._selected:.2f}")
 
-    # -- empirical sweep -----------------------------------------------------
-    def set_evidence_available(self, ok: bool, reason: str = ""):
-        """Called by the owner when it knows whether a sweep can run at all
-        (a window must be extracted and a replicate selected first)."""
-        self.evidence.set_available(ok, reason)
+    # -- the timing sweep ----------------------------------------------------
+    def set_sweep_available(self, ok: bool, reason: str = ""):
+        """Called by the owner when it knows whether a sweep can run at all."""
+        self.sweep.set_available(ok, reason)
 
-    def _on_run_evidence(self):
-        from core.evidence import sweep_scales
+    def _on_run_sweep(self):
+        from core.scale_sweep import sweep_scales
         scales = sweep_scales(self._current, CANDIDATE_SCALES)
-        self._evidence_ref = None
-        self.evidence.begin(
+        self._sweep_ref = None
+        self._sweep_rows = []
+        self.sweep.begin(
             [f"{s:.2f}" for s in scales],
-            f"{len(scales)} passes over the loaded window, the reference "
-            f"({scales[0]:.2f}) first so a sweep you stop early is still "
-            f"readable. Each pass runs at the block a production run would use.")
-        self.evidence_requested.emit(scales)
+            f"{len(scales)} passes over the loaded window, full resolution "
+            f"first so a sweep you stop early is still readable. Each runs at "
+            f"the block a production run would use.")
+        self.sweep_requested.emit(scales)
 
-    def add_evidence(self, ev):
-        """One completed pass. The first row becomes the reference; the rest are
-        reported against it. Also refreshes the frontier's caveat, since these
-        passes are measured in the production block regime the live surface's
-        own samples are not."""
-        from core.evidence import reference_caveat
-        # The check runs on the reference BEFORE it is drawn, so a vacuous sweep
-        # is marked from its very first row rather than after the user has read
-        # four rows of apparent agreement.
-        if self._evidence_ref is None:
-            self.evidence.void_comparison(reference_caveat(ev))
-        self.evidence.add_row(f"{ev.scale:.2f}", ev, self._evidence_ref)
-        if self._evidence_ref is None:
-            self._evidence_ref = ev
+    def add_sweep_row(self, sp):
+        """One completed pass. The first becomes the reference the rest express
+        their speedup against."""
+        self._sweep_rows.append(sp)
+        if self._sweep_ref is None:
+            self._sweep_ref = sp
+        self._render_sweep_row(sp)
 
-    def evidence_failed(self, scale: float, msg: str):
-        self.evidence.fail_row(f"{float(scale):.2f}", msg)
+    def _render_sweep_row(self, sp):
+        hrs = self._hours(sp.scale)
+        self.sweep.add_row(
+            f"{sp.scale:.2f}", sp,
+            format_duration(hrs) if hrs is not None else "—",
+            format_bytes(self._storage(sp.scale)),
+            None if sp is self._sweep_ref else self._sweep_ref)
 
-    def evidence_finished(self, note: str):
-        self.evidence.finish(note)
+    def sweep_failed(self, scale: float, msg: str):
+        self.sweep.fail_row(f"{float(scale):.2f}", msg)
+
+    def sweep_finished(self, note: str):
+        # Re-render every row against the FINAL model. The first row lands when
+        # only one scale has been timed, so the model is still provisional and
+        # its projection reads "—" -- and it would stay that way for the rest of
+        # the session, on the one row (full resolution) a user most wants the
+        # number for.
+        for sp in self._sweep_rows:
+            self._render_sweep_row(sp)
+        self.sweep.finish(note)
 
     def set_model(self, model: CostModel | None, model_block: int | None):
         """Replace the cost model mid-dialog. The sweep produces samples at the

@@ -25,6 +25,8 @@ _CURVE = QColor("#4ac6ff")
 _KNEE = QColor("#ffb347")
 _SELECTED = QColor("#7ee787")
 _FLAT = QColor("#3a4450")     # the region past the knee, shaded as "buys nothing"
+_STORAGE = QColor("#c792ea")  # the companion storage series, on its own axis
+_RISE = QColor("#ff6b6b")     # where storage starts going back UP
 
 
 class LeverPreamble(QLabel):
@@ -77,20 +79,47 @@ class FrontierPlot(QWidget):
         self._knee: float | None = None
         self._selected: float | None = None
         self._y_label = ""
+        self._second: list[float] = []
+        self._second_label = ""
+        self._second_fmt = None
+        self._rise: float | None = None
 
     def set_curve(self, values, costs, *, labels=None, knee=None, selected=None,
-                  y_label=""):
+                  y_label="", second=None, second_label="", second_fmt=None,
+                  rise_below=None):
+        """``second`` is an optional companion series on its own right-hand axis.
+
+        Two axes rather than one because the series are in different units
+        (hours against bytes) and the interesting fact is the SHAPE difference:
+        under the tracked block the storage line is dead flat while the time
+        curve falls, which is the whole two-lever argument in one picture.
+        Normalizing them onto a shared axis would destroy exactly that reading.
+        """
         self._values = list(values)
         self._costs = list(costs)
         self._labels = list(labels) if labels else [f"{v:g}" for v in self._values]
         self._knee = knee
         self._selected = selected
         self._y_label = y_label
+        self._second = list(second) if second else []
+        self._second_label = second_label
+        self._second_fmt = second_fmt
+        self._rise = rise_below
         self.update()
 
     # -- geometry ------------------------------------------------------------
     def _plot_rect(self):
-        return 54, 10, max(1, self.width() - 66), max(1, self.height() - 44)
+        # Right margin widens when a second series needs its own axis labels.
+        right = 76 if self._second else 12
+        return 54, 22, max(1, self.width() - 54 - right), max(1, self.height() - 56)
+
+    def _y2_of(self, v: float) -> float:
+        """Second series, on its own axis. Zero-based like the primary, so a flat
+        line reads as flat rather than as noise amplified to fill the panel."""
+        _, y, _, h = self._plot_rect()
+        hi = max(self._second) if self._second else 1.0
+        hi = hi if hi > 0 else 1.0
+        return y + h * (1.0 - v / hi)
 
     def _x_of(self, v: float) -> float:
         x, _, w, _ = self._plot_rect()
@@ -164,6 +193,26 @@ class FrontierPlot(QWidget):
                        int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
                        self._fmt_y(hi * frac))
 
+        # The storage series is drawn first, under the time curve: it is context
+        # for the primary decision, and on a tracked block it is a flat line that
+        # would otherwise sit on top of the curve it is meant to be compared to.
+        if self._second:
+            p.setPen(QPen(_STORAGE, 1))
+            for frac in (0.0, 0.5, 1.0):
+                yy = y0 + h * (1.0 - frac)
+                hi2 = max(self._second)
+                txt = (self._second_fmt(hi2 * frac) if self._second_fmt
+                       else f"{hi2 * frac:.0f}")
+                p.drawText(x0 + w + 6, int(yy) - 7, 70, 14,
+                           int(Qt.AlignmentFlag.AlignLeft
+                               | Qt.AlignmentFlag.AlignVCenter), txt)
+            spath = QPainterPath()
+            for i, (v, c) in enumerate(zip(self._values, self._second)):
+                pt = QPointF(self._x_of(v), self._y2_of(c))
+                spath.moveTo(pt) if i == 0 else spath.lineTo(pt)
+            p.setPen(QPen(_STORAGE, 2, Qt.PenStyle.DashLine))
+            p.drawPath(spath)
+
         path = QPainterPath()
         for i, (v, c) in enumerate(zip(self._values, self._costs)):
             pt = QPointF(self._x_of(v), self._y_of(c))
@@ -200,10 +249,27 @@ class FrontierPlot(QWidget):
                        f"knee {self._knee:.2f}\nbelow: lose detail,\n"
                        f"save almost no time")
 
+        # Where storage stops falling and starts rising again: past here the
+        # user pays MORE cache for less resolution, which is a hard reason to
+        # stop and is invisible without the marker.
+        if self._rise is not None:
+            rx = self._x_of(self._rise)
+            p.setPen(QPen(_RISE, 1, Qt.PenStyle.DotLine))
+            p.drawLine(int(rx), y0, int(rx), y0 + h)
+            p.setPen(_RISE)
+            p.drawText(int(rx) - 96, y0 + h - 16, 92, 14,
+                       int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop),
+                       "storage rises ▸")
+
         p.setPen(_TEXT)
-        p.drawText(x0 + 4, 0, w, 14,
+        p.drawText(x0 + 4, 0, w, 16,
                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop),
                    self._y_label)
+        if self._second_label:
+            p.setPen(_STORAGE)
+            p.drawText(x0 + 4, 0, w, 16,
+                       int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop),
+                       self._second_label)
 
     def _fmt_y(self, v: float) -> str:
         if v >= 100:
@@ -213,41 +279,42 @@ class FrontierPlot(QWidget):
         return f"{v:.1f}"
 
 
-class EvidencePanel(QWidget):
-    """Run the tuned detector at each candidate setting and show what it found.
+class SweepPanel(QWidget):
+    """Time a real pass at each candidate setting, and price its storage.
 
-    This is the sensitivity half of a lever dialog and the reason the dialog is
-    defensible at all. A window that shows only a frontier answers "can I afford
-    full resolution", never "can I afford to lose it", and a user reading an
-    asymmetric window downsamples for the reason the tool put in front of them.
-    Batch K's rule -- that a coarser setting must be *demonstrated* to still
-    resolve the behaviour -- is executable here and nowhere else in the tool.
+    Replaces the empirical *detection* panel that briefly sat here. That panel
+    ran the tuned detector at each scale and reported events kept and lost, which
+    sounds like the sensitivity evidence Batch K asks for and is not: the value
+    and count bands are absolute, and downsampling averages pixels before
+    differencing, so per-block band power falls with scale and a fixed threshold
+    catches less regardless of whether the behaviour is still resolved. Measured,
+    the loss was monotone with ZERO added frames at any scale -- the signature of
+    threshold drift, not of lost structure. Deciding whether a behaviour is
+    detectable is what the live surface and the whole-video pass are for; this
+    window prices the lever, and says so.
 
-    Every cell is a count on a named clip: events, flagged frames, and the
-    kept/missed/added split against the reference row. No summary score, and the
-    scope caption is not optional -- an event count that does not say which clip
-    and which behaviour it came from will be read as a general guarantee, which
-    is the exact claim the panel exists to avoid making.
+    What is left is honest and useful on its own: measured wall time per scale,
+    projected against the user's corpus, alongside the storage that setting
+    actually costs. Both are things no other view shows.
     """
     run_requested = pyqtSignal()
     cancel_requested = pyqtSignal()
 
-    _HEAD = ("setting", "events", "frames", "vs reference", "grid", "pass")
+    _HEAD = ("setting", "pass", "per frame", "projected", "storage", "grid")
 
-    def __init__(self, scope_note: str, run_text: str = "Run the detector at each scale",
+    def __init__(self, note: str, run_text: str = "Time a pass at each scale",
                  parent=None):
         super().__init__(parent)
         self._rows: dict[str, list[QLabel]] = {}
         self._running = False
-        self._void: str | None = None       # why the comparison carries no info
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 4, 0, 0)
 
-        cap = QLabel(scope_note)
+        cap = QLabel(note)
         cap.setWordWrap(True)
         cap.setTextFormat(Qt.TextFormat.RichText)
         cap.setStyleSheet(
-            "color:#e6c07b; background:#2b2620; border:1px solid #4a3f2c;"
+            "color:#c8d2dc; background:#232a31; border:1px solid #33404d;"
             "border-radius:4px; padding:8px; font-size:12px;")
         lay.addWidget(cap)
 
@@ -276,9 +343,8 @@ class EvidencePanel(QWidget):
 
     def set_available(self, ok: bool, reason: str = ""):
         """Disable the run with a stated reason. Silence would read as a broken
-        button; the reasons here (no window extracted, no region selected) are
-        all things the user can fix in one action -- and once fixed the reason
-        has to go, or the panel contradicts its own enabled button."""
+        button -- and once the reason is fixed it has to go, or the panel
+        contradicts its own enabled button."""
         self.run_btn.setEnabled(bool(ok))
         if not ok:
             self.status.setText(reason)
@@ -287,10 +353,8 @@ class EvidencePanel(QWidget):
 
     def begin(self, labels: list[str], note: str = ""):
         """Lay out one pending row per setting before any pass has run, so the
-        cost of the sweep is visible up front rather than arriving as a surprise
-        stall."""
+        cost of the sweep is visible up front rather than arriving as a stall."""
         self._running = True
-        self._void = None
         self.run_btn.setText("Stop")
         self.run_btn.setEnabled(True)
         self._clear()
@@ -298,48 +362,21 @@ class EvidencePanel(QWidget):
             self._set_row(lab, [lab, "…", "", "", "", "waiting"], dim=True)
         self.status.setText(note)
 
-    def void_comparison(self, reason: str | None):
-        """Mark the reference as unable to support a comparison at all.
-
-        Set from the reference row (see ``core.evidence.reference_caveat``). Once
-        set, no row prints a kept/missed/added split: a detector that fires on
-        every frame agrees with itself perfectly at every scale, and printing
-        that as "kept 96 · missed 0" would be a passing grade awarded for a
-        vacuous test -- the single most misleading thing this panel could do.
-        """
-        self._void = reason
-        if reason:
-            self.status.setText(self._void_text())
-
-    def _void_text(self) -> str:
-        return f"⚠ These rows are not evidence: {self._void}."
-
-    def add_row(self, label: str, ev, ref=None):
-        """One completed pass. ``ref`` is the reference row's evidence (the
-        first, full-resolution pass); ``None`` marks this row as the reference."""
-        kept_txt, grid_txt = "reference", f"{ev.grid[0]}×{ev.grid[1]}"
-        warn = False
-        if self._void:
-            kept_txt = "no comparison — see below"
-            warn = True
-        elif ref is not None:
-            kept, missed, added = ev.agreement_with(ref)
-            kept_txt = f"kept {kept} · missed {missed} · added {added}"
-            if tuple(ev.grid) != tuple(ref.grid):
-                # The count band counts blocks. A different grid counts a
-                # different number of them, so the two rows are thresholded on
-                # different quantities -- comparable only if the block tracks
-                # the scale, which is what auto does and a pinned block does not.
-                warn = True
-                grid_txt += " ⚠ differs"
+    def add_row(self, label: str, sp, projected: str, storage: str,
+                ref=None):
+        """One completed pass. ``ref`` is the reference (full-resolution) pass,
+        used only to express this row's speedup; ``None`` marks the reference."""
+        speed = ""
+        if ref is not None and sp.wall > 0 and ref.wall > 0:
+            speed = f"  ({ref.wall / sp.wall:.1f}× faster)"
         self._set_row(label, [
             label,
-            str(ev.n_events),
-            str(ev.n_detected_frames),
-            kept_txt,
-            f"{grid_txt} · block {ev.block}",
-            f"{ev.wall:.1f} s",
-        ], warn=warn)
+            f"{sp.wall:.1f} s{speed}",
+            f"{sp.seconds_per_frame * 1000:.0f} ms",
+            projected,
+            storage,
+            f"{sp.grid[0]}×{sp.grid[1]} · block {sp.block}",
+        ], warn=not sp.usable)
 
     def fail_row(self, label: str, msg: str):
         self._set_row(label, [label, "—", "", msg, "", ""], warn=True)
@@ -347,19 +384,14 @@ class EvidencePanel(QWidget):
     def finish(self, note: str):
         """End the sweep, however it ended.
 
-        Any row still pending is retired to "not run". A stopped sweep is the
-        common case and leaving its remaining rows reading "waiting" would claim
-        passes are still coming when nothing is running -- worse here than
-        cosmetically, because a half-populated table that looks live invites
-        reading the scales that DID run as the whole comparison.
+        Any row still pending is retired to "not run": a stopped sweep is the
+        common case, and rows left reading "waiting" claim passes are still
+        coming when nothing is running.
         """
         self._running = False
         self.run_btn.setText("Run again")
         self.run_btn.setEnabled(True)
-        # A void comparison outranks the closing note: the note says the sweep
-        # completed, which is true and, on its own, exactly the wrong thing to
-        # leave on screen when the rows mean nothing.
-        self.status.setText(self._void_text() if self._void else note)
+        self.status.setText(note)
         for cells in self._rows.values():
             if cells[-1].text() == "waiting":
                 cells[1].setText("—")

@@ -34,7 +34,7 @@ from core.channel_source import (LIVE_CHANNELS, live_channel_source,
                                  reduce_channel_data)
 from core.config import FlowConfig, PipelineConfig, PreprocessConfig
 from core.cost_model import CostModel, PassSample
-from core.evidence import measure_scale
+from core.scale_sweep import measure_scale
 from core.replicates import build_layout
 from core.detection import detect_channel_region
 from core.video import VideoSource
@@ -67,7 +67,7 @@ class _Busy(Enum):
     recognise, which a mistyped literal would make unrecoverable."""
     EXTRACT = "extract"
     PROCESS = "process"
-    EVIDENCE = "evidence"
+    SWEEP = "sweep"
 
 
 class _Cancelled(Exception):
@@ -170,53 +170,52 @@ class _ProcessWorker(_StreamWorker):
         self.done.emit(res)
 
 
-class _EvidenceWorker(_StreamWorker):
-    """The downsample dialog's sweep: one extract + detect per candidate scale.
+class _SweepWorker(_StreamWorker):
+    """The downsample dialog's sweep: one timed extraction pass per scale.
 
-    Two things land in one pass sequence, which is why they were built together.
-    Each pass answers *"does the detector I just tuned still fire at this
-    scale"*, and each pass is also a cost sample taken at the block a production
-    run would use -- unlike the live surface's own extracts, which run at
-    ``block_size=1`` so a Block change can re-reduce instead of re-extract, and
-    which therefore price a pass where ``block_reduce`` is 62% of the wall time
-    against ~15% in production.
+    Each pass is a cost sample taken at the block a production run would use --
+    unlike the live surface's own extracts, which run at ``block_size=1`` so a
+    Block change can re-reduce instead of re-extract, and which therefore price a
+    pass where ``block_reduce`` is 62% of the wall time against ~15% in
+    production (11.0 s against 4.2 s at scale 1.0, measured).
+
+    No detector runs. An earlier version ran the tuned detector at each scale and
+    reported events kept and lost, which read as sensitivity evidence but
+    measured threshold drift -- see ``core/scale_sweep.py``. Dropping it also
+    means the sweep needs no tuned explorer and no selected replicate, so it can
+    run the moment the window opens.
 
     A scale that fails does not abort the sweep: a row reporting the error is
     more useful than losing the scales that would have run after it.
     """
-    row = pyqtSignal(object)               # a completed ScaleEvidence
+    row = pyqtSignal(object)               # a completed ScalePass
     row_failed = pyqtSignal(float, str)
     scale_started = pyqtSignal(float, int, int)     # (scale, index, total)
 
-    def __init__(self, video_path, cfg, replicates, dims, start, n,
-                 region_index, params, scales, parent=None):
+    def __init__(self, video_path, cfg, replicates, dims, start, n, scales,
+                 parent=None):
         super().__init__(parent)
-        self._args = (video_path, cfg, replicates, dims, start, n,
-                      region_index, params, list(scales))
+        self._args = (video_path, cfg, replicates, dims, start, n, list(scales))
 
     def _run(self):
-        (video_path, cfg, reps, dims, start, n, region_index, params,
-         scales) = self._args
+        video_path, cfg, reps, dims, start, n, scales = self._args
         for i, s in enumerate(scales):
             if self._cancel:
                 raise _Cancelled
             self.scale_started.emit(float(s), i + 1, len(scales))
-            # Only the scale moves. The block comes from the user's own flow
-            # config, so `auto` tracks it (grid fixed in source pixels, count
-            # bands comparable) and a pinned block does not -- which the panel
-            # then flags rather than hiding.
+            # Only the scale moves; the block comes from the user's own flow
+            # config, so `auto` tracks it and a pinned block stays pinned.
             cfg_s = replace(cfg, preprocess=replace(cfg.preprocess,
                                                     downsample=float(s)))
             try:
-                ev = measure_scale(video_path, cfg_s, reps, dims=dims,
-                                   start=start, n=n, region_index=region_index,
-                                   params=params, progress=self._tick)
+                sp = measure_scale(video_path, cfg_s, reps, dims=dims,
+                                   start=start, n=n, progress=self._tick)
             except _Cancelled:
                 raise
             except Exception as e:
                 self.row_failed.emit(float(s), f"{type(e).__name__}: {e}")
                 continue
-            self.row.emit(ev)
+            self.row.emit(sp)
         self.done.emit(None)
 
 
@@ -276,7 +275,7 @@ class LiveScalogramSurface(QWidget):
         # The downsample dialog's empirical sweep, while one is running. Held on
         # the surface rather than in the dialog because it owns the decoder and
         # must not overlap the extract or the whole-video commit.
-        self._evi_worker: _EvidenceWorker | None = None
+        self._sweep_worker: _SweepWorker | None = None
         self._sweep_block_intent: int | None = None
         self._dlg = None
 
@@ -501,7 +500,7 @@ class LiveScalogramSurface(QWidget):
 
     # -- extraction ----------------------------------------------------------
     def extract(self):
-        if self._proc_worker is not None or self._evi_worker is not None:
+        if self._proc_worker is not None or self._sweep_worker is not None:
             return                          # another pass owns the decoder
         if self._worker is not None:
             # A knob settled mid-extract: that pass is now stale, so supersede it
@@ -628,10 +627,10 @@ class LiveScalogramSurface(QWidget):
             current_scale=float(self.ds_spin.value()),
             model=model, model_block=model_block, flow=self._build_cfg().flow,
             n_channels=len(LIVE_CHANNELS), parent=self)
-        dlg.evidence_requested.connect(self._start_evidence)
-        dlg.evidence_cancelled.connect(self._stop_evidence)
-        ok, why = self._evidence_ready()
-        dlg.set_evidence_available(ok, why)
+        dlg.sweep_requested.connect(self._start_sweep)
+        dlg.sweep_cancelled.connect(self._stop_sweep)
+        ok, why = self._sweep_ready()
+        dlg.set_sweep_available(ok, why)
         self._dlg = dlg
         try:
             accepted = dlg.exec()
@@ -639,60 +638,58 @@ class LiveScalogramSurface(QWidget):
             # A sweep still running when the window closes has nowhere to report
             # to, and it holds the decoder the next extract needs. Unwind it here
             # rather than letting it race the reopened dialog.
-            self._stop_evidence(wait=True)
+            self._stop_sweep(wait=True)
             self._dlg = None
             # Parented to the surface, so without this each open leaves a live
-            # dialog behind whose Run button is still wired to _start_evidence.
+            # dialog behind whose Run button is still wired to _start_sweep.
             dlg.deleteLater()
         if accepted and dlg.chosen_scale is not None:
             # setValue fires valueChanged, which starts the re-extract debounce,
             # so choosing a scale here applies exactly as dragging the spin does.
             self.ds_spin.setValue(float(dlg.chosen_scale))
 
-    # -- the dialog's empirical sweep ----------------------------------------
-    def _evidence_ready(self) -> tuple[bool, str]:
-        """Whether a sweep can run, and why not when it cannot. Both reasons are
-        one action away, so the panel states them instead of just greying out."""
-        if self._explorer is None:
-            return False, ("Extract a window and tune the detector first — the "
-                           "sweep re-runs your settings, so there have to be "
-                           "settings.")
-        if self._explorer.detection_params()["region_index"] < 0:
-            return False, ("Select a replicate first: the detector runs over one "
-                           "region, so the sweep needs to know which.")
+    # -- the dialog's timing sweep -------------------------------------------
+    def _sweep_ready(self) -> tuple[bool, str]:
+        """Whether a sweep can run, and why not when it cannot.
+
+        Short, because the sweep only times extraction: it needs no tuned
+        detector and no selected replicate, so it can run the moment the window
+        opens. Only a decoder conflict or a degenerate window can stop it.
+        """
         if self._worker is not None or self._proc_worker is not None:
             return False, "Another pass is running; wait for it to finish."
+        if self._window()[1] < 2:
+            return False, "The window is too short at this start position."
         return True, ""
 
-    def _start_evidence(self, scales):
-        ok, why = self._evidence_ready()
-        if not ok or self._evi_worker is not None:
+    def _start_sweep(self, scales):
+        ok, why = self._sweep_ready()
+        if not ok or self._sweep_worker is not None:
             if self._dlg is not None:
-                self._dlg.evidence_finished(why or "a sweep is already running")
+                self._dlg.sweep_finished(why or "a sweep is already running")
             return
         self._debounce.stop()               # an armed knob edit must not cut in
         self._block_debounce.stop()
         start, n = self._window()
-        params = self._explorer.detection_params()
         cfg = self._build_cfg()
         # Every row of this sweep runs under one block intent, so record it once
         # here rather than re-deriving it per row from the resolved block.
         self._sweep_block_intent = cfg.flow.block_size
-        self._set_busy(_Busy.EVIDENCE)
-        self._evi_worker = _EvidenceWorker(
-            self.video_path, cfg, self.replicates, self._dims,
-            start, n, params["region_index"], params, scales, self)
-        self._evi_worker.row.connect(self._on_evidence_row)
-        self._evi_worker.row_failed.connect(self._on_evidence_row_failed)
-        self._evi_worker.scale_started.connect(self._on_evidence_scale)
-        self._evi_worker.done.connect(self._on_evidence_done)
-        self._evi_worker.failed.connect(self._on_evidence_failed)
-        self._evi_worker.cancelled.connect(self._on_evidence_cancelled)
-        self._evi_worker.finished.connect(self._evi_worker.deleteLater)
-        self._evi_worker.start()
+        self._set_busy(_Busy.SWEEP)
+        self._sweep_worker = _SweepWorker(
+            self.video_path, cfg, self.replicates, self._dims, start, n,
+            scales, self)
+        self._sweep_worker.row.connect(self._on_sweep_row)
+        self._sweep_worker.row_failed.connect(self._on_sweep_row_failed)
+        self._sweep_worker.scale_started.connect(self._on_sweep_scale)
+        self._sweep_worker.done.connect(self._on_sweep_done)
+        self._sweep_worker.failed.connect(self._on_sweep_failed)
+        self._sweep_worker.cancelled.connect(self._on_sweep_cancelled)
+        self._sweep_worker.finished.connect(self._sweep_worker.deleteLater)
+        self._sweep_worker.start()
 
-    def _stop_evidence(self, wait: bool = False):
-        w = self._evi_worker
+    def _stop_sweep(self, wait: bool = False):
+        w = self._sweep_worker
         if w is None:
             return
         w.cancel()
@@ -701,59 +698,58 @@ class LiveScalogramSurface(QWidget):
             # blocking the GUI thread for that is preferable to leaving it
             # decoding into a dialog that no longer exists.
             w.wait()
-            self._evi_worker = None
+            self._sweep_worker = None
             self._set_busy(None)
 
-    def _on_evidence_scale(self, scale: float, i: int, total: int):
+    def _on_sweep_scale(self, scale: float, i: int, total: int):
         self.status_lbl.setText(
-            f"sweep {i}/{total} · extracting at scale {scale:.2f} and running "
-            f"the tuned detector…")
+            f"sweep {i}/{total} · timing a pass at scale {scale:.2f}…")
 
-    def _on_evidence_row(self, ev):
+    def _on_sweep_row(self, sp):
         # The sweep's passes resolve the block as production would, so each row
-        # is also the cost sample the live surface cannot produce: this is what
-        # moves the frontier out of the block=1 regime, live, while the dialog
-        # is open. A pass whose timing is missing is dropped rather than entered
-        # as a zero-cost point, which would pull the fitted decode floor toward
-        # zero and put the knee where downsampling looks free.
-        sample = ev.pass_sample()
-        if ev.frames > 0 and sample.wall > 0.0:
-            key = (round(float(ev.scale), 6), int(ev.block))
-            self._cost_samples[key] = sample
+        # is the cost sample the live surface cannot produce: this is what moves
+        # the frontier out of the block=1 regime, live, while the dialog is open.
+        # A pass with no measured wall time is dropped rather than entered as a
+        # zero-cost point, which would pull the fitted decode floor toward zero
+        # and put the knee where downsampling looks free.
+        if sp.usable:
+            key = (round(float(sp.scale), 6), int(sp.block))
+            self._cost_samples[key] = sp.pass_sample()
             self._sample_regime[key] = self._sweep_block_intent
             self._last_cost_key = key
         if self._dlg is not None:
-            self._dlg.add_evidence(ev)
+            # Model first: the row prints a corpus projection read off the model,
+            # so refitting after would leave the newest row a step behind.
             self._dlg.set_model(*self._cost_model())
+            self._dlg.add_sweep_row(sp)
 
-    def _on_evidence_row_failed(self, scale: float, msg: str):
+    def _on_sweep_row_failed(self, scale: float, msg: str):
         if self._dlg is not None:
-            self._dlg.evidence_failed(scale, msg)
+            self._dlg.sweep_failed(scale, msg)
 
-    def _on_evidence_done(self, _res):
-        self._evi_worker = None
+    def _on_sweep_done(self, _res):
+        self._sweep_worker = None
         self._set_busy(None)
         self.status_lbl.setText("sweep done")
         if self._dlg is not None:
-            self._dlg.evidence_finished(
-                "Done. These counts are this clip, this window and these "
-                "detector settings; a scale that held here still has to hold "
-                "for the other footage the project will run.")
+            self._dlg.sweep_finished(
+                "Done. Times are measured on this machine and this footage and "
+                "are not portable; storage is exact arithmetic over the layout.")
 
-    def _on_evidence_failed(self, msg: str):
-        self._evi_worker = None
+    def _on_sweep_failed(self, msg: str):
+        self._sweep_worker = None
         self._set_busy(None)
         if self._dlg is not None:
-            self._dlg.evidence_finished(f"sweep failed: {msg}")
+            self._dlg.sweep_finished(f"sweep failed: {msg}")
 
-    def _on_evidence_cancelled(self):
-        self._evi_worker = None
+    def _on_sweep_cancelled(self):
+        self._sweep_worker = None
         self._set_busy(None)
         self.status_lbl.setText("sweep stopped")
         if self._dlg is not None:
-            self._dlg.evidence_finished(
+            self._dlg.sweep_finished(
                 "Stopped. The rows that finished are still valid — each is an "
-                "independent pass, not a partial result.")
+                "independent timed pass, not a partial result.")
 
     def _on_extracted(self, cd):
         self._worker = None
@@ -814,7 +810,7 @@ class LiveScalogramSurface(QWidget):
     def _on_block_changed(self):
         """Block changed: re-reduce the cached pixel channels (instant) if they
         cover this window, else fall back to a full (block=1) extract."""
-        if self._proc_worker is not None or self._evi_worker is not None:
+        if self._proc_worker is not None or self._sweep_worker is not None:
             return
         if self._worker is not None:
             # Mid-extract: even a cache hit would be overwritten by the pass in
@@ -885,7 +881,7 @@ class LiveScalogramSurface(QWidget):
     # -- whole-video commit --------------------------------------------------
     def process_whole_video(self):
         if (self._worker is not None or self._proc_worker is not None
-                or self._evi_worker is not None):
+                or self._sweep_worker is not None):
             return                                  # a pass is already running
         if self._explorer is None:
             self.status_lbl.setText("extract a window and tune it first")
@@ -988,11 +984,11 @@ class LiveScalogramSurface(QWidget):
         # and it re-enters extract() on a surface that is on its way out.
         self._debounce.stop()
         self._block_debounce.stop()
-        for w in (self._worker, self._proc_worker, self._evi_worker):
+        for w in (self._worker, self._proc_worker, self._sweep_worker):
             if w is not None:
                 w.cancel()      # unwind at the next tick instead of waiting it out
                 w.wait()
-        self._worker = self._proc_worker = self._evi_worker = None
+        self._worker = self._proc_worker = self._sweep_worker = None
         if self._explorer is not None:
             self._explorer.close()
         super().closeEvent(e)

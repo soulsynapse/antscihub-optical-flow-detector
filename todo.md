@@ -880,6 +880,58 @@ ran (`FlowConfig.block_size`: `None` tracked, a number pinned), NOT inferred fro
 the resolved block: for any pinned block there is a scale where tracking picks
 the same number (64 at 1.0, 32 at 0.5), and inferring misfiles that one pass.
 
+#### Batch M (third slice, BUILT): detection panel REMOVED, storage on the plot
+The empirical detection panel is **gone**, deliberately, and should not be
+rebuilt in the form it had. `core/evidence.py` became `core/scale_sweep.py`; the
+sweep now times extraction and nothing else.
+
+**Why it was removed.** It reported events kept/lost per scale, which reads as
+the sensitivity evidence Batch K asks for and is not. Value and count bands are
+absolute, and downsampling averages pixels before differencing, so per-block band
+power falls with scale and a fixed threshold catches less whether or not the
+behaviour is still resolved. Measured with a discriminating tuning: 1.00→60
+frames, 0.75→55, 0.50→52, 0.35→31, 0.25→13, with **zero added frames at any
+scale** — the one-directional signature of threshold drift, not of lost
+structure. So the table could not distinguish "0.25 is too coarse" from "your
+threshold needs re-tuning at 0.25", which is precisely the withdrawn `sig_corr`
+failure: an authoritative-looking number that does not mean what it appears to.
+Detectability is decided in the live surface and the whole-video pass. This
+window prices the lever and says so in prose.
+
+**Dropping it also simplified the sweep**: no detector means no tuned explorer
+and no selected replicate, so it runs the moment the window opens.
+
+**Storage now rides the plot on its own axis**, and this is the more useful half.
+Two axes, not one normalized scale — the whole content is the *shape difference*:
+the time curve falls while the storage line does not.
+
+**Storage does NOT fall with downsampling, and is not exactly flat either.**
+`round(64*s)` and `ceil(dim*s/block)` round independently, so the cell count
+jitters non-monotonically:
+- 7-replicate 5312x2988: exactly 205 cells / 26.4 GB per 100 h from 1.0 down to
+  0.15, then 240 cells (30.9 GB) at 0.10. Atlas packing absorbs the rounding.
+- single full-frame replicate: 539 GB at 1.0/0.75/0.50, **564 GB** at 0.35,
+  498 GB at 0.15, **615 GB** at 0.10 — a 19% spread.
+
+So the claim to make is "does not reliably fall, and sometimes rises", not
+"flat". A user downsampling to save disk can pay MORE. `storage_rises_below()`
+marks the rising tail so it does not read as a plotting glitch.
+
+Measured after the rework (GX010047c2, 4 s window, 5 scales, ~12 s total):
+1.00 → 4.0 s / 4.2 d projected, 0.50 → 1.8 s (2.2× faster) / 2.1 d, 0.25 → 1.4 s
+(2.8× faster) / 36 h; storage 26.4 GB at every one of them. Knee ~0.6-0.7.
+
+**Found by driving:** the reference row's projection read "—" forever, because it
+lands while only one scale has been timed and the model is still provisional.
+Rows are now re-rendered against the final model when the sweep ends.
+
+Still not built: the render-at-each-scale image panel and the draw-a-line
+calibration sub-tool.
+
+---
+
+Superseded notes from the second slice, kept because the measurements stand:
+
 **Found by driving, not by tests — the default state produced a false pass.** A
 freshly built explorer has both bands wide open, so the gate is on for every
 frame; every scale then reported `kept 96 · missed 0 · added 0`. Five rows of

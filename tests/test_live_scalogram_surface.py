@@ -408,121 +408,186 @@ class CostSampleTests(_SurfaceTestCase):
         self.assertEqual(surface._cost_samples, {})
 
 
-class EvidencePanelTests(_QtTestCase):
+class SweepPanelTests(_QtTestCase):
     """Panel states that only showed up by driving the real window."""
 
     @staticmethod
-    def _ev(scale, detected, grid=(4, 4), block=8):
-        from core.evidence import ScaleEvidence
-        import numpy as np
-        return ScaleEvidence(scale=scale, block=block, grid=grid, frames=4,
-                             wall=1.0, window_start=0,
-                             detected=np.asarray(detected, bool), intervals=[])
+    def _sp(scale, wall=2.0, frames=100, grid=(4, 4), block=8):
+        from core.scale_sweep import ScalePass
+        return ScalePass(scale=scale, block=block, grid=grid, frames=frames,
+                         wall=wall)
 
     def _panel(self):
-        from gui.cost_panels import EvidencePanel
-        p = EvidencePanel("scope")
+        from gui.cost_panels import SweepPanel
+        p = SweepPanel("note")
         self.addCleanup(p.deleteLater)
         return p
 
     def test_pending_rows_are_retired_when_a_sweep_ends_early(self):
         """A stopped sweep left its remaining rows reading "waiting" forever,
-        claiming passes were still coming with nothing running -- and a
-        half-filled table that looks live invites reading the scales that did
-        run as the whole comparison."""
+        claiming passes were still coming with nothing running."""
         p = self._panel()
         p.begin(["1.00", "0.50", "0.25"])
-        p.add_row("1.00", self._ev(1.0, [0, 1, 1, 0]))
+        p.add_row("1.00", self._sp(1.0), "4.7 d", "26.4 GB")
         p.finish("stopped")
         self.assertEqual(p._rows["0.50"][-1].text(), "not run")
         self.assertEqual(p._rows["0.25"][-1].text(), "not run")
         self.assertNotEqual(p._rows["1.00"][-1].text(), "not run")
 
-    def test_a_void_reference_suppresses_every_comparison(self):
+    def test_a_row_reports_its_speedup_against_the_reference(self):
         p = self._panel()
         p.begin(["1.00", "0.50"])
-        p.void_comparison("fires on every frame")
-        ref = self._ev(1.0, [1, 1, 1, 1])
-        p.add_row("1.00", ref)
-        p.add_row("0.50", self._ev(0.5, [1, 1, 1, 1]), ref)
-        for label in ("1.00", "0.50"):
-            self.assertNotIn("kept", p._rows[label][3].text())
-        self.assertIn("not evidence", p.status.text())
+        ref = self._sp(1.0, wall=4.0)
+        p.add_row("1.00", ref, "4.7 d", "26.4 GB")
+        p.add_row("0.50", self._sp(0.5, wall=2.0), "2.4 d", "26.4 GB", ref)
+        self.assertIn("2.0", p._rows["0.50"][1].text())
+        self.assertIn("faster", p._rows["0.50"][1].text())
+        self.assertNotIn("faster", p._rows["1.00"][1].text())
 
-    def test_the_void_warning_outranks_the_closing_note(self):
+    def test_a_pass_with_no_measured_wall_is_flagged(self):
         p = self._panel()
         p.begin(["1.00"])
-        p.void_comparison("fires on every frame")
-        p.add_row("1.00", self._ev(1.0, [1, 1]))
-        p.finish("Done. These counts are this clip...")
-        self.assertIn("not evidence", p.status.text())
+        p.add_row("1.00", self._sp(1.0, wall=0.0), "-", "26.4 GB")
+        self.assertIn("e6a23c", p._rows["1.00"][0].styleSheet())
 
-    def test_a_grid_mismatch_is_flagged_rather_than_ranked_through(self):
-        # The count band counts blocks, so rows on different grids are
-        # thresholded on different quantities.
+    def test_a_stale_refusal_reason_clears_once_the_run_is_available(self):
         p = self._panel()
-        p.begin(["1.00", "0.50"])
-        ref = self._ev(1.0, [0, 1, 1, 0], grid=(8, 8))
-        p.add_row("1.00", ref)
-        p.add_row("0.50", self._ev(0.5, [0, 1, 0, 0], grid=(4, 4)), ref)
-        self.assertIn("differs", p._rows["0.50"][4].text())
-        self.assertNotIn("differs", p._rows["1.00"][4].text())
+        p.set_available(False, "Another pass is running")
+        self.assertIn("Another pass", p.status.text())
+        p.set_available(True)
+        self.assertEqual(p.status.text(), "")
 
 
-class EvidenceSweepTests(_SurfaceTestCase):
-    """The empirical panel end to end: real passes, real detector, real dialog.
+class FrontierStorageTests(_QtTestCase):
+    """Storage rides a second axis on the frontier. Under the tracked block it
+    is dead flat while the time curve falls, which is the two-lever argument in
+    one picture -- and normalizing both onto one axis would destroy it."""
 
-    Driven rather than mocked because the two things this had to fix are both
-    properties of an actual pass -- that the sweep resolves the PRODUCTION block
-    (the live surface's own extracts run at block=1, where block_reduce is 62% of
-    the wall time) and that its rows are therefore usable cost samples.
-    """
+    def _plot(self):
+        from gui.cost_panels import FrontierPlot
+        p = FrontierPlot()
+        p.resize(400, 240)
+        self.addCleanup(p.deleteLater)
+        return p
 
-    _PARAMS = {"channel_attr": "change", "region_index": 0,
-               "freq_band_hz": (1.0, 5.0),
-               "value_band": (0.0, float("inf")),
-               "count_band": (0.0, float("inf")),
-               "detect_window": 3, "centered": True}
+    def test_a_second_series_widens_the_right_margin_for_its_axis(self):
+        p = self._plot()
+        p.set_curve([1.0, 0.5], [10.0, 5.0])
+        without = p._plot_rect()[2]
+        p.set_curve([1.0, 0.5], [10.0, 5.0], second=[8.0, 8.0])
+        self.assertLess(p._plot_rect()[2], without)
 
-    def _tuned(self, **over):
-        surface = self._surface()
-        surface._explorer = MagicMock()
-        surface._explorer.detection_params.return_value = dict(self._PARAMS,
-                                                               **over)
-        return surface
+    def test_the_second_series_is_zero_based_so_flat_reads_as_flat(self):
+        # Auto-ranging a constant series would amplify float noise to fill the
+        # panel and make "storage does not move" look like it moves.
+        p = self._plot()
+        p.set_curve([1.0, 0.5, 0.25], [10.0, 5.0, 3.0], second=[8.0, 8.0, 8.0])
+        ys = [p._y2_of(v) for v in (8.0, 8.0, 8.0)]
+        self.assertEqual(len(set(ys)), 1)
+
+    def test_it_paints_with_both_series_and_a_rise_marker(self):
+        from PyQt6.QtGui import QPixmap
+        p = self._plot()
+        p.set_curve([1.0, 0.5, 0.25], [10.0, 5.0, 3.0], knee=0.5,
+                    second=[8.0, 8.0, 9.5], rise_below=0.25,
+                    second_fmt=lambda v: f"{v:.1f} GB")
+        p.render(QPixmap(p.size()))     # would raise on a bad paint path
+
+
+class StorageCurveTests(unittest.TestCase):
+    """The measured claim behind treating these as two levers."""
+
+    def _reps(self):
+        return [{"id": 0, "label": "all", "frac": (0.0, 0.0, 1.0, 1.0)}]
+
+    def test_tracked_block_stops_storage_falling_with_scale(self):
+        """The decision-relevant claim, and deliberately NOT "storage is flat":
+        the block and the cell count round independently, so the curve jitters
+        (19% on this geometry, non-monotone). What holds is that downsampling
+        never buys disk -- reaching for this lever to save storage is reaching
+        for the wrong knob."""
+        from core.config import FlowConfig
+        from core.scale_sweep import storage_curve
+        scales = [1.0, 0.75, 0.5, 0.35, 0.25, 0.15, 0.1]
+        s = storage_curve(self._reps(), 5312, 2988, scales,
+                          FlowConfig(block_size=None), 24.0, 4, 100.0)
+        at_full = s[0]
+        self.assertGreaterEqual(min(s), 0.9 * at_full)
+        self.assertGreater(max(s), at_full)     # some scales cost MORE
+
+    def test_the_packed_atlas_can_absorb_the_rounding_entirely(self):
+        # The 7-replicate layout happens to hold exactly 205 cells from 1.0 down
+        # to 0.15, which is why "flat" looked true when first measured. It is a
+        # property of that packing, not a general one.
+        from core.config import FlowConfig
+        from core.scale_sweep import storage_curve
+        reps = [{"id": i, "label": f"r{i}",
+                 "frac": (0.1 * i, 0.1, 0.1 * i + 0.08, 0.5)} for i in range(7)]
+        s = storage_curve(reps, 5312, 2988, [1.0, 0.75, 0.5, 0.25],
+                          FlowConfig(block_size=None), 24.0, 4, 100.0)
+        self.assertLessEqual((max(s) - min(s)) / max(s), 0.05)
+
+    def test_a_pinned_block_makes_storage_fall_with_scale(self):
+        from core.config import FlowConfig
+        from core.scale_sweep import storage_curve
+        s = storage_curve(self._reps(), 5312, 2988, [1.0, 0.5, 0.25],
+                          FlowConfig(block_size=64), 24.0, 4, 100.0)
+        self.assertGreater(s[0], s[1])
+        self.assertGreater(s[1], s[2])
+
+    def test_a_rising_tail_is_found_rather_than_smoothed(self):
+        # Past a point the tracked block stops dividing the scaled tile evenly
+        # and partial edge cells push the count back UP -- more storage for less
+        # resolution, which is a hard reason to stop and is invisible unmarked.
+        from core.scale_sweep import storage_rises_below
+        scales = [1.0, 0.5, 0.25, 0.15, 0.10]
+        storage = [26.4, 26.4, 26.4, 26.4, 30.9]
+        self.assertAlmostEqual(storage_rises_below(scales, storage), 0.10)
+
+
+class SweepTests(_SurfaceTestCase):
+    """The sweep end to end: real passes, real dialog, no detector."""
 
     def _pump(self, surface, timeout=120.0):
         """Pump the event loop until the worker has signalled in. Sleeps rather
         than spinning: a bare processEvents loop drains an empty queue far faster
         than the passes run and would time out on a working sweep."""
         deadline = time.monotonic() + timeout
-        while surface._evi_worker is not None and time.monotonic() < deadline:
+        while surface._sweep_worker is not None and time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(0.005)
         self.app.processEvents()
-        self.assertIsNone(surface._evi_worker, "evidence sweep did not finish")
+        self.assertIsNone(surface._sweep_worker, "sweep did not finish")
 
     def _sweep(self, surface, scales):
-        surface._start_evidence(scales)
+        surface._start_sweep(scales)
         self._pump(surface)
 
     def test_a_sweep_produces_a_row_and_a_cost_sample_per_scale(self):
-        surface = self._tuned()
+        surface = self._surface()
         dlg = MagicMock()
         surface._dlg = dlg
         self._sweep(surface, [1.0, 0.5])
-        self.assertEqual(dlg.add_evidence.call_count, 2)
-        rows = [c.args[0] for c in dlg.add_evidence.call_args_list]
+        self.assertEqual(dlg.add_sweep_row.call_count, 2)
+        rows = [c.args[0] for c in dlg.add_sweep_row.call_args_list]
         self.assertEqual([r.scale for r in rows], [1.0, 0.5])
         # Each row is also a sample, keyed at the block a production run uses.
         self.assertEqual(set(surface._cost_samples), {(1.0, 64), (0.5, 32)})
         self.assertTrue(all(b > 1 for _s, b in surface._cost_samples))
 
+    def test_the_sweep_needs_no_tuned_detector_or_selected_replicate(self):
+        """Dropping the detector is what makes this true: the sweep only times
+        extraction, so it can run the moment the window opens."""
+        surface = self._surface()
+        self.assertIsNone(surface._explorer)
+        ok, why = surface._sweep_ready()
+        self.assertTrue(ok, why)
+
     def test_the_sweep_is_what_moves_the_model_out_of_the_block_1_regime(self):
-        """The two fixes are one fix. Before the sweep the only samples come
-        from the live block=1 pixel cache, which overstates a batch run; after
-        it, the model is fitted in the tracked (production) regime."""
-        surface = self._tuned()
+        """Before the sweep the only samples come from the live block=1 pixel
+        cache, which overstates a batch run; after it, the model is fitted in the
+        tracked (production) regime."""
+        surface = self._surface()
         surface._record_cost_sample(CostSampleTests._cd(1.0, 1, 9.0))
         surface._record_cost_sample(CostSampleTests._cd(0.5, 1, 4.0))
         self.assertEqual(surface._cost_model()[1], 1)
@@ -535,7 +600,7 @@ class EvidenceSweepTests(_SurfaceTestCase):
 
     def test_rows_reach_a_real_dialog_and_redraw_the_frontier(self):
         from gui.downsample_dialog import DownsampleDialog
-        surface = self._tuned()
+        surface = self._surface()
         w, h, fps, _fc = surface._dims
         dlg = DownsampleDialog([{"id": 0, "label": "all",
                                  "frac": (0.0, 0.0, 1.0, 1.0)}],
@@ -543,41 +608,37 @@ class EvidenceSweepTests(_SurfaceTestCase):
                                current_scale=1.0, model=None)
         self.addCleanup(dlg.deleteLater)
         surface._dlg = dlg
-        dlg.evidence_requested.connect(surface._start_evidence)
+        dlg.sweep_requested.connect(surface._start_sweep)
         self.assertEqual(dlg.plot._values, [])          # nothing measured yet
-        dlg._on_run_evidence()
+        dlg._on_run_sweep()
         self._pump(surface)
-        # The reference row is held so later rows are read against it, and the
-        # sweep's samples have produced a drawable frontier from nothing.
-        self.assertIsNotNone(dlg._evidence_ref)
-        self.assertAlmostEqual(dlg._evidence_ref.scale, 1.0, places=6)
+        self.assertIsNotNone(dlg._sweep_ref)
+        self.assertAlmostEqual(dlg._sweep_ref.scale, 1.0, places=6)
         self.assertFalse(dlg._model.provisional)
         self.assertGreater(len(dlg.plot._values), 1)
-        self.assertEqual(len(dlg.evidence._rows), 5)
-
-    def test_a_sweep_is_refused_until_there_is_something_to_reproduce(self):
-        surface = self._surface()
-        ok, why = surface._evidence_ready()
-        self.assertFalse(ok)
-        self.assertIn("Extract", why)
-        surface = self._tuned(region_index=-1)
-        ok, why = surface._evidence_ready()
-        self.assertFalse(ok)
-        self.assertIn("replicate", why)
+        # The storage series rides along, which is the point of the plot.
+        self.assertEqual(len(dlg.plot._second), len(dlg.plot._values))
+        self.assertEqual(len(dlg.sweep._rows), 5)
+        # Every row carries a corpus projection, including the reference. It
+        # lands while only one scale has been timed, so its projection reads "—"
+        # when first drawn; without the re-render at the end it would stay that
+        # way on the one row a user most wants the number for.
+        for label, cells in dlg.sweep._rows.items():
+            self.assertNotEqual(cells[3].text(), "—", f"row {label}")
 
     def test_a_sweep_owns_the_decoder(self):
-        surface = self._tuned()
-        surface._evi_worker = MagicMock()
+        surface = self._surface()
+        surface._sweep_worker = MagicMock()
         surface.extract = LiveScalogramSurface.extract.__get__(surface)
         with patch("gui.explorers.live_scalogram_surface._LiveExtractWorker") as W:
             surface.extract()
             surface.process_whole_video()
         W.assert_not_called()
         self.assertIsNone(surface._proc_worker)
-        surface._evi_worker = None
+        surface._sweep_worker = None
 
     def test_a_failing_scale_does_not_abort_the_remaining_rows(self):
-        surface = self._tuned()
+        surface = self._surface()
         dlg = MagicMock()
         surface._dlg = dlg
         real = live_scalogram_surface.measure_scale
@@ -589,9 +650,9 @@ class EvidenceSweepTests(_SurfaceTestCase):
 
         with patch.object(live_scalogram_surface, "measure_scale", flaky):
             self._sweep(surface, [1.0, 0.5, 0.35])
-        self.assertEqual(dlg.add_evidence.call_count, 2)
-        dlg.evidence_failed.assert_called_once()
-        self.assertAlmostEqual(dlg.evidence_failed.call_args.args[0], 0.5)
+        self.assertEqual(dlg.add_sweep_row.call_count, 2)
+        dlg.sweep_failed.assert_called_once()
+        self.assertAlmostEqual(dlg.sweep_failed.call_args.args[0], 0.5)
 
 
 if __name__ == "__main__":
