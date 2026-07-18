@@ -421,6 +421,64 @@ retention). Do last.
   than one species/fps. Timings above vary run-to-run by ~25% (2600 measured
   5.3 s and 6.8 s); the ratios are sound, the absolute seconds are not.
 
+- **Batch K — done. Downsampling is opt-in, scale 1.0 is the default, and
+  `block_size` tracks the scale.** `DEFAULT_TARGET_WIDTH` and the auto branch of
+  `resolve_downsample` are gone; `PreprocessConfig.downsample=None` now means
+  1.0. New `BASE_BLOCK_SOURCE_PX = 64` + `FlowConfig.resolve_block_size(scale)`;
+  `FlowConfig.block_size=None` means "track the scale", an explicit int still
+  wins. Call sites resolve block *from* scale (`cache.py`, `pipeline.py`,
+  `channel_source.py`, `tab1_flow.py`) — each already had `scale` in hand.
+
+  **The tracking question was the one real fork, and it was decided on detection
+  grounds, not aesthetics.** The plan's two-lever table makes `downsample` and
+  `block_size` sound independent, which reads like an argument for a static
+  block default. It is the opposite: blocks are in *working* pixels, so a static
+  block means the scale knob silently moves the grid too. Detection reads
+  per-block band power and gates on per-region block *counts*, so a moving grid
+  changes detection output for two reasons at once and neither is attributable.
+  Tracking is what makes the scale knob a single-variable experiment — which is
+  exactly what Batch M's empirical panel needs in order to mean anything.
+
+  **Verified end to end**, `GX010047c2` 5312x2988, 7 replicates, 120 frames:
+
+  | setting | scale | block | grid | extract |
+  |---|---|---|---|---|
+  | default | 1.000 | 64 | 41x5 | 4.20 s |
+  | downsample 0.5 | 0.500 | 32 | 41x5 | 2.15 s |
+  | downsample 0.25 | 0.250 | 16 | 41x5 | 1.51 s |
+  | explicit block 16 | 1.000 | 16 | 146x19 | 6.29 s |
+
+  Grid holds at 41x5 across the scale sweep (matching the Batch K table's row 3
+  prediction) while compute moves ~3.5x; the explicit override reaches the finer
+  grid on demand. Full suite green (98 passed).
+
+  `tests/test_auto_downsample.py` rewritten as the plan asked: it now pins the
+  *invariant* (a pre-cropped video and an equivalent uncropped box resolve
+  identically) rather than `resolve_replicate_downsample`, plus grid-invariance
+  under the scale sweep, so it survives the eventual organism-relative mode.
+
+  **Three review findings fixed, all in `tab1_flow.py`, all caused by this
+  change reinterpreting `None`** — worth recording because the shelved-tab rule
+  ("don't fix them if a change breaks them") was overridden deliberately here:
+  `_apply_config` crashed with `TypeError` on `setValue(None)` for any config
+  saved at defaults; the downsample spin's `p.downsample if p.downsample else
+  0.05` mapped a default config to **0.05, a silent 20x downsample** — precisely
+  the failure this batch exists to prevent, arriving through the back door; and
+  tab1's `"auto"` sentinel now meant 1.0 while sitting next to a 0.05 minimum,
+  so it was removed. Also: `reduce_channel_data` now takes the scale from the
+  cached atlas's own meta rather than from `cfg`, since it is reducing data that
+  already records what it was extracted at.
+
+  **Left open:** `resolve_downsample(src_width)` keeps a parameter it ignores,
+  because every call site still passes one. Harmless but misleading — it invites
+  the inference that scale still depends on framing. Worth removing when the
+  organism-relative mode lands, since that mode needs *replicate* geometry, not
+  source width, i.e. a different signature anyway.
+
+  **Batch M is now the blocking item, exactly as the plan warns.** K alone ships
+  a knob users will refuse on principle; the `auto (0.245)` text Batch A added is
+  gone, and nothing yet shows what downsampling buys. Ship M next.
+
 ### Batch I — ROI pre-transcode (todo 23) · new file + `channel_source`
 The one lever that removes the decode wall. Cut each source once into
 per-replicate clips plus a manifest (geometry, scale, source hash, fps at full

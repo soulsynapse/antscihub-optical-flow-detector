@@ -96,15 +96,20 @@ def _test_cache_suffix(cfg: PipelineConfig, duration_s: float) -> str:
     bands = "-".join(
         f"{_number_slug(b.lo_hz)}to{_number_slug(b.hi_hz)}"
         for b in feat.bands)
-    downsample = "auto" if pre.downsample is None else \
-        _number_slug(pre.downsample)
+    # Both knobs are resolved rather than echoed, so the name states the geometry
+    # the run actually used. There is no "auto" scale any more (downsample=None
+    # means 1.0); block=None does still track the scale, and is marked so two
+    # differing hashes at the same resolved block are explicable to a human.
+    scale = pre.resolve_downsample()
+    block = flow.resolve_block_size(scale)
+    block_slug = f"b{block}" if flow.block_size is not None else f"bauto{block}"
     precision = {"float16": "f16", "float32": "f32"}.get(
         feat.dtype, feat.dtype)
     parts = [
         f"test{_number_slug(duration_s)}s",
         flow.backend,
-        f"b{flow.block_size}",
-        f"ds{downsample}",
+        block_slug,
+        f"ds{_number_slug(scale)}",
         f"reg{pre.registration}",
         f"den{pre.denoise}",
         f"bg{pre.bg_subtract}",
@@ -206,8 +211,10 @@ class Tab1Flow(QWidget):
         self.downsample.setRange(0.05, 1.0)
         self.downsample.setSingleStep(0.05)
         self.downsample.setDecimals(3)
-        self.downsample.setSpecialValueText("auto")
-        self.downsample.setValue(0.05)  # == "auto"
+        # No "auto" sentinel: downsampling is opt-in and off by default (todo.md
+        # Batch K), so 1.0 is a real value and 0.05 is a real 20x reduction.
+        # Labelling the minimum "auto" would now mean two different things.
+        self.downsample.setValue(1.0)
         self.downsample.valueChanged.connect(self._refresh_estimates)
         pre.addRow(labelled(self.downsample, "downsample"), QLabel("Downsample"))
 
@@ -488,7 +495,7 @@ class Tab1Flow(QWidget):
                 registration=self.registration.currentText(),
                 denoise=self.denoise.currentText(),
                 bg_subtract=self.bg.currentText(),
-                downsample=None if ds <= 0.05 else float(ds),
+                downsample=float(ds),
                 normalize=self.normalize.currentText(),
             ),
             flow=FlowConfig(
@@ -600,10 +607,10 @@ class Tab1Flow(QWidget):
             return
 
         try:
+            scale = cfg.preprocess.resolve_downsample(info.width)
             layout = build_layout(
-                reps, info.width, info.height,
-                cfg.preprocess.resolve_downsample(info.width),
-                cfg.flow.block_size)
+                reps, info.width, info.height, scale,
+                cfg.flow.resolve_block_size(scale))
         except ValueError as e:
             self.size_banner.setText("Replicate geometry needs attention")
             self.estimate_label.setText(str(e))
@@ -948,7 +955,10 @@ class Tab1Flow(QWidget):
 
     def _apply_config(self, cfg: PipelineConfig):
         p, f, ft = cfg.preprocess, cfg.flow, cfg.features
-        self.downsample.setValue(p.downsample if p.downsample else 0.05)
+        # resolve_downsample(), not `or 0.05`: None now means 1.0 (no
+        # downsampling), and the old falsy check mapped it to the 0.05 minimum
+        # -- a silent 20x downsample on any config saved at defaults.
+        self.downsample.setValue(p.resolve_downsample())
         self.registration.setCurrentText(p.registration)
         self.denoise.setCurrentText(p.denoise)
         self.bg.setCurrentText(p.bg_subtract)
@@ -957,7 +967,9 @@ class Tab1Flow(QWidget):
         self.mask_btn.setText(os.path.basename(p.mask_path) if p.mask_path
                               else "No within-box mask")
         self.backend.setCurrentText(f.backend)
-        self.block.setValue(f.block_size)
+        # block_size is None ("track the scale") by default, which setValue
+        # cannot take; resolve it against the scale just applied.
+        self.block.setValue(f.resolve_block_size(p.resolve_downsample()))
         if ft.bands:
             self.band_lo.setValue(ft.bands[0].lo_hz)
             self.band_hi.setValue(ft.bands[0].hi_hz)

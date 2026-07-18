@@ -522,7 +522,7 @@ def estimate_cache_bytes(cfg, width: int, height: int, n_frames: int,
     from core.features import cached_feature_names
 
     scale = cfg.preprocess.resolve_downsample(width)
-    block = cfg.flow.block_size
+    block = cfg.flow.resolve_block_size(scale)
     if replicates:
         from core.replicates import build_layout
         layout = build_layout(replicates, width, height, scale, block)

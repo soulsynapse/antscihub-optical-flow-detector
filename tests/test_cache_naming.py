@@ -42,7 +42,10 @@ class TestCacheNamingTests(unittest.TestCase):
 
     def test_suffix_makes_default_states_explicit(self):
         suffix = _test_cache_suffix(PipelineConfig(), 10.0)
-        self.assertIn("_test10s_farneback_b16_dsauto", suffix)
+        # Downsampling is opt-in and off by default (todo.md Batch K), so the
+        # default scale is a literal 1 and the block tracks it from
+        # BASE_BLOCK_SOURCE_PX rather than being a fixed 16.
+        self.assertIn("_test10s_farneback_bauto64_ds1", suffix)
         # Registration/denoise/bg default off; normalization defaults to z-score
         # (CLAHE has a known replicate-edge artifact -- see KNOWN_ISSUES.md).
         self.assertIn("_regoff_denoff_bgoff_normzscore_", suffix)

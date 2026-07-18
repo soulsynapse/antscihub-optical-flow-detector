@@ -76,10 +76,18 @@ HELP: dict[str, tuple[str, str]] = {
         "Lower = faster and smaller, but small or slow-moving things stop "
         "producing measurable flow. Higher = finer motion is resolved, at "
         "quadratic cost. Going from 0.25 to 0.5 makes the pass roughly 4x slower "
-        "and the cache 4x bigger.",
-        "The default targets a working width of about 1300 px, so it adapts to "
-        "the footage: a 5.3K GoPro frame gets ~0.25, a 1080p frame gets ~0.5. A "
-        "fixed factor would be wrong for one or the other.",
+        "and the cache 4x bigger. Note there is a floor: wall time is bounded "
+        "below by video decode, so past some scale you give up resolution and "
+        "buy almost no time. Measured on 5.3K footage, halving the working "
+        "width from 1300 to 650 px cut pixels 4x for about 13% of the wall "
+        "clock.",
+        "1.0 -- no downsampling -- and that is deliberate. A pipeline that "
+        "shrinks frames by default has already decided which behaviours are "
+        "detectable; whether a coarser scale still resolves yours is a result "
+        "about your animal, not a constant this tool should assume. It is "
+        "offered because it is frequently what makes a large project "
+        "computationally feasible, which is a real and legitimate reason to "
+        "reach for it -- just an examined one.",
         "After a test pass, inspect the replicate's <i>speed</i> series and PSD, "
         "then its feature histogram in Behavior Classification. If known motion "
         "is indistinguishable from the quiet baseline, you have downsampled too "
@@ -94,9 +102,17 @@ HELP: dict[str, tuple[str, str]] = {
         "proportionally more disk. Larger blocks average more pixels together, "
         "which suppresses flow noise but will dilute a small behavior: if a "
         "wing occupies a quarter of a block, three quarters of that block's "
-        "signal is background.",
-        "16x16 at the default downsample means each block covers about 64x64 "
-        "source pixels, which is a reasonable fraction of a grasshopper.",
+        "signal is background. This is close to a pure <i>storage</i> lever: "
+        "measured, 16 -> 64 was 13x less data for only 13% less compute, "
+        "because the per-pixel solve runs at working resolution whatever the "
+        "block size. If you are short on compute rather than disk, reach for "
+        "Downsample instead.",
+        "Auto, meaning the block tracks the downsample factor so it always "
+        "covers about 64x64 <i>source</i> pixels -- a reasonable fraction of a "
+        "grasshopper. That keeps the two knobs independent: moving Downsample "
+        "changes compute without also moving the grid, so a change in what gets "
+        "detected is attributable to one lever rather than two. Setting an "
+        "explicit block size opts out of the tracking.",
         "Click a block you know contains the behavior and look at its time "
         "series in the inspector. If the oscillation is visible but small "
         "relative to its own baseline, the block is too big and is diluting it."),

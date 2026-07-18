@@ -83,9 +83,9 @@ def synth_live_meta(video_path: str, cfg, replicates: list[dict], *,
     without running (or writing) any flow cache. ``n_frames`` is the FULL clip;
     the extraction window is applied separately."""
     scale = cfg.preprocess.resolve_downsample(width)
-    layout = build_layout(replicates, width, height, scale, cfg.flow.block_size)
+    block = cfg.flow.resolve_block_size(scale)
+    layout = build_layout(replicates, width, height, scale, block)
     ny, nx = layout.atlas_grid
-    block = int(cfg.flow.block_size)
     return {
         "video_path": video_path,
         "backend": "live",
@@ -177,10 +177,12 @@ def reduce_channel_data(pp: ChannelData, cfg, replicates: list[dict]
     src = pp.meta
     if int(src.get("block_size", 0)) != 1:
         raise ValueError("reduce_channel_data expects a block_size=1 source")
-    block = int(cfg.flow.block_size)
+    w, h = int(src["src_width"]), int(src["src_height"])
+    # Track the scale the cached pixels were actually extracted at, not the one
+    # in cfg: this reduces an existing atlas, so its own meta is authoritative.
+    block = cfg.flow.resolve_block_size(float(src["downsample"]))
     if block <= 1:
         return pp                                    # already pixel-level
-    w, h = int(src["src_width"]), int(src["src_height"])
     fps = float(src["fps"])
     n = int(src["n_frames"])
     ws = int(getattr(pp, "window_start", src.get("window_start", 0)))

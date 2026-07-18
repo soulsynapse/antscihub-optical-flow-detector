@@ -168,8 +168,8 @@ def run_pipeline(
         n_frames = min(n_frames, max(2, int(round(duration_s * fps))))
 
     replicates = list(replicates or [])
-    block = cfg.flow.block_size
     scale = cfg.preprocess.resolve_downsample(info.width)
+    block = cfg.flow.resolve_block_size(scale)
     layout = build_layout(replicates, info.width, info.height, scale, block)
     key = cfg.cache_key(info.video_hash, layout.geometry_hash) + cache_key_suffix
 

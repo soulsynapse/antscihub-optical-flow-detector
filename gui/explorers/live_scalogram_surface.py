@@ -40,9 +40,14 @@ from core.wavelet import default_freqs
 from gui.explorers.detection_timeline import DetectionNavigator
 from gui.explorers.scalogram_explorer import ScalogramExplorer
 
-# downsample spinbox sentinel: at/under this value means "auto" (derive from the
-# default target width), matching the Preprocessing & Flow tab's convention.
-_AUTO_DS = 0.05
+# Downsampling is opt-in and off by default (todo.md Batch K), so there is no
+# longer an "auto" sentinel on the scale knob -- 1.0 is a real, and the default,
+# value. This is the smallest scale the spinbox offers.
+_MIN_DS = 0.05
+
+# Block spinbox sentinel: 0 means "track the scale", i.e. leave block_size None
+# and let FlowConfig hold the grid fixed in source pixels.
+_AUTO_BLOCK = 0
 
 # Idle labels for the two action buttons; each becomes "Stop" while its own pass
 # runs (see _set_busy).
@@ -264,29 +269,35 @@ class LiveScalogramSurface(QWidget):
         row.addSpacing(12)
         row.addWidget(QLabel("Downsample"))
         self.ds_spin = QDoubleSpinBox()
-        self.ds_spin.setRange(_AUTO_DS, 1.0)
+        self.ds_spin.setRange(_MIN_DS, 1.0)
         self.ds_spin.setSingleStep(0.05)
         self.ds_spin.setDecimals(3)
-        # "auto" is derived from the source width and is fixed for this clip, so
-        # resolve it once and show the factor it actually stands for.
-        auto_scale = PreprocessConfig(downsample=None).resolve_downsample(
-            self._dims[0])
-        self.ds_spin.setSpecialValueText(f"auto ({auto_scale:.3f})")
-        self.ds_spin.setValue(cfg.preprocess.downsample
-                              if cfg.preprocess.downsample else _AUTO_DS)
+        self.ds_spin.setValue(cfg.preprocess.resolve_downsample())
+        self.ds_spin.setToolTip(
+            "Working scale. 1.0 (no downsampling) is the default and is NOT a "
+            "quality setting to trade away lightly: downsampling decides what "
+            "is detectable, and whether a coarser scale still resolves your "
+            "behaviour has to be demonstrated for that behaviour and species. "
+            "It is offered because it is often what makes a large project "
+            "computationally feasible — it shortens every per-pixel stage.")
         self.ds_spin.valueChanged.connect(self._debounce.start)
+        self.ds_spin.valueChanged.connect(self._sync_block_auto_text)
         row.addWidget(self.ds_spin)
 
         row.addWidget(QLabel("Block"))
         self.block_spin = QSpinBox()
-        self.block_spin.setRange(1, 64)
-        self.block_spin.setValue(int(cfg.flow.block_size))
+        self.block_spin.setRange(_AUTO_BLOCK, 64)
+        self.block_spin.setValue(cfg.flow.block_size or _AUTO_BLOCK)
         self.block_spin.setToolTip(
-            "Pixels per block. Sets the scalogram grid (and cube memory); the "
-            "per-pixel tensor solve is block-size independent, so a change here "
-            "re-reduces the cached pixels instead of re-extracting.")
+            "Working pixels per block. Sets the scalogram grid (and cube "
+            "memory); the per-pixel tensor solve is block-size independent, so "
+            "a change here re-reduces the cached pixels instead of "
+            "re-extracting. On auto the block tracks the scale, holding the "
+            "grid fixed in source pixels so that moving Downsample changes "
+            "compute only — not localization.")
         self.block_spin.valueChanged.connect(self._block_debounce.start)
         row.addWidget(self.block_spin)
+        self._sync_block_auto_text()
 
         row.addWidget(QLabel("Normalize"))
         self.norm_combo = QComboBox()
@@ -342,16 +353,23 @@ class LiveScalogramSurface(QWidget):
     def _sync_window_label(self):
         self.start_lbl.setText(f"{self.start_slider.value() / self.fps:.2f} s")
 
+    def _sync_block_auto_text(self):
+        """Show what "auto" currently resolves to, since it moves with the scale."""
+        tracked = FlowConfig(block_size=None).resolve_block_size(
+            float(self.ds_spin.value()))
+        self.block_spin.setSpecialValueText(f"auto ({tracked})")
+
     # -- config assembly -----------------------------------------------------
     def _build_cfg(self) -> PipelineConfig:
-        ds = self.ds_spin.value()
+        block = int(self.block_spin.value())
         return PipelineConfig(
             preprocess=PreprocessConfig(
-                downsample=None if ds <= _AUTO_DS else float(ds),
+                downsample=float(self.ds_spin.value()),
                 normalize=self.norm_combo.currentText(),
                 denoise="off", registration="off", bg_subtract="off",
                 mask_path=None),
-            flow=FlowConfig(block_size=int(self.block_spin.value())),
+            flow=FlowConfig(
+                block_size=None if block == _AUTO_BLOCK else block),
         )
 
     def _window(self) -> tuple[int, int]:
@@ -420,7 +438,7 @@ class LiveScalogramSurface(QWidget):
         extract_cfg = self._cfg_block1(cfg) if fits else cfg
         self._set_busy(_Busy.EXTRACT)
         self._extract_t0 = time.monotonic()
-        self._extract_ctx = (f"block {cfg.flow.block_size}, "
+        self._extract_ctx = (f"block {self._resolved_block(cfg)}, "
                              f"norm {cfg.preprocess.normalize}")
         self.status_lbl.setText(
             f"extracting {n} frames from {start / self.fps:.2f} s "
@@ -486,6 +504,11 @@ class LiveScalogramSurface(QWidget):
         ny, nx = build_layout(self.replicates, w, h, scale, 1).atlas_grid
         return n * ny * nx * len(LIVE_CHANNELS) * 4 <= self._pp_budget
 
+    def _resolved_block(self, cfg: PipelineConfig) -> int:
+        """The working block size a pass will actually use (auto tracks scale)."""
+        return cfg.flow.resolve_block_size(
+            cfg.preprocess.resolve_downsample(self._dims[0]))
+
     @staticmethod
     def _cfg_block1(cfg: PipelineConfig) -> PipelineConfig:
         return replace(cfg, flow=replace(cfg.flow, block_size=1))
@@ -510,7 +533,8 @@ class LiveScalogramSurface(QWidget):
             if self._explorer is not None:
                 self._pending_state = self._explorer.capture_view_state()
             self.status_lbl.setText(
-                f"re-reducing to block {cfg.flow.block_size} — no re-extract…")
+                f"re-reducing to block {self._resolved_block(cfg)} — "
+                f"no re-extract…")
             self.status_lbl.repaint()
             self._show_channel_data(
                 reduce_channel_data(self._pp, cfg, self.replicates))

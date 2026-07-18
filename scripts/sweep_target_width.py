@@ -46,8 +46,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.channel_source import live_channel_source
-from core.config import (DEFAULT_TARGET_WIDTH, FlowConfig, PipelineConfig,
-                         PreprocessConfig)
+from core.config import FlowConfig, PipelineConfig, PreprocessConfig
 from core.detection import (detect_gate, inband_count, region_blocks_and_grid,
                             windowed_mean)
 from core.video import VideoSource
@@ -57,7 +56,12 @@ from core.wavelet import band_indices, default_freqs, morlet_band_power
 # cover the same SOURCE area -- see the module docstring. 1300/16 is today's
 # default and is the reference every other rung is scored against.
 LADDER = ((2600, 32), (1300, 16), (650, 8), (325, 4))
-REFERENCE_WIDTH = DEFAULT_TARGET_WIDTH
+
+# This sweep has been run; its result is recorded under "DEFAULT_TARGET_WIDTH
+# sweep" in todo.md and is what retired the constant this used to import. The
+# reference rung is kept as a literal so the script stays runnable as a
+# historical comparison -- it is no longer a default anywhere in the tool.
+REFERENCE_WIDTH = 1300
 
 # Operating point, as quantiles of each rung's own distribution.
 VALUE_Q = 0.90        # value band = [q90 of band power, +inf)
