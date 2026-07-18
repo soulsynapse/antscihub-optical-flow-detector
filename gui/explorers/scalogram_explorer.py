@@ -375,6 +375,22 @@ class ScalogramExplorer(QWidget):
             "freq_band": (self.scalo_plot.band_lo, self.scalo_plot.band_hi),
         }
 
+    def detection_params(self) -> dict:
+        """The tuned detector settings, for the whole-video commit pass. Returns
+        the channel attribute, selected region, and the three bands + window so
+        the whole-clip pass reproduces exactly what this preview shows."""
+        dp = self._selected_density()
+        return {
+            "channel_attr": CHANNELS[self.channel][0],
+            "region_index": self.active_region_index,
+            "freq_band_hz": self.scalo_plot.band_hz(),
+            "value_band": dp.band() if dp is not None
+            else (float("-inf"), float("inf")),
+            "count_band": self.count_w_plot.band(),
+            "detect_window": self.sweep_win,
+            "centered": self.centered,
+        }
+
     def apply_view_state(self, st: dict) -> None:
         """Restore a captured view state onto this (freshly built) explorer."""
         ch = st.get("channel")

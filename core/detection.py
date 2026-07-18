@@ -18,7 +18,25 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from core.wavelet import band_indices, morlet_band_power
+from core.wavelet import band_indices, default_freqs, morlet_band_power
+
+
+def region_blocks_and_grid(meta: dict, channel_arr: np.ndarray,
+                           region_index: int):
+    """A region's (T, B) block columns plus its (dy, dx, gy, gx) clump grid, from
+    a cache-shaped meta. Column order and 0-based grid match the explorer's
+    _scope_blocks / _make_snap, so a whole-clip pass indexes blocks identically."""
+    T = channel_arr.shape[0]
+    tiles = meta.get("replicate_tiles")
+    if tiles:
+        y0, x0, y1, x1 = (int(v) for v in tiles[region_index]["atlas_bbox"])
+    else:
+        ny, nx = (int(v) for v in meta["grid"])
+        y0, x0, y1, x1 = 0, 0, ny, nx
+    blocks = channel_arr[:, y0:y1, x0:x1].reshape(T, -1)
+    dy, dx = y1 - y0, x1 - x0
+    gy, gx = np.mgrid[0:dy, 0:dx]
+    return blocks, (dy, dx, gy.ravel(), gx.ravel())
 
 
 def inband_count(m: np.ndarray, lo: float, hi: float) -> np.ndarray:
@@ -136,6 +154,28 @@ def recompute_from_band_power(band_power: np.ndarray, *, value_band, count_band,
         freq_band_hz=tuple(freq_band_hz), value_band=(lo, hi),
         count_band=(blo, bhi), detect_window=int(detect_window),
         centered=bool(centered), window_start=int(window_start))
+
+
+def detect_channel_region(channel_data, region_index: int, channel_attr: str, *,
+                          freq_band_hz, value_band, count_band, detect_window,
+                          centered, freqs=None, block_chunk: int = 512
+                          ) -> DetectionResult:
+    """Run the detector over ONE region of an already-extracted ChannelData -- the
+    whole-clip commit path. ``channel_data`` is duck-typed (needs ``.meta`` and
+    ``.channels``), so this stays cache/GUI-agnostic. ``freqs`` defaults to the
+    explorer's ``default_freqs(fps)`` so the pass and the preview share the bank."""
+    meta = channel_data.meta
+    fps = float(meta["fps"])
+    if freqs is None:
+        freqs = default_freqs(fps)
+    arr = np.asarray(channel_data.channels[channel_attr], np.float32)
+    blocks, region_grid = region_blocks_and_grid(meta, arr, region_index)
+    return detect_over_blocks(
+        blocks, fps, freqs, freq_band_hz=freq_band_hz, value_band=value_band,
+        count_band=count_band, detect_window=detect_window, centered=centered,
+        region_grid=region_grid,
+        window_start=int(getattr(channel_data, "window_start", 0)),
+        block_chunk=block_chunk)
 
 
 def detect_over_blocks(blocks: np.ndarray, fps: float, freqs: np.ndarray, *,

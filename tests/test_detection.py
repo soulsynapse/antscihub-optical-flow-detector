@@ -8,8 +8,9 @@ import unittest
 import numpy as np
 
 from core.wavelet import band_indices, default_freqs, morlet_band_power, morlet_power
-from core.detection import (detect_over_blocks, inband_count,
-                           recompute_from_band_power, windowed_mean)
+from core.detection import (detect_channel_region, detect_over_blocks,
+                           inband_count, recompute_from_band_power,
+                           region_blocks_and_grid, windowed_mean)
 
 
 class MorletBandPowerTest(unittest.TestCase):
@@ -94,6 +95,48 @@ class DetectOverBlocksTest(unittest.TestCase):
             centered=kw["centered"])
         np.testing.assert_array_equal(full.count, again.count)
         np.testing.assert_array_equal(full.gate, again.gate)
+
+
+class _StubChannelData:
+    def __init__(self, arr, ny, nx, tiles=None):
+        self.meta = {"fps": 30.0, "grid": [ny, nx], "n_frames": arr.shape[0],
+                     "replicate_tiles": tiles or []}
+        self.channels = {"tensor_speed": arr}
+        self.window_start = 0
+
+
+class DetectChannelRegionTest(unittest.TestCase):
+    def test_whole_frame_matches_direct_blocks(self):
+        fps = 30.0
+        freqs = default_freqs(fps)
+        T, ny, nx = 200, 3, 4
+        arr = np.random.default_rng(4).standard_normal((T, ny, nx)).astype(np.float32)
+        kw = dict(freq_band_hz=(5.0, 10.0), value_band=(0.5, 5.0),
+                  count_band=(1.0, float("inf")), detect_window=15, centered=True)
+
+        res = detect_channel_region(_StubChannelData(arr, ny, nx), 0,
+                                    "tensor_speed", freqs=freqs, **kw)
+        gy, gx = np.mgrid[0:ny, 0:nx]
+        ref = detect_over_blocks(arr.reshape(T, ny * nx), fps, freqs,
+                                 region_grid=(ny, nx, gy.ravel(), gx.ravel()), **kw)
+
+        self.assertEqual(res.band_power.shape, (T, ny * nx))
+        np.testing.assert_allclose(res.band_power, ref.band_power)
+        np.testing.assert_array_equal(res.gate, ref.gate)
+        np.testing.assert_array_equal(res.clump, ref.clump)
+
+    def test_region_scoping_picks_the_right_tile(self):
+        # Two stacked tiles in the atlas; scoping region 1 must read only its rows.
+        ny, nx, T = 4, 2, 60
+        arr = np.zeros((T, ny, nx), np.float32)
+        arr[:, 2:4, :] = 3.0                         # only region 1 has signal
+        tiles = [{"atlas_bbox": [0, 0, 2, 2]}, {"atlas_bbox": [2, 0, 4, 2]}]
+        blocks, grid = region_blocks_and_grid(
+            _StubChannelData(arr, ny, nx, tiles).meta, arr, 1)
+        self.assertEqual(blocks.shape, (T, 4))
+        self.assertTrue((blocks == 3.0).all())
+        self.assertEqual(grid[0], 2)                 # dy
+        self.assertEqual(grid[1], 2)                 # dx
 
 
 if __name__ == "__main__":

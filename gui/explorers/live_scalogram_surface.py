@@ -21,13 +21,17 @@ independent (a future optimization, not needed now). See the branch plan.
 """
 from __future__ import annotations
 
+import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout,
                              QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
 from core.channel_source import live_channel_source
 from core.config import FlowConfig, PipelineConfig, PreprocessConfig
+from core.detection import detect_channel_region
 from core.video import VideoSource
+from core.wavelet import default_freqs
+from gui.explorers.detection_timeline import DetectionNavigator
 from gui.explorers.scalogram_explorer import ScalogramExplorer
 
 # downsample spinbox sentinel: at/under this value means "auto" (derive from the
@@ -57,6 +61,34 @@ class _LiveExtractWorker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class _ProcessWorker(QThread):
+    """The whole-video commit: stream the WHOLE clip's channels once, then run the
+    tuned detector over the selected region. No flow, no cache -- just the
+    detection track. This is the one expensive pass, paid after tuning."""
+    done = pyqtSignal(object)       # DetectionResult
+    failed = pyqtSignal(str)
+
+    def __init__(self, video_path, cfg, replicates, dims, region_index, params,
+                 parent=None):
+        super().__init__(parent)
+        self._args = (video_path, cfg, replicates, dims, region_index, params)
+
+    def run(self):
+        video_path, cfg, reps, dims, region_index, params = self._args
+        w, h, fps, fc = dims
+        try:
+            cd = live_channel_source(video_path, cfg, reps, start=0, n=None,
+                                     width=w, height=h, fps=fps, frame_count=fc)
+            res = detect_channel_region(
+                cd, region_index, params["channel_attr"],
+                freqs=default_freqs(fps), freq_band_hz=params["freq_band_hz"],
+                value_band=params["value_band"], count_band=params["count_band"],
+                detect_window=params["detect_window"], centered=params["centered"])
+            self.done.emit(res)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 class LiveScalogramSurface(QWidget):
     def __init__(self, video_path: str, replicates: list[dict],
                  base_cfg: PipelineConfig | None = None, parent=None):
@@ -74,6 +106,7 @@ class LiveScalogramSurface(QWidget):
 
         self._explorer: ScalogramExplorer | None = None
         self._worker: _LiveExtractWorker | None = None
+        self._proc_worker: _ProcessWorker | None = None
         self._pending_state: dict | None = None
 
         # Coalesce rapid knob edits into a single re-extract on settle. Created
@@ -95,6 +128,12 @@ class LiveScalogramSurface(QWidget):
         self._placeholder.setStyleSheet("color:#8ab; padding:40px;")
         self._host_lay.addWidget(self._placeholder)
         root.addWidget(self._host, 1)
+
+        # Whole-clip detection navigator (hidden until a commit pass lands).
+        self.navigator = DetectionNavigator()
+        self.navigator.focus_requested.connect(self._focus_frame)
+        self.navigator.setVisible(False)
+        root.addWidget(self.navigator)
 
         # First extract once shown, so the window opens without a blocking pass.
         QTimer.singleShot(0, self.extract)
@@ -161,6 +200,12 @@ class LiveScalogramSurface(QWidget):
         self.extract_btn = QPushButton("Extract")
         self.extract_btn.clicked.connect(self.extract)
         row.addWidget(self.extract_btn)
+        self.process_btn = QPushButton("Process whole video ▶")
+        self.process_btn.setToolTip(
+            "Run the tuned detector over the WHOLE clip (one streaming pass, no "
+            "flow, no cache) and navigate the detections below.")
+        self.process_btn.clicked.connect(self.process_whole_video)
+        row.addWidget(self.process_btn)
         outer.addLayout(row)
 
         self.status_lbl = QLabel("")
@@ -200,8 +245,8 @@ class LiveScalogramSurface(QWidget):
 
     # -- extraction ----------------------------------------------------------
     def extract(self):
-        if self._worker is not None:               # coalesce: a pass is running
-            return
+        if self._worker is not None or self._proc_worker is not None:
+            return                                  # a pass is already running
         self._debounce.stop()
         start, n = self._window()
         if n < 2:
@@ -253,6 +298,61 @@ class LiveScalogramSurface(QWidget):
             old.setParent(None)
             old.deleteLater()
 
+    # -- whole-video commit --------------------------------------------------
+    def process_whole_video(self):
+        if self._worker is not None or self._proc_worker is not None:
+            return                                  # a pass is already running
+        if self._explorer is None:
+            self.status_lbl.setText("extract a window and tune it first")
+            return
+        params = self._explorer.detection_params()
+        if params["region_index"] < 0:
+            self.status_lbl.setText("select a replicate before processing")
+            return
+        cfg = self._build_cfg()
+        self.process_btn.setEnabled(False)
+        self.extract_btn.setEnabled(False)
+        flo, fhi = params["freq_band_hz"]
+        self.status_lbl.setText(
+            f"processing whole video ({self.frame_count} frames) · "
+            f"{flo:.2f}–{fhi:.2f} Hz on {params['channel_attr']}… this is the "
+            f"one expensive pass")
+        self._proc_worker = _ProcessWorker(
+            self.video_path, cfg, self.replicates, self._dims,
+            params["region_index"], params, self)
+        self._proc_worker.done.connect(self._on_processed)
+        self._proc_worker.failed.connect(self._on_process_failed)
+        self._proc_worker.finished.connect(self._proc_worker.deleteLater)
+        self._proc_worker.start()
+
+    def _on_processed(self, res):
+        self._proc_worker = None
+        self.process_btn.setEnabled(True)
+        self.extract_btn.setEnabled(True)
+        self.navigator.set_result(res, self.fps)
+        self.navigator.setVisible(True)
+        n = len(res.detected_intervals())
+        self.status_lbl.setText(
+            f"whole-video pass done · {n} detection{'s' if n != 1 else ''} — "
+            f"click one (or step strongest) to verify in a window")
+
+    def _on_process_failed(self, msg: str):
+        self._proc_worker = None
+        self.process_btn.setEnabled(True)
+        self.extract_btn.setEnabled(True)
+        self.status_lbl.setText(f"process failed: {msg}")
+
+    def _focus_frame(self, center: int):
+        """A detection was chosen: load a window centered on it for verification."""
+        n = max(2, int(round(self.len_spin.value() * self.fps)))
+        start = int(np.clip(center - n // 2, 0, max(0, self.frame_count - n)))
+        self.navigator.set_cursor(center)
+        self.start_slider.blockSignals(True)
+        self.start_slider.setValue(start)
+        self.start_slider.blockSignals(False)
+        self._sync_window_label()
+        self.extract()
+
     def toggle_playback(self):
         """Space handler the main window's focus-walk finds; drives the hosted
         explorer so the embedded explorer needs no Space shortcut of its own."""
@@ -260,9 +360,10 @@ class LiveScalogramSurface(QWidget):
             self._explorer.toggle_playback()
 
     def closeEvent(self, e):
-        if self._worker is not None:
-            self._worker.wait()
-            self._worker = None
+        for w in (self._worker, self._proc_worker):
+            if w is not None:
+                w.wait()
+        self._worker = self._proc_worker = None
         if self._explorer is not None:
             self._explorer.close()
         super().closeEvent(e)
