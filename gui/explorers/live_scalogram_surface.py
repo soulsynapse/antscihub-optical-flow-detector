@@ -60,6 +60,14 @@ _PROCESS_TEXT = "Process whole video ▶"
 # None, which is a real regime (the block tracked the scale).
 _INFER = object()
 
+# Longest side of the source crop the render strip works from. A replicate box
+# can be the whole frame, and squeezing 5312 px into a ~108 px tile makes every
+# scale look identical -- the display becomes the bottleneck instead of the
+# working resolution, which is the one thing the strip exists to show. Cropping
+# to a centre window keeps the comparison at a magnification where the
+# difference between scales is visible.
+_RENDER_MAX_PX = 420
+
 
 class _Busy(Enum):
     """Which pass owns the decoder. Named rather than bare strings because
@@ -133,6 +141,34 @@ class _LiveExtractWorker(_StreamWorker):
             video_path, cfg, reps, start=start, n=n,
             width=w, height=h, fps=fps, frame_count=fc, progress=self._tick)
         self.done.emit(cd)
+
+
+class _RenderWorker(_StreamWorker):
+    """Render one replicate box at every candidate scale, off the GUI thread.
+
+    Cheap in work (one frame pair, then a resize per scale) and expensive in
+    latency: seeking long-GOP footage decodes forward from the preceding
+    keyframe, which is easily a second on 5.3K. Doing that on the GUI thread
+    would freeze the dialog on open and again on every replicate change.
+
+    Unlike the streaming passes this does NOT contend for the decoder the others
+    hold -- it opens its own ``VideoSource``, reads two frames and closes -- so
+    it is deliberately not gated behind ``_sweep_ready``. Blocking it while an
+    extract runs would leave the strip empty in the ordinary case of opening the
+    window straight after a pass.
+    """
+
+    def __init__(self, video_path, box, frame_idx, scales, pre_cfg, parent=None):
+        super().__init__(parent)
+        self._args = (video_path, box, frame_idx, list(scales), pre_cfg)
+
+    def _run(self):
+        from core.scale_render import fit_box_to, render_box_at_scales
+        video_path, box, frame_idx, scales, pre_cfg = self._args
+        renders = render_box_at_scales(
+            video_path, fit_box_to(box, _RENDER_MAX_PX), frame_idx, scales,
+            base_cfg=pre_cfg)
+        self.done.emit(renders)
 
 
 class _ProcessWorker(_StreamWorker):
@@ -277,6 +313,9 @@ class LiveScalogramSurface(QWidget):
         # must not overlap the extract or the whole-video commit.
         self._sweep_worker: _SweepWorker | None = None
         self._sweep_block_intent: int | None = None
+        # The dialog's render strip. Its own decoder handle, so it does not
+        # contend with the passes above and is not tracked by _Busy.
+        self._render_worker: _RenderWorker | None = None
         self._dlg = None
 
         # Coalesce rapid knob edits into a single re-extract on settle. Created
@@ -629,6 +668,7 @@ class LiveScalogramSurface(QWidget):
             n_channels=len(LIVE_CHANNELS), parent=self)
         dlg.sweep_requested.connect(self._start_sweep)
         dlg.sweep_cancelled.connect(self._stop_sweep)
+        dlg.render_requested.connect(self._start_render)
         ok, why = self._sweep_ready()
         dlg.set_sweep_available(ok, why)
         self._dlg = dlg
@@ -639,6 +679,7 @@ class LiveScalogramSurface(QWidget):
             # to, and it holds the decoder the next extract needs. Unwind it here
             # rather than letting it race the reopened dialog.
             self._stop_sweep(wait=True)
+            self._stop_render(wait=True)
             self._dlg = None
             # Parented to the surface, so without this each open leaves a live
             # dialog behind whose Run button is still wired to _start_sweep.
@@ -647,6 +688,77 @@ class LiveScalogramSurface(QWidget):
             # setValue fires valueChanged, which starts the re-extract debounce,
             # so choosing a scale here applies exactly as dragging the spin does.
             self.ds_spin.setValue(float(dlg.chosen_scale))
+
+    # -- the dialog's render strip -------------------------------------------
+    def _replicate_box(self, index: int):
+        """The source-pixel box of one replicate, as extraction sees it.
+
+        Through ``build_layout`` at scale 1.0 rather than off the replicate dict
+        directly, so the strip renders the same box the pass crops -- a box the
+        layout clamps or rounds must not be shown unclamped, or the strip
+        describes a crop that never runs.
+        """
+        layout = build_layout(self.replicates, self._dims[0], self._dims[1],
+                              scale=1.0, block_size=1)
+        tiles = list(layout.tiles)
+        if not tiles:
+            return None
+        return tiles[min(max(0, index), len(tiles) - 1)].source_box
+
+    def _start_render(self, rep_index: int, scales):
+        box = self._replicate_box(int(rep_index))
+        if box is None:
+            if self._dlg is not None:
+                self._dlg.render_failed("this source has no replicate boxes")
+            return
+        # Supersede rather than queue: the user stepping through replicates would
+        # otherwise wait out every seek they skipped past.
+        self._stop_render(wait=True)
+        start, n = self._window()
+        self._render_worker = _RenderWorker(
+            self.video_path, box, start + n // 2, scales,
+            self._build_cfg().preprocess, self)
+        self._render_worker.done.connect(self._on_render_done)
+        self._render_worker.failed.connect(self._on_render_failed)
+        self._render_worker.finished.connect(self._render_worker.deleteLater)
+        self._render_worker.start()
+
+    def _stop_render(self, wait: bool = False):
+        w = self._render_worker
+        if w is None:
+            return
+        w.cancel()
+        self._render_worker = None
+        if wait:
+            # There is no cancel point inside a two-frame decode, so this waits
+            # out the seek rather than interrupting it. Bounded and short, and
+            # the alternative is a thread writing into a closed dialog.
+            w.wait()
+
+    def _on_render_done(self, renders):
+        # A superseded worker still runs to completion (a two-frame decode has no
+        # cancel point) and still emits. _stop_render has already cleared the
+        # slot, so identity is what distinguishes the live result from the stale
+        # one -- without it a fast second request is overwritten by the first.
+        if self.sender() is not self._render_worker:
+            return
+        self._render_worker = None
+        if self._dlg is None:
+            return
+        first = renders[0] if renders else None
+        note = ""
+        if first is not None:
+            note = (f"Frame {self._window()[0] + self._window()[1] // 2} of "
+                    f"replicate {self._dlg.rep_spin.value()}, "
+                    f"{first.size_label} at full resolution.")
+        self._dlg.set_renders(renders, note)
+
+    def _on_render_failed(self, msg: str):
+        if self.sender() is not self._render_worker:
+            return
+        self._render_worker = None
+        if self._dlg is not None:
+            self._dlg.render_failed(msg)
 
     # -- the dialog's timing sweep -------------------------------------------
     def _sweep_ready(self) -> tuple[bool, str]:
@@ -984,11 +1096,13 @@ class LiveScalogramSurface(QWidget):
         # and it re-enters extract() on a surface that is on its way out.
         self._debounce.stop()
         self._block_debounce.stop()
-        for w in (self._worker, self._proc_worker, self._sweep_worker):
+        for w in (self._worker, self._proc_worker, self._sweep_worker,
+                  self._render_worker):
             if w is not None:
                 w.cancel()      # unwind at the next tick instead of waiting it out
                 w.wait()
         self._worker = self._proc_worker = self._sweep_worker = None
+        self._render_worker = None
         if self._explorer is not None:
             self._explorer.close()
         super().closeEvent(e)

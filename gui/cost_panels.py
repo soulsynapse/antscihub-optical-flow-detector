@@ -14,7 +14,8 @@ an aggregate that looked authoritative and did not mean what it appeared to.
 from __future__ import annotations
 
 from PyQt6.QtCore import QPointF, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import (QColor, QFont, QImage, QPainter, QPainterPath, QPen,
+                         QPixmap)
 from PyQt6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QPushButton,
                              QSizePolicy, QVBoxLayout, QWidget)
 
@@ -257,9 +258,21 @@ class FrontierPlot(QWidget):
             p.setPen(QPen(_RISE, 1, Qt.PenStyle.DotLine))
             p.drawLine(int(rx), y0, int(rx), y0 + h)
             p.setPen(_RISE)
-            p.drawText(int(rx) - 96, y0 + h - 16, 92, 14,
-                       int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop),
-                       "storage rises ▸")
+            # Flip to the right of the line when it sits near the left edge --
+            # the rising tail is by definition at the SMALLEST scale, i.e. hard
+            # against the y axis, so the leftward default clipped this label to
+            # "orage rises" in the common case.
+            tw = 96
+            if rx - 4 - tw >= x0:
+                tx, align = int(rx) - 4 - tw, Qt.AlignmentFlag.AlignRight
+            else:
+                tx, align = int(rx) + 4, Qt.AlignmentFlag.AlignLeft
+            # The arrow always points LEFT, because the rising region is always
+            # the smaller scales and smaller is left. The placement flips; the
+            # direction it means must not.
+            p.drawText(tx, y0 + h - 16, tw, 14,
+                       int(align | Qt.AlignmentFlag.AlignTop),
+                       "◂ storage rises")
 
         p.setPen(_TEXT)
         p.drawText(x0 + 4, 0, w, 16,
@@ -277,6 +290,117 @@ class FrontierPlot(QWidget):
         if v >= 10:
             return f"{v:.0f}"
         return f"{v:.1f}"
+
+
+def _gray_pixmap(arr, side: int) -> QPixmap:
+    """A uint8 (H, W) array as a square-ish pixmap at ``side`` px, NEAREST.
+
+    ``FastTransformation`` is nearest-neighbour and is the load-bearing choice:
+    the panel exists to show what the working resolution costs, and smooth
+    scaling would paint back an interpolated approximation of exactly the detail
+    the lever removed. The tile is upscaled to a COMMON size rather than drawn at
+    its own, so a coarser scale reads as blockier and not merely as smaller.
+    """
+    h, w = arr.shape[:2]
+    buf = arr.tobytes()                     # keep the copy alive past QImage
+    img = QImage(buf, w, h, w, QImage.Format.Format_Grayscale8).copy()
+    return QPixmap.fromImage(img).scaled(
+        side, side, Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.FastTransformation)
+
+
+class RenderStrip(QWidget):
+    """What one replicate looks like to the pipeline at each candidate setting.
+
+    The companion to the frontier: that panel prices the lever, this one shows
+    what is being bought with. Without it the user is asked to trade away
+    resolution with no view of the resolution.
+
+    Two rows, and the lower one carries the argument. The top row is the working
+    grey image the per-pixel stages receive; the bottom is the frame-difference
+    field they are built out of, rendered on a display range SHARED across every
+    tile (see ``core/scale_render.py``). Sharing the range is what makes the
+    amplitude loss visible -- auto-contrasting each tile would make every setting
+    look equally vivid and quietly delete the only thing worth seeing.
+
+    Generic over the lever: it renders whatever :class:`ScaleRender`-shaped rows
+    it is handed, so Batch N's block-size dialog reuses it for grid granularity.
+    """
+    # Sized so the full candidate set fits one row beside the legend column: the
+    # strip then lines up with the frontier's x axis and reads as its picture,
+    # rather than as a separate shorter list the user has to match up by hand.
+    _TILE = 96
+
+    def __init__(self, note: str, parent=None):
+        super().__init__(parent)
+        self._tiles: dict[float, list[QLabel]] = {}
+        self._selected: float | None = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 4, 0, 0)
+
+        cap = QLabel(note)
+        cap.setWordWrap(True)
+        cap.setTextFormat(Qt.TextFormat.RichText)
+        cap.setStyleSheet(
+            "color:#c8d2dc; background:#232a31; border:1px solid #33404d;"
+            "border-radius:4px; padding:8px; font-size:12px;")
+        lay.addWidget(cap)
+
+        self.grid = QGridLayout()
+        self.grid.setHorizontalSpacing(10)
+        self.grid.setVerticalSpacing(2)
+        # Column 0 is the row legend; tiles start at column 1. Rows match
+        # set_renders: 0 label, 1 grey, 2 working size, 3 difference.
+        for row, text in ((1, "what the solve sees"), (3, "frame difference")):
+            lab = QLabel(text)
+            lab.setStyleSheet("color:#8fa3b5; font-size:10px;")
+            self.grid.addWidget(lab, row, 0)
+        lay.addLayout(self.grid)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#8fa3b5; font-size:11px;")
+        lay.addWidget(self.status)
+
+    def set_status(self, text: str):
+        self.status.setText(text)
+
+    def set_renders(self, renders, selected: float | None = None):
+        self._clear()
+        self._selected = selected
+        for col, r in enumerate(renders, start=1):
+            head = QLabel(r.label)
+            head.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            gray = QLabel()
+            gray.setPixmap(_gray_pixmap(r.gray, self._TILE))
+            gray.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            # Fixed, not minimum: a QLabel holding a pixmap will happily be
+            # squeezed by a layout under vertical pressure and CLIP the pixmap
+            # rather than scale it, which silently turns every tile into a
+            # letterbox strip and destroys the comparison the panel exists for.
+            gray.setFixedSize(self._TILE, self._TILE)
+            size = QLabel(r.size_label)
+            size.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            size.setStyleSheet("color:#8fa3b5; font-size:10px;")
+            chg = QLabel()
+            chg.setPixmap(_gray_pixmap(r.change, self._TILE))
+            chg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            chg.setFixedSize(self._TILE, self._TILE)
+
+            sel = selected is not None and abs(r.scale - selected) < 1e-9
+            head.setStyleSheet(
+                f"font-family:Consolas; font-size:12px; font-weight:700;"
+                f"color:{'#7ee787' if sel else '#c8d2dc'};")
+            for row, wdg in ((0, head), (1, gray), (2, size), (3, chg)):
+                self.grid.addWidget(wdg, row, col)
+            self._tiles[r.scale] = [head, gray, size, chg]
+
+    def _clear(self):
+        for cells in self._tiles.values():
+            for c in cells:
+                c.setParent(None)
+                c.deleteLater()
+        self._tiles.clear()
 
 
 class SweepPanel(QWidget):

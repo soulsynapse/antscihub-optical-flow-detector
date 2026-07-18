@@ -50,18 +50,33 @@ what they are for. This window prices the lever and states the consequence in
 prose; it does not pretend to have measured a sensitivity it cannot separate from
 a threshold artifact.
 
-Not built (see todo.md Batch M): the render-at-each-scale image panel and the
-draw-a-line calibration sub-tool (reading ``pixels_per_mm`` / ``body_length_mm``
-off the replicate dicts works today). The panels below are built as reusable
-components (``gui/cost_panels.py``) so Batch N's block-size sibling shares them
-rather than diverging.
+What it shows *instead*, and why that is not the same thing
+-----------------------------------------------------------
+Refusing to score sensitivity leaves an obvious hole: the window would be asking
+the user to trade away resolution without ever showing them the resolution. The
+**render strip** fills it with the one thing that is neither a sensitivity
+measurement nor an invented score -- the actual image the pipeline receives at
+each scale, beside the frame-difference field the detector's band power is built
+from, on a display range shared across every tile.
+
+It shows the *mechanism* rather than a verdict. The difference field visibly
+dims as the scale falls, because averaging happens before differencing, and that
+is precisely why the removed detection panel measured a monotone loss: the
+threshold drifted, the structure did not necessarily go. Saying so with two rows
+of pictures is honest in a way the events-kept table was not, because a picture
+does not claim to have counted anything.
+
+Not built (see todo.md Batch M): the draw-a-line calibration sub-tool (reading
+``pixels_per_mm`` / ``body_length_mm`` off the replicate dicts works today). The
+panels below are built as reusable components (``gui/cost_panels.py``) so Batch
+N's block-size sibling shares them rather than diverging.
 """
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (QDialog, QDoubleSpinBox, QFormLayout, QFrame,
                              QGridLayout, QHBoxLayout, QLabel, QPushButton,
-                             QSpinBox, QVBoxLayout, QWidget)
+                             QScrollArea, QSpinBox, QVBoxLayout, QWidget)
 
 from core.config import FlowConfig
 from core.replicates import build_layout
@@ -110,6 +125,20 @@ _SWEEP_NOTE = (
     "whole-video pass."
 )
 
+_RENDER_NOTE = (
+    "<b>The selected replicate as the pipeline sees it at each scale.</b> Top "
+    "row: the working image the structure-tensor solve receives. Bottom: the "
+    "frame difference its <i>change</i> channel is built from. Tiles share one "
+    "display size and one brightness range, and are drawn without smoothing, so "
+    "a coarser scale reads as blockier rather than smaller.<br>"
+    "<b>The difference field dims as you downsample</b> — pixels are averaged "
+    "<i>before</i> they are differenced. That is why an absolute threshold "
+    "catches less at a coarser scale and must be re-tuned rather than carried "
+    "across; it is a fact about the threshold, <b>not</b> evidence the behaviour "
+    "has stopped being resolved. Judge the top row for whether the structure you "
+    "care about survives."
+)
+
 
 class _Readout(QFrame):
     """One `AT 0.50 → 4.2 px per body length · 62 d · 0.9 TB` line."""
@@ -152,6 +181,7 @@ class DownsampleDialog(QDialog):
     """
     sweep_requested = pyqtSignal(object)        # list[float] of scales to time
     sweep_cancelled = pyqtSignal()
+    render_requested = pyqtSignal(int, object)  # replicate index, scales
 
     def __init__(self, replicates: list[dict], src_width: int, src_height: int,
                  fps: float, current_scale: float, model: CostModel | None,
@@ -188,26 +218,60 @@ class DownsampleDialog(QDialog):
         self._sweep_ref = None
         self._sweep_rows: list = []
 
-        root = QVBoxLayout(self)
+        # Rendered tiles, held so a selection change can re-highlight without
+        # re-decoding: a pick costs a seek otherwise, and the user picks often.
+        self._renders: list = []
+        self._render_asked = False
+
+        # Everything above the buttons scrolls. This window is mostly prose and
+        # measured panels, and it grew past any fixed height that fits a laptop
+        # screen -- unscrolled, Qt resolves the overflow by squeezing whichever
+        # widget yields, which silently truncated the render note mid-sentence
+        # and clipped the image tiles into letterbox strips. The buttons stay
+        # OUTSIDE the scroll so the decision the window exists for is never
+        # somewhere the user has to scroll to find.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        root = QVBoxLayout(body)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
         # Imported lazily-ish at module scope; kept here so the prose reads in
         # order with the layout it heads.
-        from gui.cost_panels import FrontierPlot, LeverPreamble, SweepPanel
+        from gui.cost_panels import (FrontierPlot, LeverPreamble, RenderStrip,
+                                     SweepPanel)
         root.addWidget(LeverPreamble(_WHY_OFFERED, _WHY_NOT_ASSUMED))
 
         root.addLayout(self._build_inputs())
 
         self.plot = FrontierPlot()
         self.plot.picked.connect(self._on_pick)
-        root.addWidget(self.plot, 1)
+        # No stretch factor: inside a scroll area the body sizes to its hint, so
+        # a stretch here would not grow the plot, it would only let the layout
+        # steal height back off it under pressure.
+        self.plot.setMinimumHeight(215)
+        root.addWidget(self.plot)
 
         root.addWidget(self._build_readouts())
+
+        self.render = RenderStrip(_RENDER_NOTE)
+        root.addWidget(self.render)
 
         self.sweep = SweepPanel(_SWEEP_NOTE)
         self.sweep.run_requested.connect(self._on_run_sweep)
         self.sweep.cancel_requested.connect(self.sweep_cancelled.emit)
         root.addWidget(self.sweep)
+        root.addStretch(1)
 
-        root.addLayout(self._build_buttons())
+        buttons = self._build_buttons()
+        buttons.setContentsMargins(9, 6, 9, 9)
+        outer.addLayout(buttons)
         self._refresh()
 
     # -- construction --------------------------------------------------------
@@ -231,6 +295,10 @@ class DownsampleDialog(QDialog):
             "Which replicate the 'what you keep' readout describes. Time and "
             "storage always cover every replicate.")
         self.rep_spin.valueChanged.connect(self._refresh)
+        # Separate from _refresh: the render costs a decode, so it is requested
+        # on the replicate changing and NOT on the corpus-hours spin, which also
+        # runs _refresh and has nothing to do with what the box looks like.
+        self.rep_spin.valueChanged.connect(self._on_rep_changed)
         form.addRow("Replicate", self.rep_spin)
         row.addLayout(form)
         row.addStretch(1)
@@ -416,6 +484,39 @@ class DownsampleDialog(QDialog):
         self.use_btn.setEnabled(abs(self._selected - 1.0) > 1e-9)
         self.use_btn.setText(f"Use {self._selected:.2f}")
 
+    # -- the render strip ----------------------------------------------------
+    def showEvent(self, ev):
+        """Request the renders once the window is up.
+
+        Not in ``__init__``: the owner connects :attr:`render_requested` after
+        construction and before ``exec()``, so an emit from the constructor
+        would go nowhere. Same reason the sweep is owner-driven -- this dialog
+        holds no video and no decoder.
+        """
+        super().showEvent(ev)
+        if not self._render_asked:
+            self._render_asked = True
+            self._request_render()
+
+    def _request_render(self):
+        if not self._reps:
+            self.render.set_status(
+                "No replicates are defined, so there is no box to render.")
+            return
+        self.render.set_status("rendering…")
+        self.render_requested.emit(self.rep_spin.value(),
+                                   list(CANDIDATE_SCALES))
+
+    def set_renders(self, renders, note: str = ""):
+        self._renders = list(renders)
+        self.render.set_renders(self._renders, self._selected)
+        self.render.set_status(note)
+
+    def render_failed(self, msg: str):
+        self.render.set_renders([])
+        self._renders = []
+        self.render.set_status(f"Could not render this replicate: {msg}")
+
     # -- the timing sweep ----------------------------------------------------
     def set_sweep_available(self, ok: bool, reason: str = ""):
         """Called by the owner when it knows whether a sweep can run at all."""
@@ -471,11 +572,17 @@ class DownsampleDialog(QDialog):
         self._refresh()
 
     # -- actions -------------------------------------------------------------
+    def _on_rep_changed(self, *_):
+        if self._render_asked:
+            self._request_render()
+
     def _on_pick(self, scale: float):
         self._selected = float(scale)
         # Rows only: the curve, the knee and the note do not depend on which
         # point is selected, and the plot tracks its own selection marker.
         self._refresh_rows()
+        if self._renders:
+            self.render.set_renders(self._renders, self._selected)
 
     def _accept_selected(self):
         self.chosen_scale = self._selected
