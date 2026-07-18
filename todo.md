@@ -172,9 +172,63 @@ retention). Do last.
   The `DEFAULT_TARGET_WIDTH` sweep the plan calls for is still unrun and still
   the right way to price the replicate-aware-downsample correctness gap.
 
-- **Next: Batch C's hot-spot half (todo 6)** — producer-thread decode first, then
-  batched block reduce; re-measure after each with the timing lines. Or jump to
-  Batch D/E if perceived UI lag matters more than throughput.
+- **Batch C's hot-spot half (todo 6) — done, both levers landed.**
+
+  1. **Producer-thread decode.** New `core.video.prefetch(iterable, depth=2)`
+     runs any iterator on a worker thread. `_stream_channels` wraps
+     `src.iter_frames` in it. The `decode` span now means *wait for a frame*,
+     not decode cost — near zero when the overlap works, still honest when
+     decode is the bottleneck. `close()` joins the producer with **no timeout**,
+     on purpose: the caller releases the VideoCapture the instant close returns,
+     so a timeout could only hand back a capture still being read from. Cancel
+     stress-tested at 10 cut points on the 5.3K clip — no lingering threads, no
+     stale-handle crash, clean pass afterwards.
+  2. **Block reduce.** `reduce_scalar_to_blocks(..., "mean")` no longer pads the
+     whole plane with NaN, transposes it, and runs `nanmean` (three full-size
+     temporaries). New `_block_mean` reshapes to (ny, block, nx, block) and
+     reduces axes 1 and 3 — a view, no copy, even for ragged tiles. Microbench
+     730x1300 b=16: **3.46 ms → 1.01 ms (3.4x)**. NaN in the field falls back to
+     the old nanmean route, so masked-input semantics are preserved.
+
+  **Measured, 7 replicates, 5312x2988, 479 frames (20 s), grid 41x5, scale 0.245**
+  (controlled A/B in one session; not comparable to the 33.6 s figure above,
+  which used a different replicate set):
+
+  - prefetch off: **15.14 s** — decode 64% · block_reduce 11% · preprocess 9%
+  - prefetch on: **10.21 s** — decode 39% · block_reduce 16% · preprocess 13%
+
+  ~33% off the pass. Prefetch hides ~5.6 s of the 9.6 s decode — exactly the
+  amount of consumer work available to overlap it with. Note the consumer spans
+  read slightly *higher* with prefetch on (GIL contention); net is still a clear
+  win. Small clip (462x456, decode only 3%): 9.15 s → 9.23 s, i.e. neutral, with
+  decode fully hidden (0.28 s → 0.02 s). No regression where there is nothing to
+  overlap.
+
+  Review fixes applied: unbounded join (was a 5 s timeout that silently broke
+  the close-joins-the-producer guarantee); `frames.close()` nested so a raising
+  close cannot skip `src.release()`; `except Exception` not `BaseException`, so
+  a KeyboardInterrupt is not re-raised inside the consumer's cancel machinery,
+  with a terminator now put on every exit path; deduped the ragged-cell loop
+  shared by the mean and p90 branches. New `tests/test_prefetch.py` (7 tests,
+  ordering / error forwarding / thread shutdown) and a ragged-grid test covering
+  both statistics — the `include_partial` p90 branch had no test at all.
+  `tests/test_channel_source.py` re-reduction check relaxed from `rtol=0` to
+  `rtol=1e-6`: it was asserting bit-identical float32 summation order between
+  the batched and per-frame routes, which was never the contract.
+
+- **Next lever is decode itself, now 39% and the largest single span.** The pass
+  decodes full 5312x2988 BGR frames and discards ~92% of the pixels.
+  `core.video.ReplicateVideoSource` already exists and does exactly the right
+  thing — FFmpeg crops, greyscales and downsamples each replicate box before the
+  data crosses the process boundary — but it is wired into `core/pipeline.py`,
+  not the live tensor path. Reusing it here subsumes both `decode` and
+  `preprocess` (52% combined) and needs no new math. It does change where
+  preprocessing happens, so it is its own batch, not a fold-in. Price that
+  before considering GPU.
+  The `DEFAULT_TARGET_WIDTH` sweep is still unrun and still the right way to
+  price the replicate-aware-downsample correctness gap.
+
+- **Then: Batch D/E** if perceived UI lag matters more than throughput.
 
 ### Shelved (todo 8, 9)
 `gui/tab1_flow.py` and `gui/tab3_behavior.py` are unmaintained. Do not fix them if a

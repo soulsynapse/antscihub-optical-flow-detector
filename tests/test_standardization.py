@@ -62,6 +62,24 @@ class StandardizationMathTests(unittest.TestCase):
         u, _, _ = reduce_to_blocks(flow, 4, fps=1.0, include_partial=True)
         np.testing.assert_allclose(u, reduced)
 
+    def test_partial_blocks_for_both_statistics(self):
+        # Both reductions take a fast route for the complete cells and handle the
+        # short edge row/column separately; check every cell against the plain
+        # per-cell definition on a grid that is ragged in both axes.
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((23, 19)).astype(np.float32)
+        block = 8
+        for stat, ref in (("mean", np.mean), ("p90", lambda c: np.percentile(c, 90))):
+            got = reduce_scalar_to_blocks(x, block, stat, include_partial=True)
+            self.assertEqual(got.shape, (3, 3), stat)   # ceil(23/8), ceil(19/8)
+            for by in range(3):
+                for bx in range(3):
+                    cell = x[by * block:min(23, (by + 1) * block),
+                             bx * block:min(19, (bx + 1) * block)]
+                    self.assertAlmostEqual(
+                        float(got[by, bx]), float(ref(cell)), places=4,
+                        msg=f"{stat} cell ({by},{bx}) shape {cell.shape}")
+
     def test_median_features_leave_raw_flow_untouched(self):
         u = np.zeros((1, 5, 5), np.float32)
         u[0, 2, 2] = 100.0

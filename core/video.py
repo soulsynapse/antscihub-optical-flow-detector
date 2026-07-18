@@ -7,12 +7,88 @@ from __future__ import annotations
 
 import hashlib
 import os
+import queue
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+_DONE = object()
+
+
+def prefetch(iterable, depth: int = 2):
+    """Yield from ``iterable`` on a worker thread, running up to ``depth`` ahead.
+
+    Decoding is pure producer work and OpenCV releases the GIL across
+    ``VideoCapture.read``, so on the extraction pass it overlaps with the tensor
+    math for free -- decode measured 26% of a 5.3K pass, and that is the share
+    this hides rather than speeds up.
+
+    ``depth`` stays small deliberately: a 5312x2988 BGR frame is ~48 MB, and at
+    the default four can be alive at once (two queued, one the consumer still
+    holds, one the producer has decoded but not handed off) -- about 190 MB.
+
+    The consumer must close the generator (or exhaust it) before releasing
+    whatever the producer reads from -- ``close()`` stops the thread and joins it,
+    so a released VideoCapture can never be touched by a still-running decode.
+    Exceptions raised by ``iterable`` are re-raised on the consumer's thread.
+    """
+    q: queue.Queue = queue.Queue(maxsize=depth)
+    stop = threading.Event()
+
+    def put(item) -> bool:
+        # Poll rather than block forever, so a consumer that walks away is
+        # noticed even with the queue full and nobody draining it.
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def produce():
+        try:
+            for item in iterable:
+                if not put(item):
+                    return
+        except Exception as exc:          # noqa: BLE001 - forwarded, not handled
+            # Exception only: a KeyboardInterrupt or SystemExit re-raised inside
+            # the consumer's loop would be indistinguishable from that loop's own
+            # failure and would unwind through the extraction cancel machinery
+            # instead of ending the process. Those leave via the finally below.
+            put(exc)
+        finally:
+            # The consumer blocks in get() until it sees a terminator, so one must
+            # go out on every exit path -- including the BaseException path that
+            # deliberately forwards nothing. A put after stop is set is a no-op,
+            # which is the already-abandoned case.
+            put(_DONE)
+            close = getattr(iterable, "close", None)
+            if close is not None:
+                close()
+
+    th = threading.Thread(target=produce, daemon=True, name="ofd-prefetch")
+    th.start()
+    try:
+        while True:
+            item = q.get()
+            if item is _DONE:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        stop.set()
+        # No timeout: the join is what makes the docstring's guarantee true, and
+        # the caller acts on it by releasing the decoder the moment close()
+        # returns. The producer cannot block indefinitely -- it only ever waits in
+        # put(), which polls the stop flag -- so a timeout here could not rescue a
+        # real hang, it could only hand back a capture still being read from.
+        th.join()
 
 
 @dataclass(frozen=True)

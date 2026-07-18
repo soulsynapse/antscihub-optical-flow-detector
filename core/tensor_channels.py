@@ -35,7 +35,7 @@ from core.preprocess import Preprocessor
 from core.structure_tensor import (flow_from_tensor, spatial_min_eigen,
                                    tensor_products)
 from core.timing import Timer
-from core.video import VideoSource
+from core.video import VideoSource, prefetch
 
 CHANNELS = ("intensity", "change", "appearance", "texture", "tensor_speed")
 CHANNEL_VERSION = 3     # bump when the extraction math changes (sidecar key)
@@ -136,11 +136,15 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
     tm = Timer("extract_channels")
     done = 0            # stored frames, so a cancelled pass can report how far it got
     src = VideoSource(video_path)
+    frames = None
     try:
         # The decode is driven by hand rather than with a plain ``for`` so the
         # generator's own work (seek + read + colour convert) lands in its own span
-        # instead of being invisibly folded into the loop body.
-        frames = src.iter_frames(first, count)
+        # instead of being invisibly folded into the loop body. Behind ``prefetch``
+        # that decode runs on its own thread, so the span now measures how long
+        # this loop *waits* for a frame -- near zero when the overlap is working,
+        # and still the honest number when decode is the bottleneck.
+        frames = prefetch(src.iter_frames(first, count))
         while True:
             with tm.span("decode"):
                 nxt = next(frames, None)
@@ -212,7 +216,16 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                 with tm.span("progress_cb"):
                     progress(oi + 1, n)
     finally:
-        src.release()
+        try:
+            # Close before releasing: the decode thread holds the VideoCapture,
+            # and closing joins it. Releasing first would free a capture still in
+            # use by a cancelled pass's producer. Nested so that a close() that
+            # raises cannot skip the release and leak the handle -- the live
+            # surface starts a pass on every knob edit, so a leak per pass adds up.
+            if frames is not None:
+                frames.close()
+        finally:
+            src.release()
         # Logged from the finally so a pass cancelled mid-stream still reports its
         # spans. A knob edit supersedes the running extraction by raising inside
         # the progress callback, so during tuning -- exactly when these numbers are

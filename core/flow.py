@@ -199,6 +199,48 @@ def forward_backward_error(forward: np.ndarray,
     return np.minimum(err, cap).astype(np.float32, copy=False)
 
 
+def _ragged_cells(values: np.ndarray, block: int, h: int, w: int,
+                  ny: int, nx: int):
+    """Yield ``(by, bx, cell)`` for the partial cells at the bottom/right edge.
+
+    When ``include_partial``, ny/nx use ceiling division, so the last row and
+    column can be short. Those cells are the only ones that fall outside the
+    regular (ny, block, nx, block) grid, and both the mean and p90 reductions
+    need exactly the same set -- keeping the geometry in one place stops a fix to
+    edge handling from being applied to one statistic and not the other.
+    """
+    full_y, full_x = h // block, w // block
+    for by in range(ny):
+        for bx in range(nx):
+            if by < full_y and bx < full_x:
+                continue
+            yield by, bx, values[by * block:min(h, (by + 1) * block),
+                                 bx * block:min(w, (bx + 1) * block)]
+
+
+def _block_mean(values: np.ndarray, block: int, h: int, w: int,
+                ny: int, nx: int) -> np.ndarray:
+    """Block-mean without padding or transposing the full plane.
+
+    This is the extraction hot path -- five calls per frame per tile, measured at
+    14% of a 5.3K pass and 32% of a small one. The generic route below pads the
+    whole field with NaN, transposes it (which forces a copy at the following
+    reshape), and runs ``nanmean``: three full-size temporaries for what is a
+    strided sum. Reshaping to (ny, block, nx, block) and reducing axes 1 and 3
+    needs none of them. Only the ragged last row/column fall outside the regular
+    grid, and there are at most ny + nx of those cells, so they are done directly.
+    """
+    out = np.empty((ny, nx), np.float32)
+    full_y, full_x = h // block, w // block
+    if full_y and full_x:
+        core = values[:full_y * block, :full_x * block]
+        out[:full_y, :full_x] = core.reshape(
+            full_y, block, full_x, block).mean(axis=(1, 3), dtype=np.float32)
+    for by, bx, cell in _ragged_cells(values, block, h, w, ny, nx):
+        out[by, bx] = cell.mean(dtype=np.float32)
+    return out
+
+
 def reduce_scalar_to_blocks(values: np.ndarray, block: int,
                             statistic: str = "mean",
                             include_partial: bool = False) -> np.ndarray:
@@ -225,14 +267,18 @@ def reduce_scalar_to_blocks(values: np.ndarray, block: int,
         if full_y and full_x:
             out[:full_y, :full_x] = reduce_scalar_to_blocks(
                 values[:full_y * block, :full_x * block], block, "p90")
-        for by in range(ny):
-            for bx in range(nx):
-                if by < full_y and bx < full_x:
-                    continue
-                cell = values[by * block:min(h, (by + 1) * block),
-                              bx * block:min(w, (bx + 1) * block)]
-                out[by, bx] = np.percentile(cell, 90)
+        for by, bx, cell in _ragged_cells(values, block, h, w, ny, nx):
+            out[by, bx] = np.percentile(cell, 90)
         return out
+
+    if statistic == "mean":
+        out = _block_mean(values, block, h, w, ny, nx)
+        if not np.isnan(out).any():
+            return out
+        # NaN reached the output. Either the field itself carries NaN, or (when
+        # include_partial) a padded cell was all-NaN -- which ceiling division
+        # makes impossible, so it is the field. Fall through to the nanmean
+        # route below, which skips NaN per cell the way this path cannot.
 
     if include_partial:
         x = np.pad(values.astype(np.float32, copy=False),

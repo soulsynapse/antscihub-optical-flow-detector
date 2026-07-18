@@ -104,9 +104,14 @@ class LiveChannelSourceTest(unittest.TestCase):
                                  list(direct.meta["grid"]),
                                  f"grid mismatch @ block {block}")
                 for name in LIVE_CHANNELS:
+                    # rtol, not atol alone: the two routes sum the same pixels in
+                    # different orders (batched (T,H,W) vs per-frame), and these
+                    # channels reach ~1e3, where one float32 ulp is already 1e-4.
+                    # The contract is "same block means", not bit-identical
+                    # reassociation.
                     np.testing.assert_allclose(
                         reduced.channels[name], direct.channels[name],
-                        rtol=0, atol=1e-5,
+                        rtol=1e-6, atol=1e-5,
                         err_msg=f"{name} @ block {block}, {len(reps)} tiles")
 
     def test_denoise_forced_off_flags_approximated(self):
