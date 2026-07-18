@@ -129,6 +129,11 @@ def live_channel_source(video_path: str, cfg, replicates: list[dict], *,
     # The explorer's T axis is the window, so advertise the window length as
     # n_frames; keep the full-clip geometry otherwise.
     meta = {**full_meta, "n_frames": win, "window_start": wstart}
+    # Carried through so the downsample decision tool can price the lever from
+    # passes that actually ran on this machine and this footage. Absent when the
+    # pass was empty or timing was disabled.
+    if res["meta"].get("timing"):
+        meta["timing"] = res["meta"]["timing"]
     channels = {k: np.asarray(res[k], np.float32) for k in LIVE_CHANNELS}
     return ChannelData(meta=meta, channels=channels, window_start=wstart,
                        approximated=bool(res["meta"].get("approximated", False)))

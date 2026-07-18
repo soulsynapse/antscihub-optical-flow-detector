@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel,
 from core.channel_source import (LIVE_CHANNELS, live_channel_source,
                                  reduce_channel_data)
 from core.config import FlowConfig, PipelineConfig, PreprocessConfig
+from core.cost_model import CostModel, PassSample
 from core.replicates import build_layout
 from core.detection import detect_channel_region
 from core.video import VideoSource
@@ -202,6 +203,14 @@ class LiveScalogramSurface(QWidget):
         # starts from the cancelled handler, once the old thread has unwound.
         self._restart_extract = False
 
+        # Measured extraction passes, feeding the downsample dialog's cost model.
+        # Keyed by (scale, block) because the two are not interchangeable costs:
+        # an extract that fits the per-pixel budget runs at block=1 and does no
+        # reduction, so mixing those samples with block-reduced ones into one fit
+        # would regress across two variables and attribute both to the scale.
+        self._cost_samples: dict[tuple[float, int], PassSample] = {}
+        self._last_cost_key: tuple[float, int] | None = None
+
         # Coalesce rapid knob edits into a single re-extract on settle. Created
         # before the strip because the controls connect to it.
         self._debounce = QTimer(self)
@@ -283,6 +292,17 @@ class LiveScalogramSurface(QWidget):
         self.ds_spin.valueChanged.connect(self._debounce.start)
         self.ds_spin.valueChanged.connect(self._sync_block_auto_text)
         row.addWidget(self.ds_spin)
+
+        # The knob alone gets refused on principle (see gui/downsample_dialog.py):
+        # this is where its cost and its consequence are made legible.
+        self.ds_help_btn = QPushButton("…")
+        self.ds_help_btn.setFixedWidth(26)
+        self.ds_help_btn.setToolTip(
+            "What downsampling gains and costs: projected time and storage for "
+            "your corpus at each scale, priced from passes measured on this "
+            "machine, with the knee marked.")
+        self.ds_help_btn.clicked.connect(self._open_downsample_dialog)
+        row.addWidget(self.ds_help_btn)
 
         row.addWidget(QLabel("Block"))
         self.block_spin = QSpinBox()
@@ -461,9 +481,71 @@ class LiveScalogramSurface(QWidget):
             f"extracting… {done}/{total} frames ({pct:.0f}%) · "
             f"{self._extract_ctx}{self._eta(done, total, self._extract_t0)}")
 
+    def _record_cost_sample(self, cd):
+        """Keep one timing sample per (scale, block) for the cost model.
+
+        Overwrites rather than averages: the newest pass reflects the current
+        machine state (thermal, other load), and todo.md records run-to-run
+        spread of ~25% at fixed settings, so an average over a long session would
+        blend conditions rather than reduce noise.
+        """
+        t = (getattr(cd, "meta", None) or {}).get("timing")
+        if not t or not t.get("frames"):
+            return
+        key = (round(float(t["scale"]), 6), int(t["block"]))
+        self._cost_samples[key] = PassSample(
+            scale=float(t["scale"]), frames=int(t["frames"]),
+            wall=float(t["wall"]), spans=dict(t.get("spans") or {}))
+        # Tracked explicitly: re-recording an existing key keeps its original
+        # insertion position, so dict order does not identify the newest sample.
+        self._last_cost_key = key
+
+    def _cost_model(self) -> tuple[CostModel | None, int | None]:
+        """Fit within one block regime; returns ``(model, the regime's block)``.
+
+        Samples must not be mixed across block sizes (block=1 does no reduction
+        at all), but "newest regime" is the wrong way to pick one: whether a pass
+        runs at block=1 depends on whether its per-pixel footprint fits the
+        budget, and that footprint scales with the square of the scale. So the
+        very act of dragging Downsample to compare scales splits the samples
+        across regimes, and always taking the newest would leave the model
+        provisional forever -- withholding the frontier in exactly the workflow
+        it exists to serve. Picking the regime with the most distinct scales
+        finds the fit if one exists anywhere; ties go to the newest.
+        """
+        if not self._cost_samples:
+            return None, None
+        groups: dict[int, list[PassSample]] = {}
+        for (_scale, block), s in self._cost_samples.items():
+            groups.setdefault(block, []).append(s)
+        newest_block = self._last_cost_key[1] if self._last_cost_key else None
+        block, samples = max(groups.items(),
+                             key=lambda kv: (len({s.scale for s in kv[1]}),
+                                             kv[0] == newest_block))
+        # The block is returned alongside so the dialog can say which regime the
+        # numbers came from: a block=1 pass does no reduction and is much slower
+        # than a production pass, which would otherwise inflate its projection
+        # silently.
+        return CostModel.fit(samples), block
+
+    def _open_downsample_dialog(self):
+        from gui.downsample_dialog import DownsampleDialog
+        w, h, fps, _fc = self._dims
+        model, model_block = self._cost_model()
+        dlg = DownsampleDialog(
+            self.replicates, src_width=w, src_height=h, fps=fps,
+            current_scale=float(self.ds_spin.value()),
+            model=model, model_block=model_block, flow=self._build_cfg().flow,
+            n_channels=len(LIVE_CHANNELS), parent=self)
+        if dlg.exec() and dlg.chosen_scale is not None:
+            # setValue fires valueChanged, which starts the re-extract debounce,
+            # so choosing a scale here applies exactly as dragging the spin does.
+            self.ds_spin.setValue(float(dlg.chosen_scale))
+
     def _on_extracted(self, cd):
         self._worker = None
         self._set_busy(None)
+        self._record_cost_sample(cd)
         cfg = self._pending_cfg or self._build_cfg()
         if self._pending_pp:                         # cd is the block=1 pixel cache
             self._pp = cd

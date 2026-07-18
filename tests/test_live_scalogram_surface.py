@@ -269,5 +269,99 @@ class LiveScalogramSurfaceStopTests(_SurfaceTestCase):
         surface._proc_worker = None
 
 
+class CostSampleTests(_SurfaceTestCase):
+    """Timing carried off a completed pass is what lets the downsample dialog
+    price the lever from measurement instead of assertion."""
+
+    @staticmethod
+    def _cd(scale, block, wall, frames=100, spans=None):
+        cd = MagicMock()
+        cd.meta = {"timing": {"scale": scale, "block": block, "wall": wall,
+                              "frames": frames, "spans": spans or {}}}
+        return cd
+
+    def test_sample_is_recorded_per_scale_and_block(self):
+        surface = self._surface()
+        surface._record_cost_sample(self._cd(1.0, 64, 4.0))
+        surface._record_cost_sample(self._cd(0.5, 32, 2.0))
+        self.assertEqual(set(surface._cost_samples), {(1.0, 64), (0.5, 32)})
+
+    def test_a_pass_without_timing_is_ignored(self):
+        surface = self._surface()
+        cd = MagicMock()
+        cd.meta = {}
+        surface._record_cost_sample(cd)
+        surface._record_cost_sample(self._cd(1.0, 64, 4.0, frames=0))
+        self.assertEqual(surface._cost_samples, {})
+        self.assertEqual(surface._cost_model(), (None, None))
+
+    def test_re_recording_a_key_still_identifies_the_newest_block(self):
+        # dict order keeps a re-recorded key at its ORIGINAL position, so the
+        # newest sample cannot be read off insertion order.
+        surface = self._surface()
+        surface._record_cost_sample(self._cd(1.0, 32, 4.0))
+        surface._record_cost_sample(self._cd(1.0, 64, 5.0))
+        surface._record_cost_sample(self._cd(0.5, 32, 2.0))
+        surface._record_cost_sample(self._cd(1.0, 32, 4.1))
+        self.assertEqual(surface._last_cost_key, (1.0, 32))
+        model, block = surface._cost_model()
+        # Only the block-32 samples, so the fit is over two distinct scales.
+        self.assertFalse(model.provisional)
+        self.assertEqual(model.n_samples, 2)
+
+    def test_model_stays_provisional_while_only_one_scale_is_measured(self):
+        surface = self._surface()
+        surface._record_cost_sample(self._cd(1.0, 64, 4.0, spans={"decode": 0.01}))
+        model, block = surface._cost_model()
+        self.assertTrue(model.provisional)
+        # ...and therefore declines to place a knee, which is the whole point:
+        # one prefetched pass cannot see the decode floor.
+        self.assertIsNone(model.knee_scale())
+
+    def test_samples_at_different_blocks_are_not_fitted_together(self):
+        surface = self._surface()
+        surface._record_cost_sample(self._cd(0.5, 1, 9.0))    # block=1 pixel cache
+        surface._record_cost_sample(self._cd(1.0, 64, 4.0))
+        model, block = surface._cost_model()
+        self.assertTrue(model.provisional)      # neither regime has two scales
+
+    def test_fit_uses_the_regime_with_the_most_scales_not_the_newest(self):
+        """Whether a pass runs at block=1 depends on whether its per-pixel
+        footprint fits the budget, which scales with the square of the scale --
+        so dragging Downsample naturally splits samples across regimes. Taking
+        only the newest regime would leave the model provisional forever."""
+        surface = self._surface()
+        surface._record_cost_sample(self._cd(1.0, 1, 8.0))
+        surface._record_cost_sample(self._cd(0.5, 1, 3.0))
+        surface._record_cost_sample(self._cd(0.25, 64, 1.5))   # newest, alone
+        self.assertEqual(surface._last_cost_key, (0.25, 64))
+        model, block = surface._cost_model()
+        self.assertFalse(model.provisional)
+        self.assertEqual(model.n_samples, 2)
+        self.assertIsNotNone(model.knee_scale())
+
+    def test_the_fitted_regime_is_reported_alongside_the_model(self):
+        """A block=1 pass does no reduction and is far slower than a production
+        pass, so the dialog has to be told which regime the numbers came from
+        rather than presenting them as a batch-run projection."""
+        surface = self._surface()
+        surface._record_cost_sample(self._cd(1.0, 1, 8.0))
+        surface._record_cost_sample(self._cd(0.5, 1, 3.0))
+        model, block = surface._cost_model()
+        self.assertEqual(block, 1)
+        self.assertFalse(model.provisional)
+
+    def test_ties_between_regimes_go_to_the_newest(self):
+        surface = self._surface()
+        surface._record_cost_sample(self._cd(1.0, 1, 8.0))
+        surface._record_cost_sample(self._cd(0.5, 1, 3.0))
+        surface._record_cost_sample(self._cd(1.0, 64, 6.0))
+        surface._record_cost_sample(self._cd(0.5, 64, 2.5))
+        model, block = surface._cost_model()
+        self.assertEqual(model.n_samples, 2)
+        # The block-64 pair is newest, so its (cheaper) wall times drive the fit.
+        self.assertAlmostEqual(model.seconds_per_frame(1.0) * 100, 6.0, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

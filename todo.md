@@ -479,6 +479,79 @@ retention). Do last.
   a knob users will refuse on principle; the `auto (0.245)` text Batch A added is
   gone, and nothing yet shows what downsampling buys. Ship M next.
 
+- **Batch M — first slice done: the cost model, the frontier, the knee, and the
+  prose. The evidence / empirical / calibration panels are NOT built.** New
+  `core/cost_model.py` (shared with Batch N as the plan requires), new
+  `gui/cost_panels.py` (`LeverPreamble`, `FrontierPlot`), new
+  `gui/downsample_dialog.py`, launched from a `…` button beside the downsample
+  spin. Timing now rides back on the pass: `_stream_channels` returns its spans
+  in `out["meta"]["timing"]` (complete path only, so a cancelled pass can never
+  be mistaken for a sample) and `live_channel_source` forwards it.
+
+  **The knee has a closed form, and it is the measured payoff of the whole
+  batch.** Cost is `t(s) = F + M·s²` — decode is whole-frame so `F` is fixed,
+  everything downstream is per-pixel. The user's real question is an elasticity
+  ("does 1% less resolution buy 1% less time?"), and `E(s) = 2Ms²/(F+Ms²) = 1`
+  exactly when `M·s² = F`, i.e. **`s* = √(F/M)`: the knee is where the per-pixel
+  math cost equals the decode floor.** Parameter-free, and it independently
+  reproduces the ~0.50 the approved mockup marked by eye when fed todo's own
+  measured numbers (3.8 s floor, 15.6 s math → 0.494).
+
+  **Measured, driven against `GX010047c2` (7 replicates, 120 frames):** the
+  quadratic reproduces real wall time to **within ±2% across a 4x scale range**
+  (1.0 → 4.30 s, 0.5 → 2.17 s, 0.25 → 1.56 s). That is what justifies the form.
+
+  **The single-pass model is unusable, and this is why the dialog withholds
+  rather than labels.** Prefetch hides decode so thoroughly that the `decode`
+  span read 0.01 s of a 4.30 s pass (0%), so a one-pass span split sees *no
+  floor*:
+
+  | | floor | per-pixel | knee |
+  |---|---|---|---|
+  | one pass (provisional) | 0.04 ms/f | 35.77 ms/f | 0.05 |
+  | fitted (3 scales) | 11.79 ms/f | 24.09 ms/f | **0.70** |
+
+  Wrong by ~300x on the floor, ~5.7x optimistic on cost at scale 0.25, and wrong
+  in the direction that makes aggressive downsampling look free — precisely the
+  choice this window exists to stop being made carelessly. So `knee_scale()`
+  returns None when provisional, `_hours()` returns None, and the dialog shows no
+  curve at all: a plot that wrong is worse than no plot, because it looks
+  measured. It tells the user to extract at a second scale instead.
+
+  **Three real bugs caught by driving it rather than by tests.**
+  1. Storage counted the sum of per-tile boxes, but channels are allocated over
+     the *packed atlas* — 205 cells against 175 on this clip, a **~17%
+     under-report**. New `atlas_cells()` goes through `build_layout` and uses
+     its own `block_cells`; `grid_cells` is kept only to pin the two apart.
+  2. The provisional branch was unreachable — `_hours()` already returns None
+     for it, so the "nothing measured yet" branch swallowed it and showed the
+     wrong explanation. Ordered by cause, not symptom.
+  3. Review + trace found `_cost_model()` fitting only the *newest* block
+     regime. Whether a pass runs at block=1 depends on the per-pixel budget,
+     which scales with s², so **dragging Downsample to compare scales is exactly
+     what splits the samples across regimes** — the model would have stayed
+     provisional forever in the one workflow the dialog serves. Now picks the
+     regime with the most distinct scales, ties to the newest.
+
+  **Left open deliberately, and it is the honest gap.** The live surface extracts
+  at block=1 whenever the per-pixel cache fits, and block=1 does no reduction —
+  `block_reduce` measured **62%** of such a pass against ~15% at block 64. So a
+  model fitted from live passes describes a costlier pass than a production run;
+  the dialog now says so and labels its times an upper bound. A proper fix is a
+  "measure" action that runs passes at the production block, which is the
+  deferred empirical panel's machinery anyway.
+
+  **Not built, and M is not shippable-as-designed without the first one:** the
+  render-at-each-scale evidence panel, the scoped empirical detection panel, and
+  the draw-a-line calibration sub-tool (the *reading* of `pixels_per_mm` /
+  `body_length_mm` off the replicate dicts works today, so the organism-relative
+  readout is live where a replicate is already calibrated). The empirical panel
+  is the mechanism by which Batch K's "demonstrated per behaviour, never assumed"
+  becomes executable, so **until it lands this window argues feasibility more
+  strongly than it argues sensitivity** — an asymmetry that pushes toward
+  downsampling. The preamble prose carries that weight in the meantime, which is
+  weaker than the plan intends. Do not consider M closed.
+
 ### Batch I — ROI pre-transcode (todo 23) · new file + `channel_source`
 The one lever that removes the decode wall. Cut each source once into
 per-replicate clips plus a manifest (geometry, scale, source hash, fps at full

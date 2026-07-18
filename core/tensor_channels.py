@@ -317,7 +317,15 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
         progress(n, n)
     out["meta"] = {"fps": fps, "block": block, "grid": (ny, nx), "n_frames": n,
                    "channel_version": CHANNEL_VERSION, "approximated": approximated,
-                   "sigma": sigma, "window_start": start}
+                   "sigma": sigma, "window_start": start,
+                   # The spans are already measured for the log line; returning
+                   # them too is what lets the cost model be built from passes
+                   # the user actually ran instead of from asserted constants.
+                   # Only on the complete path: a cancelled pass unwinds through
+                   # the finally above and never reaches here, so a partial pass
+                   # can never be mistaken for a timing sample.
+                   "timing": {"wall": tm.elapsed, "spans": dict(tm.totals),
+                              "frames": n, "scale": scale, "block": block}}
     return out
 
 
