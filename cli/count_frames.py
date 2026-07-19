@@ -28,6 +28,7 @@ import os
 import sys
 import time
 
+from core.batch import BatchError
 from core.framecount import (FrameCountError, build_record, load_sidecar,
                              write_record)
 from core.pretranscode import PretranscodeError, probe_source
@@ -66,7 +67,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         videos = expand_videos(args.videos, list_file=args.list_file)
-    except (OSError, ValueError) as e:
+    # BatchError is what expand_videos raises for a pattern that matched nothing.
+    # Without it here a mistyped glob exits 1 with a traceback instead of 2 with
+    # a message -- and 1 means "a file could not be counted", which would tell a
+    # job runner the wrong thing about a run that never started.
+    except (BatchError, OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     if not videos:

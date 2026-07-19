@@ -265,7 +265,10 @@ class PipelineConfig:
         provenance key travels in the channel meta as ``clip_provenance``
         (``channel_source.live_channel_source``) and must be threaded to here.
         Miss it and a source-derived result and a clip-derived one collide
-        silently in the same cache entry. Recorded in ``todo.md`` under Batch J.
+        silently in the same cache entry. Recorded in ``todo.md`` under Standing
+        decisions, which also carries the recommended fix: make this parameter
+        required and keyword-only, so a caller must claim ``provenance_key=None``
+        rather than forget it.
         """
         d = {"video": video_hash,
              "replicate_geometry": replicate_geometry_hash,

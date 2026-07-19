@@ -31,8 +31,8 @@ to the relevant section rather than restating it.
 | ~~**T18**~~ | ~~"Process whole video" computes every channel regardless of the selected one.~~ **FIXED** — see Batch F. |
 | **T20** | Drop the replicate dropdown — redundant with click navigation. |
 | **T21** | Suspected runaway memory issue somewhere on the replicate tab. **Not reproduced by inspection** — `_refresh_list` was the obvious suspect and is clean (14x14 swatch pixmaps, `list.clear()` releases the items). Needs an actual measurement, not more code reading; do not guess at a fix. |
-| **T22** | New **viewer tab** consuming a fully-processed video: detection/no-detection only, full-clip bar plus a ~1 min bar zoomed on the scrubber, and a hand-off back into preprocessing at the paused position *without* auto-triggering a pass. |
-| **T23** | **ROI pre-transcode**: cut each source once into per-replicate clips + manifest, so later passes decode ~1/16 the pixels. The only lever that moves the decode floor. |
+| ~~**T22**~~ | ~~New **viewer tab** consuming a fully-processed video.~~ **DROPPED** (2026-07-19) — scope, not value. A convenience shell over a `DetectionResult` that nothing else depends on; never started. Re-open only if day-to-day review actually stalls without it. |
+| ~~**T23**~~ | ~~**ROI pre-transcode**: cut each source once into per-replicate clips + manifest.~~ **DONE** — see Batch I. Works, and **the premise it was justified on turned out false**: the 25x isolated decode win is **1.06x end to end** (`FINDINGS.md` §16). Not the lever that moves the floor at scale 1.0. |
 | ~~**T24**~~ | ~~**Headless batch driver**: no-GUI entry point, file-level partitioning, N-worker throughput.~~ **DONE** — all three slices landed; throughput measured in `FINDINGS.md` §14 (**~130 fps / 5.4x realtime, ceiling at 8 workers**). |
 | ~~**T26**~~ | ~~**The container frame count is not the decodable frame count.**~~ **FIXED** — see Batch O. The cut and a full-length headless pass both run clean on `GX010047c2` now; `FINDINGS.md` §15 records the fix, §16 the clip-backed throughput it unblocked. |
 
@@ -62,6 +62,39 @@ a named clip. The withdrawn `sig_corr` reading (`FINDINGS.md` §4) is the
 cautionary case: an aggregate that looked authoritative and did not mean what it
 appeared to.
 
+**Decode is not the throughput lever; math is.** Measured, not assumed. At scale
+1.0 (K's default) `tensor_blur` + `tensor_products` are ~80% of a pass, the
+producer thread already overlaps decode, and Batch I's 25x cheaper decode buys
+**1.06x end to end** (`FINDINGS.md` §16). Do not prioritize decode work off the
+isolated decode number again — that number is real and nearly irrelevant. The one
+untested case is **N=8 clip-backed** (carried to Batch L below), where 8-way
+decode contention meets §14's suspected memory-bandwidth ceiling.
+
+**The clip-provenance cache obligation (from Batch I, still unenforced).**
+`cfg.cache_key(video_hash, geometry_hash, provenance_key=None)` has a third
+provenance axis that **no caller passes**. Nothing caches a clip-derived result
+today, so it is an available guard, not an active one — but the day something
+does, omitting it collides a source-derived and a clip-derived result in one
+cache entry, silently. The key travels as `meta["clip_provenance"]` out of
+`live_channel_source`.
+
+*Recommended fix, cheap and worth doing before it bites — make the omission
+impossible rather than documented.* Drop the default and make the parameter
+**required and keyword-only**:
+
+```python
+def cache_key(self, video_hash, replicate_geometry_hash, *, provenance_key): ...
+```
+
+Every call site must then write `provenance_key=None` deliberately, which is a
+claim ("this pass read the source") rather than an oversight. Cost is three call
+sites — `core/pipeline.py:174`, the shelved `gui/tab1_flow.py:757`,
+`scripts/validate_standardization.py:114` — plus `tests/test_clip_extraction.py`.
+The *hashing* behaviour must not change: `None` stays omitted from the blob, so
+every pre-clip cache keeps its key. This is the T17 shape handled early — state
+that quietly stops meaning what it meant — and the same remedy class as bumping
+`PRETRANSCODE_VERSION`: make the silent case loud at the boundary.
+
 **Shelved (T8, T9).** `gui/tab1_flow.py` and `gui/tab3_behavior.py` are
 unmaintained. Don't fix them if a change breaks them; just note it. Consider
 renaming to `_shelved_*` once nothing imports them. (Overridden once, deliberately,
@@ -79,6 +112,11 @@ in Batch K — see `FINDINGS.md` §9.)
 | — | `DEFAULT_TARGET_WIDTH` sweep (refuted the plan's cost model) | — |
 | K | downsampling opt-in, scale 1.0 default, block tracks scale (T25) | `34ef8ec` |
 | M | downsampling decision tool — all five slices, **closed** | `ecd942d`…`3ec1e5a` + calibration |
+| I | ROI pre-transcode: the cut, the manifest, the wiring (T23) — **closed, see below** | — |
+| J | headless batch driver + sharding + throughput (T24) | — |
+| O | decodable frame count (T26) | `cba9824` |
+| D | plot collapse, empty-plot collapse (T10, T13, T14) | `0b112a6` |
+| E | detection readout (T15, T16, T27, T28) | `4fdf8b0` |
 
 Their durable output is `FINDINGS.md`. Everything else about them has been deleted.
 
@@ -198,9 +236,9 @@ class the item assumed.
 `video_panel`), but only because `MiniPlot` had already been found and moved in
 Batch D. E's real work still landed in `speed_explorer`.
 
-### Batch F — whole-video correctness (~~T17~~, T18) · `scalogram_explorer` + `tensor_channels`
-T18 remains; **T17 is landed**. The file locality moved — neither fix was where
-this batch originally guessed.
+### Batch F — whole-video correctness (~~T17~~, ~~T18~~) · `scalogram_explorer` + `tensor_channels`  ← **CLOSED**
+Both landed. The file locality moved — neither fix was where this batch
+originally guessed.
 
 **T17 — LANDED.** The original hypothesis was wrong: `extract()` captures view
 state unconditionally and `_focus_frame` goes through `extract()`, so the round
@@ -247,15 +285,16 @@ fixed stamp follows selection, new box selects itself, drop the redundant dropdo
 The memory leak (T21) is likely an overlay/pixmap not released per selection —
 chase it last, with the rest already simplified.
 
-### Batch H — viewer tab (T22) · new file, largest
-New tab consuming a `DetectionResult`: full-clip detection bar plus a ~1 min zoomed
-bar following the scrubber, and an "open here in preprocessing" handoff that seeks
-the live surface without auto-triggering a pass. Depends on B (cancel) and F (state
-retention). Do last.
-
-### Batch I — ROI pre-transcode (T23) · new file + `channel_source`  ← **IN PROGRESS**
+### Batch I — ROI pre-transcode (T23) · `core/pretranscode.py` + `channel_source`  ← **CLOSED**
 Cut each source once into per-replicate clips plus a manifest (geometry, scale,
 source hash, fps at full precision), and teach extraction to consume the manifest.
+
+**Closed 2026-07-19 — it works, and it is not the win it was scoped as.** Every
+slice landed and is tested; the cut runs clean on `GX010047c2`. But the 25x
+isolated decode win is **1.06x end to end** (`FINDINGS.md` §16), so no further
+investment here is planned. Kept, not deleted: it still wins on storage-local
+working sets, slow or remote source disk, and any future smaller-scale pass. The
+open question moved to Batch L — see there.
 
 **Landed:** `core/pretranscode.py` + `tests/test_pretranscode.py` — the cut, the
 manifest, `provenance_key()`, and verification. Measured on `GX010047c2`:
@@ -304,35 +343,44 @@ three real defects, all silent-shaped, all fixed:
   §6 says the cost model must never err in. Now uses the delivered count and
   carries `truncated`, which `usable` excludes from any fit.
 
-**Still open:** nothing on the tensor path. `run_pipeline` accepts no manifest —
-deliberately, since the flow cache is not the detection path on this branch. Wire
-it there only if Batch J needs it.
+**Landed after the close — `cli/pretranscode.py`.** The close exposed that the
+cut had **no entry point**: `build_pretranscode` was called from tests and
+nothing else, while `cli/run.py` already consumed clips *by default* via
+`shard.find_manifest`. The fast path could be read but not written, and the only
+hint it existed was a flag named `--no-clips`. Now
+`python -m cli.pretranscode footage/*.MP4`, argparse over the tested function,
+same 0/1/2 exit contract. Clips and manifest default to **beside each video**,
+which is where `find_manifest` looks first — verified end to end: written by the
+CLI, discovered with no flag, `verify_manifest` clean.
 
-**One unenforced obligation, carried to J.** `cfg.cache_key` accepts a
-`provenance_key` third argument and **no caller passes it**, because nothing
-caches a clip-derived result yet. The first code that does must thread
-`meta["clip_provenance"]` into it; otherwise a source-derived and a clip-derived
-result collide in one cache entry. Available guard, not an active one.
-**Still unenforced after J's first slice** — the headless summary *records*
-`clip_provenance`, but writing a result file is not caching, so no caller has
-appeared yet.
+Two things in it that are not argparse. **Resume is by identity, not existence**
+(§13's rule): an existing manifest is re-verified against the current boxes and
+clip sizes, so an up-to-date cut skips, and a *stale* one is a hard error naming
+the reason rather than a silent re-use or a silent re-cut. And **`--replicates`
+is refused for more than one video** — the boxes are fractional, so applying one
+sidecar across a session looks reasonable and yields clips that verify, decode,
+and attribute the wrong pixels.
 
-**Why this beats the live ROI crop that already exists.** H.264 decode is
-whole-frame: the `crop` in `ReplicateVideoSource`'s filter graph runs *after*
-decode, so the live path still pays full decode cost. Pre-transcoding makes the
-*stored file* small, so later decodes genuinely decode fewer pixels. It is the only
-thing that moves the ~3.8 s floor (`FINDINGS.md` §1).
+It also turned up a live defect in **`cli/count_frames.py`**, fixed: it let
+`expand_videos`'s `BatchError` escape, so a mistyped glob exited **1 with a
+traceback** instead of 2 — and 1 means "a file could not be counted", telling a
+job runner something false about a run that never started.
 
-**That last sentence is true and is no longer the interesting one — see
-`FINDINGS.md` §16, measured once Batch O unblocked the cut on real footage.** The
-clip-backed pass is **1.06x** end to end (38.7 vs 36.6 fps), not the 25x the
-isolated decode measurement suggests, because the producer thread already
-overlaps decode and at scale 1.0 this workload is math-bound (`tensor_blur` 53% +
-`tensor_products` 27%). Moving the decode floor stopped mattering much when Batch
-K made scale 1.0 the default. The cut still wins on storage-local working sets,
-slow or remote source disk, and any future smaller-scale pass — and the N-worker
-case, where 8 processes contend for the memory bandwidth §14 suspects is the
-ceiling, is **untested and is where the win is most likely to be real**.
+**Deliberately not done, and staying that way:** nothing on the tensor path.
+`run_pipeline` accepts no manifest, since the flow cache is not the detection
+path on this branch. The `cfg.cache_key` provenance obligation this batch created
+is now a **standing decision** (§2) rather than a batch note, because it outlives
+the batch — it binds whoever first caches a clip-derived result, whenever that is.
+
+**Why the 25x did not survive contact.** H.264 decode is whole-frame, so the
+`crop` in `ReplicateVideoSource`'s filter graph runs *after* decode and the live
+path pays full decode cost — pre-transcoding genuinely makes later decodes
+cheaper, and in isolation it is 25x. It still only bought **1.06x** end to end
+(38.7 vs 36.6 fps), because the producer thread already overlaps decode and at
+scale 1.0 the pass is math-bound. Moving the decode floor stopped mattering when
+Batch K made scale 1.0 the default. **The general lesson is in §2:** an isolated
+stage speedup is not a pipeline speedup, and this plan has now made that mistake
+once with a number as large as 25x.
 
 Also from §16, and the first evidence either way: clip-backed and source-backed
 detections **agreed exactly** on this footage (14000/14000 over 2000 frames,
@@ -510,6 +558,16 @@ ordinary pass: what fraction of block-cells fall below a candidate threshold,
 across footage types. ~90% quiet means gating removes most of the math; ~40% means
 bookkeeping eats it.
 
+**Second cheap measurement, inherited from closed Batch I: clip-backed throughput
+at N=8.** It belongs here rather than with I because it asks L's question, not
+I's — §14 suspects memory bandwidth is the 8-worker ceiling, and 8 processes
+decoding 1/12 the pixels is the one configuration that would separate a
+bandwidth ceiling from a decode-contention one. Single-process says 1.06x
+(§16); the multi-worker case is untested and is the configuration that actually
+runs a corpus. A bench run on `scripts/bench_worker_scaling.py` with clip paths,
+not a batch. **If it comes back ~1x, the memory-bandwidth hypothesis firms up and
+L is the only remaining lever** — which is the result that would matter most.
+
 **Threshold validation is tractable and not optional.** The gate and the detector
 read the SAME quantity, so the gate can be expressed in units of the detector's own
 sensitivity floor ("gate at X% of floor"). The hazard is worse than downsampling's:
@@ -573,25 +631,23 @@ produces either avoidance or silent degradation.
 
 ## 6. Order
 
-**I → J → O → D → E all landed.** G/H remain (F is down to its own note), as
-day-to-day use demands. **G is next.**
+**I → J → O → D → E → F all landed and closed. Only G remains open.** **G is
+next**, and after it the plan is down to deferred work (L) plus two cheap
+measurements.
 
-**What O changed about the ordering.** It was justified as unblocking I's ~25x
-decode win on the primary test video. It did unblock the cut — but the win it
-unblocked measured **1.06x end to end** (`FINDINGS.md` §16), so the argument for
-prioritizing further decode work is gone. At scale 1.0 this pipeline is
-math-bound, which points at **Batch L (quiet-tile gating)** as the next real
-throughput lever rather than anything in the I/J decode family. L's own
-prerequisite is unchanged and is cheap: **measure tile occupancy from the
-`change` channel of an ordinary pass** before building anything.
+**Scope cut, 2026-07-19.** Batch H (T22, viewer tab) is **dropped** — unbuilt,
+self-scoped as the largest batch, a convenience shell nothing depends on. Batch I
+(T23) is **closed rather than continued**, on the measurement rather than on
+taste: §16 priced its win at 1.06x end to end. Both removals are about the same
+thing — this plan grew two large items justified by numbers taken in isolation
+(25x decode) or by no number at all (the viewer tab), and neither survived being
+asked what it buys the pipeline.
 
-The one decode measurement still worth taking is **clip-backed throughput at
-N=8**, where §14's suspected memory-bandwidth ceiling and 8-way decode contention
-interact. Single-process says 1.06x; the multi-worker case is untested and is the
-configuration that actually runs a corpus.
-
-**D and E are closed.** T18 is already landed, so F is down to nothing but its
-own note.
+**What that leaves as the real throughput lever: Batch L (quiet-tile gating)**,
+because at scale 1.0 the pass is math-bound. Its two prerequisites are both cheap
+measurements, not builds, and are recorded in L: **tile occupancy from the
+`change` channel**, and **clip-backed throughput at N=8** (inherited from I).
+Take both before building anything.
 
 **One thing D showed that applies to G and H.** That batch's stated file
 locality was wrong — the class it had to change lived in a file the spec did not
