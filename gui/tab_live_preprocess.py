@@ -64,12 +64,22 @@ class TabLivePreprocess(QWidget):
             self._drop()
             return
         if sig == self._sig and self._surface is not None:
+            # Same geometry, so the surface stands -- but its replicate dicts are
+            # references into an AppState list that is REPLACED with fresh copies
+            # on every edit, so a calibration or baseline set on another tab has
+            # not reached it. This runs on every show, which is exactly when the
+            # user could have been editing elsewhere.
+            self._surface.refresh_replicate_metadata(self.state.replicate_specs)
             return
         self._drop()
         self._info.setVisible(False)
         self._surface = LiveScalogramSurface(
             self.state.source.info.path, self.state.replicate_specs,
             base_cfg=self.state.cfg, parent=self)
+        # The surface works from AppState's copies of the replicate dicts, so a
+        # calibration measured in its downsample window has to be relayed here
+        # to reach the replicate tab's list and its per-video sidecar.
+        self._surface.calibration_changed.connect(self.state.apply_calibration)
         self._lay.addWidget(self._surface, 1)
         self._sig = sig
 

@@ -35,7 +35,12 @@ from core.channel_source import (LIVE_CHANNELS, live_channel_source,
 from core.config import FlowConfig, PipelineConfig, PreprocessConfig
 from core.cost_model import CostModel, PassSample
 from core.scale_sweep import measure_scale
-from core.replicates import build_layout
+from core.replicates import build_layout, in_tile_order
+
+# Fields that define a replicate's geometry. A surface is rebuilt outright when
+# these change (the tab keys it on a geometry hash), so refreshing metadata must
+# never copy them across -- see refresh_replicate_metadata.
+_GEOMETRY_KEYS = frozenset({"frac", "id"})
 from core.detection import detect_channel_region
 from core.video import VideoSource
 from core.wavelet import default_freqs
@@ -256,6 +261,12 @@ class _SweepWorker(_StreamWorker):
 
 
 class LiveScalogramSurface(QWidget):
+    # A calibration measured in the downsample window. This surface works from
+    # AppState's *copies* of the replicate dicts, so it cannot persist one
+    # itself; the owning tab relays this to AppState, which the replicate tab --
+    # owner of the authoritative list and its sidecar -- writes to disk.
+    calibration_changed = pyqtSignal(int, object)   # (replicate id, fields)
+
     def __init__(self, video_path: str, replicates: list[dict],
                  base_cfg: PipelineConfig | None = None, parent=None):
         super().__init__(parent)
@@ -669,6 +680,7 @@ class LiveScalogramSurface(QWidget):
         dlg.sweep_requested.connect(self._start_sweep)
         dlg.sweep_cancelled.connect(self._stop_sweep)
         dlg.render_requested.connect(self._start_render)
+        dlg.calibrate_requested.connect(self._open_calibration)
         ok, why = self._sweep_ready()
         dlg.set_sweep_available(ok, why)
         self._dlg = dlg
@@ -688,6 +700,72 @@ class LiveScalogramSurface(QWidget):
             # setValue fires valueChanged, which starts the re-extract debounce,
             # so choosing a scale here applies exactly as dragging the spin does.
             self.ds_spin.setValue(float(dlg.chosen_scale))
+
+    # -- the dialog's calibration sub-tool -----------------------------------
+    def _sorted_reps(self) -> list[dict]:
+        return in_tile_order(self.replicates)
+
+    def refresh_replicate_metadata(self, replicates: list[dict]) -> None:
+        """Re-read non-geometry replicate fields from the owner.
+
+        Geometry changes rebuild this whole surface (the tab keys it on a
+        geometry hash), but calibration and baselines do not -- and
+        ``AppState.set_replicate_specs`` *replaces* its dicts with fresh copies
+        on every edit, so this surface's references go stale silently. Measured:
+        calibrating in the replicate tab left an already-built surface's
+        downsample window reporting the replicate as uncalibrated for the rest
+        of the session.
+
+        Refreshing all metadata rather than calibration alone, because the same
+        staleness applies to every non-geometry field and a calibration-only
+        patch would have to be rewritten for the next one. Geometry is
+        deliberately NOT copied across: if it differed, this surface would be
+        the wrong one and the tab would have rebuilt it.
+        """
+        incoming = {int(r["id"]): r for r in replicates if "id" in r}
+        for rep in self.replicates:
+            src = incoming.get(int(rep.get("id", -1)))
+            if src is None:
+                continue
+            rep.update({k: v for k, v in src.items() if k not in _GEOMETRY_KEYS})
+
+    def _open_calibration(self, rep_index: int):
+        reps = self._sorted_reps()
+        if not reps:
+            return
+        i = min(max(0, int(rep_index)), len(reps) - 1)
+        rep = reps[i]
+        box = self._replicate_box(i)
+        start, n = self._window()
+        # Decoded on the GUI thread: it is one seek, user-initiated, and a modal
+        # window follows immediately, so the freeze is bounded and legible in a
+        # way a spinner over an empty dialog would not be.
+        with VideoSource(self.video_path) as src:
+            frame = src.frame_at(start + n // 2)
+        if frame is None:
+            # Same failure the render strip reports, and the same place to
+            # report it: the dialog already has a status line for "this frame
+            # could not be decoded".
+            if self._dlg is not None:
+                self._dlg.render_failed(
+                    f"frame {start + n // 2} could not be decoded")
+            return
+        from gui.calibration_dialog import CalibrationDialog
+        dlg = CalibrationDialog(
+            frame, box=box, label=str(rep.get("label", "")),
+            pixels_per_mm=rep.get("pixels_per_mm"),
+            body_length_mm=rep.get("body_length_mm"),
+            body_length_px=rep.get("body_length_px"),
+            scale=float(self.ds_spin.value()), parent=self._dlg or self)
+        try:
+            if dlg.exec() and dlg.calibration is not None:
+                fields = dlg.calibration.as_replicate_fields()
+                if fields:
+                    if self._dlg is not None:
+                        self._dlg.apply_calibration(i, fields)
+                    self.calibration_changed.emit(int(rep["id"]), fields)
+        finally:
+            dlg.deleteLater()
 
     # -- the dialog's render strip -------------------------------------------
     def _replicate_box(self, index: int):

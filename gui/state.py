@@ -34,6 +34,10 @@ class AppState(QObject):
     frame_changed = pyqtSignal(int)
     status = pyqtSignal(str)
     request_tab = pyqtSignal(int)
+    # (replicate id, {field: value}) -- a calibration measured somewhere other
+    # than the replicate tab. The tab owns the list and its sidecar, so it is
+    # what persists this; state only relays and keeps its own specs in step.
+    calibration_changed = pyqtSignal(int, object)
 
     def __init__(self, project_dir: str = "."):
         super().__init__()
@@ -218,6 +222,26 @@ class AppState(QObject):
                 self.status.emit(
                     "Replicate geometry changed; run Test/Full again to build "
                     "a matching ROI-first cache.")
+
+    def apply_calibration(self, replicate_id: int, fields: dict) -> None:
+        """Merge measured calibration onto one replicate and relay it.
+
+        ``set_replicate_specs`` copies the dicts, so a calibration measured off
+        ``replicate_specs`` (the live preprocessing surface works from those)
+        would otherwise die with the widget that measured it. This updates the
+        published copy and emits, leaving the replicate tab -- which owns the
+        authoritative list and its per-video sidecar -- to persist it.
+
+        Only the keys actually measured are merged, so a partial calibration
+        never clears a field set by hand.
+        """
+        if not fields:
+            return
+        for rep in self.replicate_specs:
+            if int(rep.get("id", -1)) == int(replicate_id):
+                rep.update(fields)
+                break
+        self.calibration_changed.emit(int(replicate_id), dict(fields))
 
     # -- cache ---------------------------------------------------------------
 

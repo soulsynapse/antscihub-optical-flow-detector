@@ -152,6 +152,13 @@ class Tab2Replicates(QWidget):
         self.body_length_mm.setDecimals(4)
         self.body_length_mm.setSpecialValueText("unset")
         sf.addRow("body length (mm)", self.body_length_mm)
+        self.calibrate_btn = QPushButton("Calibrate by drawing…")
+        self.calibrate_btn.setToolTip(
+            "Measure both fields on the frame instead of typing them: drag "
+            "along the animal for its length, and across a ruler or scale bar "
+            "of known size to fix pixels/mm.")
+        self.calibrate_btn.clicked.connect(self._open_calibration)
+        sf.addRow(self.calibrate_btn)
         for w in (self.use_baseline, self.baseline_start, self.baseline_end,
                   self.pixels_per_mm, self.body_length_mm):
             # Rebuilding every ROI trace on each intermediate spinbox keystroke
@@ -179,6 +186,7 @@ class Tab2Replicates(QWidget):
         state.video_loaded.connect(self._on_video_loaded)
         state.cache_opened.connect(self._on_cache_opened)
         state.frame_changed.connect(self._on_frame_changed)
+        state.calibration_changed.connect(self._on_calibration_changed)
 
     # -- per-video persistence ----------------------------------------------
 
@@ -344,7 +352,8 @@ class Tab2Replicates(QWidget):
 
     def _sync_standardization_controls(self, rep: dict | None):
         widgets = (self.use_baseline, self.baseline_start, self.baseline_end,
-                   self.pixels_per_mm, self.body_length_mm)
+                   self.pixels_per_mm, self.body_length_mm,
+                   self.calibrate_btn)
         for w in widgets:
             w.blockSignals(True)
         try:
@@ -362,6 +371,68 @@ class Tab2Replicates(QWidget):
         finally:
             for w in widgets:
                 w.blockSignals(False)
+
+    # -- calibration ---------------------------------------------------------
+
+    def _source_box(self, rep: dict):
+        """The replicate's box in source pixels, as extraction resolves it.
+
+        Through ``build_layout`` rather than off ``frac`` directly, so the guide
+        rectangle in the calibration window is the box the pass actually crops --
+        rounding and clamping included. Matched by ``replicate_id``, never by
+        position: ``build_layout`` sorts by id and this list is in draw order.
+        """
+        if self.state.source is None:
+            return None
+        from core.replicates import build_layout
+        info = self.state.source.info
+        layout = build_layout(self.replicates, info.width, info.height,
+                              scale=1.0, block_size=1)
+        tile = next((t for t in layout.tiles
+                     if int(t.replicate_id) == int(rep["id"])), None)
+        return tile.source_box if tile is not None else None
+
+    def _open_calibration(self):
+        rep = self._selected_rep()
+        if rep is None or self.state.source is None:
+            return
+        frame = self.state.source.frame_at(self.state.current_frame)
+        if frame is None:
+            self.state.status.emit(
+                "Could not decode the current frame to calibrate against.")
+            return
+        from gui.calibration_dialog import CalibrationDialog
+        dlg = CalibrationDialog(
+            frame, box=self._source_box(rep), label=str(rep.get("label", "")),
+            pixels_per_mm=rep.get("pixels_per_mm"),
+            body_length_mm=rep.get("body_length_mm"),
+            body_length_px=rep.get("body_length_px"),
+            scale=1.0, parent=self)
+        try:
+            if dlg.exec() and dlg.calibration is not None:
+                self._merge_calibration(rep["id"],
+                                        dlg.calibration.as_replicate_fields())
+        finally:
+            dlg.deleteLater()
+
+    def _on_calibration_changed(self, replicate_id: int, fields: dict):
+        """A calibration measured on another tab. Persisting is this tab's job:
+        it owns the list and the per-video sidecar."""
+        self._merge_calibration(replicate_id, fields)
+
+    def _merge_calibration(self, replicate_id: int, fields: dict):
+        rep = next((r for r in self.replicates
+                    if int(r["id"]) == int(replicate_id)), None)
+        if rep is None or not fields:
+            return
+        rep.update(fields)
+        # Re-read the spin boxes off the dict rather than setting them from
+        # `fields`, so a partial calibration (animal only, no ruler) leaves the
+        # untouched field showing what it already held.
+        if rep is self._selected_rep():
+            self._sync_standardization_controls(rep)
+        self._rebuild_rois()
+        self._autosave()
 
     def _standardization_changed(self, *_):
         rep = self._selected_rep()

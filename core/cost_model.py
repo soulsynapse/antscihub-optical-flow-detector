@@ -310,14 +310,24 @@ def format_duration(hours: float) -> str:
 
 def working_px_per_body_length(pixels_per_mm: float | None,
                                body_length_mm: float | None,
-                               scale: float) -> float | None:
+                               scale: float,
+                               body_length_px: float | None = None
+                               ) -> float | None:
     """Organism-relative resolution at a given scale, or None if uncalibrated.
 
     Follows the convention already established at ``core/roi.py:418`` --
     calibration is stored in SOURCE px/mm and the working value is derived by
     multiplying through the scale -- so this reads the same fields exports and
     ``speed_body_lengths_s`` already read rather than inventing new ones.
+
+    ``body_length_px`` is a fallback for the fiducial-free case: the mm pair
+    reduces to ``body_length_px * scale`` exactly (the px/mm cancels -- see
+    ``core/calibration.py``), so a replicate measured with only an animal line
+    still answers this question. Preferred order is the mm pair, since that is
+    what a user may have typed or corrected by hand.
     """
-    if not pixels_per_mm or not body_length_mm:
-        return None
-    return float(pixels_per_mm) * float(body_length_mm) * float(scale)
+    if pixels_per_mm and body_length_mm:
+        return float(pixels_per_mm) * float(body_length_mm) * float(scale)
+    if body_length_px:
+        return float(body_length_px) * float(scale)
+    return None

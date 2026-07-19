@@ -179,6 +179,22 @@ def build_layout(replicates: list[dict], src_width: int, src_height: int,
     )
 
 
+def in_tile_order(replicates: list[dict]) -> list[dict]:
+    """The same replicates, in the order :func:`build_layout` emits tiles.
+
+    ``build_layout`` sorts by id; a replicate list is in draw order, and a
+    sidecar can be in any order at all. Anything that indexes ``layout.tiles``
+    and the replicate list with the SAME index must sort first, or index *i*
+    means one replicate in one and a different one in the other -- which showed
+    up as one replicate's rendered picture beside another's px-per-body-length,
+    and would write a calibration onto the wrong animal.
+
+    Returns a new list of the same dict objects, so callers still see later
+    edits; it does not reorder the caller's list.
+    """
+    return sorted(replicates, key=lambda r: int(r.get("id", 0)))
+
+
 def tiles_from_meta(meta: dict) -> list[dict]:
     return list(meta.get("replicate_tiles", []))
 

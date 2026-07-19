@@ -66,10 +66,15 @@ threshold drifted, the structure did not necessarily go. Saying so with two rows
 of pictures is honest in a way the events-kept table was not, because a picture
 does not claim to have counted anything.
 
-Not built (see todo.md Batch M): the draw-a-line calibration sub-tool (reading
-``pixels_per_mm`` / ``body_length_mm`` off the replicate dicts works today). The
-panels below are built as reusable components (``gui/cost_panels.py``) so Batch
-N's block-size sibling shares them rather than diverging.
+The **Calibrate…** button beside the replicate selector opens
+``gui/calibration_dialog.py``, where a line drawn along the animal fixes the
+"what you keep" readout in organism-relative units. Note what that costs: the
+ruler is optional for *this* window, because working px per body length reduces
+to ``body_line_px * scale`` and the fiducial cancels exactly (see
+``core/calibration.py``). It is needed only to store the result in millimetres.
+
+The panels here are built as reusable components (``gui/cost_panels.py``) so
+Batch N's block-size sibling shares them rather than diverging.
 """
 from __future__ import annotations
 
@@ -79,7 +84,7 @@ from PyQt6.QtWidgets import (QDialog, QDoubleSpinBox, QFormLayout, QFrame,
                              QScrollArea, QSpinBox, QVBoxLayout, QWidget)
 
 from core.config import FlowConfig
-from core.replicates import build_layout
+from core.replicates import build_layout, in_tile_order
 from core.cost_model import (CostModel, atlas_cells, boxes_from_tiles,
                              format_bytes, format_duration,
                              storage_bytes_per_hour,
@@ -182,6 +187,7 @@ class DownsampleDialog(QDialog):
     sweep_requested = pyqtSignal(object)        # list[float] of scales to time
     sweep_cancelled = pyqtSignal()
     render_requested = pyqtSignal(int, object)  # replicate index, scales
+    calibrate_requested = pyqtSignal(int)       # replicate index
 
     def __init__(self, replicates: list[dict], src_width: int, src_height: int,
                  fps: float, current_scale: float, model: CostModel | None,
@@ -191,7 +197,9 @@ class DownsampleDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Downsampling — what you gain and what you lose")
         self.resize(980, 880)
-        self._reps = list(replicates)
+        # Tile order, because the render strip and the box geometry come back in
+        # it while the readouts index this list. See core.replicates.in_tile_order.
+        self._reps = in_tile_order(replicates)
         self._src = (int(src_width), int(src_height))
         self._fps = float(fps)
         self._flow = flow or FlowConfig()
@@ -299,7 +307,17 @@ class DownsampleDialog(QDialog):
         # on the replicate changing and NOT on the corpus-hours spin, which also
         # runs _refresh and has nothing to do with what the box looks like.
         self.rep_spin.valueChanged.connect(self._on_rep_changed)
-        form.addRow("Replicate", self.rep_spin)
+        rep_row = QHBoxLayout()
+        rep_row.addWidget(self.rep_spin)
+        self.calib_btn = QPushButton("Calibrate…")
+        self.calib_btn.setToolTip(
+            "Draw a line along the animal to get working pixels per body "
+            "length exactly — no ruler needed for that number. Add a ruler line "
+            "to store the result in millimetres.")
+        self.calib_btn.clicked.connect(
+            lambda: self.calibrate_requested.emit(self.rep_spin.value()))
+        rep_row.addWidget(self.calib_btn)
+        form.addRow("Replicate", rep_row)
         row.addLayout(form)
         row.addStretch(1)
 
@@ -373,7 +391,8 @@ class DownsampleDialog(QDialog):
         the replicate is calibrated and geometric where it is not."""
         rep = self._reps[self.rep_spin.value()] if self._reps else {}
         px_bl = working_px_per_body_length(rep.get("pixels_per_mm"),
-                                           rep.get("body_length_mm"), scale)
+                                           rep.get("body_length_mm"), scale,
+                                           rep.get("body_length_px"))
         if px_bl is not None:
             return f"{px_bl:.1f} px per body length"
         boxes = self._boxes()
@@ -516,6 +535,19 @@ class DownsampleDialog(QDialog):
         self.render.set_renders([])
         self._renders = []
         self.render.set_status(f"Could not render this replicate: {msg}")
+
+    def apply_calibration(self, rep_index: int, fields: dict):
+        """Merge a calibration the owner just measured, and re-read the rows.
+
+        Only the readouts change: calibration is organism geometry and touches
+        neither the cost model nor the storage arithmetic, so the frontier and
+        the sweep rows are left alone.
+        """
+        if not fields or not self._reps:
+            return
+        i = min(max(0, int(rep_index)), len(self._reps) - 1)
+        self._reps[i].update(fields)
+        self._refresh_rows()
 
     # -- the timing sweep ----------------------------------------------------
     def set_sweep_available(self, ok: bool, reason: str = ""):
