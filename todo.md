@@ -25,10 +25,10 @@ to the relevant section rather than restating it.
 | **T14** | All plots should collapse/expand via `[+]`, collapsed by default, and a collapsed plot must not render (saves memory). |
 | **T15** | Replace the positive-detection graph with green bands overlaid on the windowed #-blocks-in-band plot. |
 | **T16** | On a detection, show a `DETECTED` badge (green bg, bold black) bottom-right of the viewer box — must survive the shift-held path. |
-| **T17** | Whole-video processing resets the detection threshold bands when navigating. It should not. |
-| **T18** | "Process whole video" may compute change energy regardless of the selected channel. Suspected, not confirmed. |
+| **T17** | Whole-video processing resets the detection threshold bands when navigating. It should not. **CONFIRMED, cause found — see Batch F.** |
+| **T18** | "Process whole video" computes every channel regardless of the selected one. **CONFIRMED — see Batch F.** |
 | **T20** | Drop the replicate dropdown — redundant with click navigation. |
-| **T21** | Suspected runaway memory issue somewhere on the replicate tab. |
+| **T21** | Suspected runaway memory issue somewhere on the replicate tab. **Not reproduced by inspection** — `_refresh_list` was the obvious suspect and is clean (14x14 swatch pixmaps, `list.clear()` releases the items). Needs an actual measurement, not more code reading; do not guess at a fix. |
 | **T22** | New **viewer tab** consuming a fully-processed video: detection/no-detection only, full-clip bar plus a ~1 min bar zoomed on the scrubber, and a hand-off back into preprocessing at the paused position *without* auto-triggering a pass. |
 | **T23** | **ROI pre-transcode**: cut each source once into per-replicate clips + manifest, so later passes decode ~1/16 the pixels. The only lever that moves the decode floor. |
 | **T24** | **Headless batch driver**: no-GUI entry point (video + replicate JSON → detection results) and file-level job partitioning, so runs fan out across nodes. |
@@ -104,6 +104,7 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 7. Detection panel | why it was removed and must not be rebuilt in that form |
 | 8. Calibration | the fiducial cancels; two ownership traps that each bit once |
 | 9. GUI bugs | the Qt exit-9 crash, the silent 20x downsample, the false pass |
+| 10. ROI pre-transcode | the 25x decode win, why lossless saves no storage, and four traps |
 
 ---
 
@@ -121,12 +122,40 @@ Replace the separate positive-detection plot with green bands overlaid on the
 windowed-#-blocks-in-band plot. Add a `DETECTED` badge (green bg, bold black) in
 the viewer box's bottom-right that survives the shift-held path.
 
-### Batch F — whole-video correctness (T17, T18) · `live_scalogram_surface` + `channel_source`
-Two suspected bugs, both need confirming before fixing. (T17) threshold bands reset
-on navigation — check the `_focus_frame` → `extract` → `_swap_explorer` view-state
-round trip. (T18) `LIVE_CHANNELS` looks unconditional in `live_channel_source`, so
-the commit pass likely computes every channel regardless of `channel_attr`; if
-confirmed, thread the selected channel through. **T18 is a real speed win.**
+### Batch F — whole-video correctness (T17, T18) · `scalogram_explorer` + `tensor_channels`
+Both bugs are now **confirmed by inspection**, and the file locality moved — neither
+fix is where this batch originally guessed.
+
+**T17 — the original hypothesis was wrong.** `extract()` captures view state
+unconditionally (`live_scalogram_surface.py:567`) and `_focus_frame` goes through
+`extract()`, so the round trip is *not* dropping the capture. The actual cause is
+that `capture_view_state` (`scalogram_explorer.py:373`) carries `channel`, `frame`,
+`sweep_win`, `centered` and `freq_band` — but **not `value_band` or `count_band`**,
+the two detection threshold bands. `detection_params()` reads all three from live
+widgets, so the state exists; it simply is not in the captured dict, so every
+rebuild reverts those two to defaults. Fix is local: add both to `capture_view_state`
+and restore them in `apply_view_state`. Note `apply_view_state` ends with
+`_on_freq_band_committed()`, so restore the bands *before* that call or the
+recompute runs against defaults.
+
+**T18 — confirmed, and bigger than "computes change energy anyway".**
+`extract_channels_live` takes no channel selector at all, so the whole commit pass
+computes `flow_solve`, `appearance` and `texture` for every window regardless of
+`channel_attr`; `live_channel_source` then materializes all of `LIVE_CHANNELS`
+(`channel_source.py:137`). The dependency structure is what makes this worth doing:
+
+| selected channel | needs |
+|---|---|
+| `intensity`, `change` | `tensor_products` only (~7% per `FINDINGS.md` §1) |
+| `tensor_speed` | + `flow_solve` |
+| `appearance` | + `flow_solve`, + residual |
+| `texture` | its own spatial min-eigen |
+
+So selecting `change` — the detection default — should skip nearly all the
+downstream math. Thread a channel set through `extract_channels_live` and write a
+defined placeholder for unselected channels rather than omitting keys, so the
+explorer's channel checkboxes still know they exist but are unavailable
+(`_channel_available` already gates on this).
 
 ### Batch G — replicate tab (T11, T12, T20, T21) · `tab2_replicates` + `video_panel`
 Click-to-select + zoom, drag to reposition, right-click to delete (that tab only),
@@ -140,9 +169,20 @@ bar following the scrubber, and an "open here in preprocessing" handoff that see
 the live surface without auto-triggering a pass. Depends on B (cancel) and F (state
 retention). Do last.
 
-### Batch I — ROI pre-transcode (T23) · new file + `channel_source`  ← **NEXT**
+### Batch I — ROI pre-transcode (T23) · new file + `channel_source`  ← **IN PROGRESS**
 Cut each source once into per-replicate clips plus a manifest (geometry, scale,
 source hash, fps at full precision), and teach extraction to consume the manifest.
+
+**Landed:** `core/pretranscode.py` + `tests/test_pretranscode.py` — the cut, the
+manifest, `provenance_key()`, and verification. Measured on `GX010047c2`:
+**~25x faster decode**, 1/12.1 the pixels. See `FINDINGS.md` §10 for the codec
+measurements and why the quality default is what it is.
+
+**Still open — the wiring:** teach `live_channel_source` / `extract_channels_live`
+to consume a manifest, and **fold `Manifest.provenance_key()` into the cache key**.
+That last part is not optional: the cache key already omits decoder and bit depth
+(§3 trap 3), and clips add a third axis on top of it, so without it a result from
+a live crop and one from a clip cut at a different quality compare as equal.
 
 **Why this beats the live ROI crop that already exists.** H.264 decode is
 whole-frame: the `crop` in `ReplicateVideoSource`'s filter graph runs *after*

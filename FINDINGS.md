@@ -370,3 +370,84 @@ false pass, the wrong-replicate index, the stale surface, the 300x floor error, 
 them. The order matters — several of these produce *plausible, authoritative-looking
 output* rather than a crash, and a test written from the same wrong mental model
 would have passed.
+
+## 10. ROI pre-transcode
+
+Measured on `GX010047c2_02_17_26.MP4` (5312x2988 HEVC, 24000/1001, 0.157 bits/px,
+3.55 GB), 6 replicates covering 8.27% of frame area.
+
+**The decode win, which is the whole point.** 300 frames of one replicate:
+
+| path | time | speedup |
+|---|---|---|
+| source HEVC + crop (today) | 4.03 s | 1.0x |
+| ffv1 lossless clip | 0.16 s | **25.4x** |
+| crf18 clip | 0.14 s | 28.6x |
+
+**Codec choice barely affects decode speed** — 25.4x lossless vs 28.6x lossy, 12%
+apart. Decode cost tracks *pixels*, not bytes. There is therefore no
+speed-vs-fidelity trade to agonize over; the trade is purely storage.
+
+### Storage vs fidelity, and why lossless is not the default
+
+Luma error against a bit-exact reference, and full-clip size for all 6 replicates:
+
+| quality | grey-level RMS | clips | total disk |
+|---|---|---|---|
+| lossless (ffv1) | 0.000 | 131% of source | 2.31x |
+| high (crf 12) | 1.041 | 24% | **1.24x** ← default |
+| standard (crf 18) | 1.540 | 11% | 1.11x |
+| x265 lossless | 0.000 | **130%** | — |
+| ffvhuff | 0.000 | **199%** | — |
+
+**Bit-exact lossless saves essentially no storage**, and two lossless codecs come
+out *larger than the 5.3K source*. Lossless must encode the source's inherited
+HEVC artifacts and sensor noise verbatim, and noise does not compress.
+
+The default is `high`, deliberately, against the initial instinct to force
+lossless. The sources are *already* a lossy re-encode (`stab_` = a stabilization
+generation removed from the sensor), so byte-exact preservation of an
+already-degraded intermediate buys less than it appears to; and a result that
+flips between crf 12 and lossless was fragile regardless, which is better
+surfaced than hidden. For reference, `FINDINGS.md` §3's ROI path achieves 0.364
+RMS, so crf 12 at 1.041 is ~2.9x that — real, and the reason quality is recorded
+rather than assumed.
+
+**What survives that argument.** The `change` channel is `<I_t^2>`, squared frame
+differencing, and it is the detection default. Lossy *inter-frame* coding
+perturbs precisely the frame-to-frame quantity that channel measures, rather than
+degrading generically. So quality is in `Manifest.provenance_key()` and clips cut
+at different quality must never share a cache entry. Whether a given behaviour is
+robust across these settings is **measurable once extraction consumes the
+manifest — measure it, per behaviour, rather than assuming either way.**
+
+### Lossless cost is distributed backwards from intuition
+
+| replicate | bits/px |
+|---|---|
+| rep6-no-flying | **3.695** ← most expensive |
+| rep2-backlit-flying-whole-time | 2.981 |
+| rep1-mostly-flying-some-pause | **1.921** ← among the cheapest |
+
+Motion is *cheaper*: motion blur is smooth and compresses well, while a still
+frame is mostly per-pixel noise. **Do not extrapolate a corpus from one
+replicate** — rep3 alone reads 1.602 bpp and projects 86% of source, a third
+under the true 131%. That error was made once here.
+
+### Traps found while building it
+
+1. **Both ffmpeg pipes must be drained concurrently.** Reading stdout for
+   `-progress` while deferring stderr until exit deadlocks as soon as ffmpeg
+   emits ~64 KB of stderr. It would hang the multi-minute whole-source runs and
+   never reproduce on a short test clip. A thread drains stderr.
+2. **ffmpeg emits a progress block only ~every 0.5 s**, so any clip small enough
+   for a fast test finishes inside one block and reports only the final frame. An
+   end-to-end test of progress parsing therefore passes whether or not parsing
+   works. The parser is unit-tested against canned lines instead. A first attempt
+   at an end-to-end version was vacuous in exactly this way.
+3. **`frame=` does NOT aggregate across outputs** — it matches source frames even
+   with 6 outputs mapped. This was assumed to be a bug and "fixed" wrongly before
+   being checked; it is not one.
+4. Gray-only encoding saves just ~6% here, not the ~33% the chroma planes suggest:
+   this backlit footage is nearly monochrome already. Still worth taking, since
+   the pipeline reads only luma.
