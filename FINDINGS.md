@@ -1109,3 +1109,74 @@ given *behaviour* survives the quality setting. On this footage, at these tuned
 thresholds, it does — exactly. That is one video and one parameter set, so it is
 not a general result about crf 12, but it is a real one and it is the first
 evidence in either direction.
+
+## 17. Plot collapse (T10, T13, T14, Batch D)
+
+**The measurement.** Scrubbing 120 frames of a synthetic clip through
+`ScalogramExplorer`, everything collapsed vs everything expanded:
+
+| grid | all collapsed | all expanded | ratio |
+|---|---|---|---|
+| 8x8 blocks, T=1200 | 160 ms | 513 ms | **3.2x** |
+| 48x48 blocks, T=1200 | 180 ms | 588 ms | **3.3x** |
+
+**The ratio barely moves with grid size, and that is the informative part.**
+The plan (T10) framed the lag as a *block=1 / weak-downsampling* problem, which
+implies the cost scales with the number of blocks. It does not.
+`DensityPlot._density_image` bins into a `w x h` raster, so its cost is set by
+the widget's **pixel area**, not by `blocks x frames` — its own docstring says
+so, and this measurement confirms it. The panel is expensive because it holds
+~11 plots that each repaint on every cursor move, not because any one of them
+handles a lot of data. So collapsing helps *uniformly*, at every block size,
+and "shrink the grid to make the UI faster" was never the lever it looked like.
+
+Total collapsed panel height is 198 px against ~800 expanded, which is the
+other half of why a collapsed panel is cheap: less area to blit.
+
+**A collapsed plot must skip the *paint*, not merely the geometry.** Setting a
+widget to 18 px still repaints it. The mechanism therefore returns early from
+`paintEvent` and drops the cached `QImage` (`_release_render_cache`), and
+`set_cursor`/`set_series` skip `update()` entirely so no paint is even queued.
+Only the QImage is dropped, never the matrix: the matrix is reconstructible only
+from a cube the explorer may have evicted, so discarding it could cost a full
+rebuild to reopen a plot.
+
+**The bug this batch nearly shipped, and the rule that prevents it.**
+`_refresh_densities` skipped the band-power sum for collapsed plots. Combined
+with collapsed-by-default (T14), that meant the **selected** channel was skipped
+too — and `_recompute_counts` / `_recompute_clump` read that matrix as the
+**detector's input**, not as a picture. Result: the explorer opened with a cube
+built and cached, and the entire detection sweep (count, windowed count,
+detect, clump) reading zero-length. A silent false negative, arrived at from a
+pure-UI change, and self-sustaining: the empty matrix re-armed the
+auto-collapse-when-empty rule (T13) that caused it, so the plot could never
+populate.
+
+> **Visibility decides what is DRAWN. It must never decide what is COMPUTED.**
+
+The selected channel is now exempt from the skip. This is the same shape as
+T17 (tuned state quietly stops meaning what it meant) reached from a different
+direction, and it is worth stating because the tempting version of this
+optimization — "don't compute what you don't show" — is *correct for four of
+the five density plots and catastrophic for the fifth*.
+
+`tests/test_plot_collapse.py::CollapseDoesNotDisarmTheDetectorTest` covers it,
+and was confirmed to fail against the unfixed code rather than merely passing
+against the fixed code. A test that only asserted geometry — which is what a
+"collapse plots" batch invites — would have passed throughout.
+
+**Not fixed, and deliberately.** `_recompute_clump` runs an O(T) connected-
+components pass even when `clump_plot` is collapsed. Skipping it would be a
+real saving, but the clump series is a detection quantity and the failure above
+is precisely what skipping a detection quantity looks like. It stays until
+someone establishes that nothing downstream reads it.
+
+**A GUI-test trap worth adding to §9.** `QApplication.instance() or
+QApplication([])` inside a helper *function* creates an app that nothing holds a
+reference to; it is garbage collected on return and the next `QWidget`
+constructor aborts the process with "Must construct a QApplication before a
+QWidget". That surfaces as a bare **exit 9 with no failing test named** — the
+same signature as the `closeEvent`/debounce crash already recorded in §9, from
+an unrelated cause. It only appears when the module runs *alone*; under the full
+suite another module has already made an app that outlives it, so the file
+passes. Hold the `QApplication` at module scope.

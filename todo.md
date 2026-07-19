@@ -18,11 +18,13 @@ to the relevant section rather than restating it.
 
 | id | item |
 |---|---|
-| **T10** | Plots are themselves the main source of lag at block=1 with weak downsampling — even 10 s can be a massive result. Worse once the full-video tab can scrub. |
+| ~~**T10**~~ | ~~Plots are themselves the main source of lag at block=1 with weak downsampling.~~ **FIXED** — see Batch D. Measured **3.2x** cheaper scrub collapsed. The premise was half wrong: plot cost tracks *widget pixel area*, not block count, so the win is the same at every block size (`FINDINGS.md` §17). |
 | **T11** | If fixed-size stamp is on, it should be the stamp of the *currently selected* replicate. Drawing a new box should select it (and set the stamp). |
 | **T12** | Replicate tab: clicking a replicate should highlight + zoom to it; dragging its box should reposition it; right-click should delete it (that tab only). |
-| **T13** | Per-block band power by channel draws black blocks when unpopulated — collapse those to checkbox height (the plot name is already that tall). |
-| **T14** | All plots should collapse/expand via `[+]`, collapsed by default, and a collapsed plot must not render (saves memory). |
+| ~~**T13**~~ | ~~Per-block band power by channel draws black blocks when unpopulated — collapse those to checkbox height.~~ **FIXED** — see Batch D. |
+| ~~**T14**~~ | ~~All plots should collapse/expand via `[+]`, collapsed by default, and a collapsed plot must not render.~~ **FIXED** — see Batch D. |
+| **T27** | The four **detection-sweep** plots draw the same black slab T13 removed from the density plots when they have no series (visible on open, and in the no-replicate-selected view). T13 scoped only the per-channel heatmaps; the mechanism to fix this now exists (`set_auto_collapse_empty`) and is a two-line change. |
+| **T28** | Collapsed-by-default (T14) hides `count_w_plot`, which carries the **detection threshold band** — the primary tuning control. Following T14 literally is what the plan asked for, but the first thing a user needs on open is now one click away. Decide whether that one plot is exempt. |
 | **T15** | Replace the positive-detection graph with green bands overlaid on the windowed #-blocks-in-band plot. |
 | **T16** | On a detection, show a `DETECTED` badge (green bg, bold black) bottom-right of the viewer box — must survive the shift-held path. |
 | ~~**T17**~~ | ~~Whole-video processing resets the detection threshold bands when navigating.~~ **FIXED** — see Batch F. |
@@ -112,17 +114,64 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 14. N-worker throughput | the ~130 fps / 8-worker ceiling and the node count to quote |
 | 15. Decodable frame count | claim vs measurement, and why a tolerance is not a fix |
 | 16. Clip-backed throughput | why the 25x decode win is 1.06x end to end, and where it may still be real |
+| 17. Plot collapse | the 3.2x, why it does not scale with block size, and the detector the collapse nearly disarmed |
 
 ---
 
 ## 5. Remaining batches
 
-### Batch D — plot cost + collapse (T13, T14, T10) · `scalogram_explorer` only
-Generalize the existing expand/collapse into a `[+]` header on every plot,
-collapsed by default; a collapsed plot skips its paint *and* drops its cached
-array. Unpopulated per-channel heatmaps collapse to checkbox height. This is also
-the fix for T10, so treat them as one batch. `_apply_selected_plot_ui` already
-calls `dp.set_expanded(...)`, so a collapse mechanism exists and can be generalized.
+### Batch D — plot cost + collapse (T13, T14, T10) · **CLOSED**
+All three landed. Measurements and the near-miss in `FINDINGS.md` §17.
+
+**The file locality in this spec was wrong.** It said "`scalogram_explorer`
+only", but `MiniPlot` — the base class every plot here derives from — lives in
+`gui/explorers/speed_explorer.py`, and `speed_explorer` and `variance_explorer`
+both build on it and are *not* shelved. The collapse machinery therefore had to
+go in a file the batch did not name, and had to be **opt-in**
+(`set_collapsible(False)` by default) so those two explorers keep their exact
+previous geometry. Only `scalogram_explorer` opts in.
+
+**Landed.** `MiniPlot` grows `set_collapsible` / `set_collapsed` /
+`set_auto_collapsed`, a `[+]`/`[-]` header marker with its own hit region, and
+`COLLAPSED_H = 18` (checkbox height, so a row of collapsed heatmaps aligns with
+the checkbox column beside it). `DensityPlot` and `ScalogramPlot` override
+`_release_render_cache` to drop their cached `QImage`. `DensityPlot` also gets
+`set_auto_collapse_empty`, which is T13.
+
+**Two collapse states, not one, and the separation is load-bearing.**
+`_user_collapsed` is what the `[+]` says; `_auto_collapsed` is "there is
+nothing to draw". Folding them together would let data arriving re-open a plot
+the user deliberately shut, and would let a user "open" a plot that has nothing
+in it. An auto-collapsed plot renders `[.]` rather than `[+]`, because its
+toggle genuinely does nothing — its data arrives by checking its channel — and
+a `[+]` that silently no-ops reads as a broken control.
+
+**Three real costs are skipped while collapsed**, which is where the 3.2x comes
+from: the `paintEvent` returns early, `set_cursor`/`set_series` do not even
+queue a repaint, and `_refresh_densities` skips the O(F·T·B) band-power sum for
+collapsed channels (remembering them in `_density_dirty` and re-summing on
+expand). The pooled Morlet transform in `_rebuild_selected_views` is skipped
+too, and the scalogram left **empty rather than stale** — `_on_plot_expanded`
+tests emptiness to know it owes a build, and a stale matrix would be
+indistinguishable from a current one while showing the previous replicate's
+spectrum.
+
+**It nearly shipped a silent false negative — read §17 before touching this.**
+Skipping the band-power sum for collapsed plots also skipped it for the
+*selected* one, whose matrix is the **detector's input**, not a picture. The
+explorer opened with the cube built and the whole detection sweep reading
+zero-length, and the state was self-sustaining, since the empty matrix re-armed
+T13's auto-collapse. The rule that came out of it: **visibility decides what is
+drawn, never what is computed.** The selected channel is exempt from the skip.
+Covered by `CollapseDoesNotDisarmTheDetectorTest`, confirmed to fail against the
+unfixed code — a test asserting only geometry, which is what this batch invites,
+would have passed the whole way through.
+
+**Left deliberately:** `_recompute_clump` still runs its O(T) connected-
+components pass when `clump_plot` is collapsed. It is a detection quantity, and
+skipping a detection quantity is exactly the failure above.
+
+**Two follow-ups it surfaced: T27 and T28.**
 
 ### Batch E — detection readout (T15, T16) · `scalogram_explorer` + `video_panel`
 Replace the separate positive-detection plot with green bands overlaid on the
@@ -504,7 +553,7 @@ produces either avoidance or silent degradation.
 
 ## 6. Order
 
-**I → J → O all landed.** D/E/F/G/H remain, as day-to-day use demands.
+**I → J → O → D all landed.** E/F/G/H remain, as day-to-day use demands.
 
 **What O changed about the ordering.** It was justified as unblocking I's ~25x
 decode win on the primary test video. It did unblock the cut — but the win it
@@ -520,10 +569,18 @@ N=8**, where §14's suspected memory-bandwidth ceiling and 8-way decode contenti
 interact. Single-process says 1.06x; the multi-worker case is untested and is the
 configuration that actually runs a corpus.
 
-D/E (interactive polish) sit behind J unless day-to-day use becomes the near-term
-milestone; they live in `gui/explorers/scalogram_explorer.py`, the widget inside
-**tab 2 · Preprocessing (live)**, not the shelved flow-cache tab. **F is worth
-folding into whichever lands first, since T18 is a real speed win.**
+**D is closed.** E (interactive polish) lives in
+`gui/explorers/scalogram_explorer.py`, the widget inside **tab 2 · Preprocessing
+(live)**, not the shelved flow-cache tab — and E now has a natural pairing with
+**T28**, since both concern what the detection readout looks like on open. T18
+is already landed, so F is down to nothing but its own note.
+
+**One thing D showed that applies to E, G and H.** This batch's stated file
+locality was wrong — the class it had to change lived in a file the spec did not
+name. The remaining GUI batches inherit the same hazard, because these explorers
+share a base-class layer (`MiniPlot`, `FrameView`, `video_panel`) that the
+per-batch "· file" annotations do not reflect. Check what a widget actually
+derives from before trusting the locality line.
 
 Explicitly deferred and not blocking: **Batch L**, the pixels-per-body-length
 denomination, and the per-behaviour sensitivity study that would justify any

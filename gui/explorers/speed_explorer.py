@@ -225,11 +225,18 @@ class MiniPlot(QWidget):
     seek_requested = pyqtSignal(int)
     band_changed = pyqtSignal()       # emitted continuously while dragging a line
     band_committed = pyqtSignal()     # emitted once on release (expensive recompute)
+    collapse_toggled = pyqtSignal(bool)   # user clicked the [+]/[-] header marker
 
     BASE_H = 66
     EXPANDED_H = 132
+    # A collapsed plot is exactly its own header: the title line and nothing
+    # else. Sized to a checkbox so a row of collapsed per-channel heatmaps lines
+    # up with the checkbox column beside it (T13) instead of leaving a black
+    # slab where an unpopulated heatmap would have been.
+    COLLAPSED_H = 18
     HANDLE_MARGIN = 20                 # right-edge room for the band pull handles
     GRAB_PX = 6                        # vertical pick tolerance for a band line
+    TOGGLE_W = 14                      # hit width of the [+]/[-] marker
 
     def __init__(self, title: str, unit: str = "", color: QColor = LINE):
         super().__init__()
@@ -242,22 +249,112 @@ class MiniPlot(QWidget):
         self.band_lo: float | None = None
         self.band_hi: float | None = None
         self._drag: str | None = None
+        self._expanded = False
+        self._collapsible = False
+        # Two separate states, deliberately. ``_user_collapsed`` is what the
+        # user asked for via [+]; ``_auto_collapsed`` is a data-driven collapse
+        # (an unpopulated heatmap). Folding them into one flag would let a
+        # refresh that finds an empty matrix overwrite the user's intent, so
+        # that a plot the user expanded stays expanded once its data arrives.
+        self._user_collapsed = False
+        self._auto_collapsed = False
         self.setMinimumHeight(self.BASE_H)
         self.setMaximumHeight(self.BASE_H)
 
     def set_series(self, y: np.ndarray) -> None:
         self.y = np.asarray(y, np.float32)
-        self.update()
+        self._repaint_unless_collapsed()
 
     def set_cursor(self, frame: int) -> None:
         self.cursor = int(frame)
-        self.update()
+        self._repaint_unless_collapsed()
 
     def set_expanded(self, on: bool) -> None:
-        h = self.EXPANDED_H if on else self.BASE_H
+        self._expanded = bool(on)
+        self._apply_height()
+
+    # -- collapse ------------------------------------------------------------
+
+    def set_collapsible(self, on: bool) -> None:
+        """Grow a clickable [+]/[-] marker in the header. Off by default, so
+        explorers that have not opted in keep their previous geometry exactly."""
+        self._collapsible = bool(on)
+        self.update()
+
+    def is_collapsed(self) -> bool:
+        return self._user_collapsed or self._auto_collapsed
+
+    def set_collapsed(self, on: bool) -> None:
+        """The user's explicit collapse state."""
+        self._user_collapsed = bool(on)
+        self._sync_collapse()
+
+    def set_auto_collapsed(self, on: bool) -> None:
+        """Data-driven collapse (nothing to draw), independent of user intent."""
+        self._auto_collapsed = bool(on)
+        self._sync_collapse()
+
+    def _sync_collapse(self) -> None:
+        # Dropping the rendered image is the memory half of T14; skipping the
+        # paint is the latency half, and it is the larger one -- a density
+        # repaint is an O(T*K) bincount over the whole matrix, per resize, per
+        # cursor move.
+        if self.is_collapsed():
+            self._release_render_cache()
+        self._apply_height()
+
+    def _release_render_cache(self) -> None:
+        """Drop any cached rendered array. No-op for a line plot, which holds
+        none; the heatmap subclasses override it."""
+
+    def _apply_height(self) -> None:
+        if self.is_collapsed():
+            h = self.COLLAPSED_H
+        else:
+            h = self.EXPANDED_H if self._expanded else self.BASE_H
         self.setMinimumHeight(h)
         self.setMaximumHeight(h)
         self.update()
+
+    def _repaint_unless_collapsed(self) -> None:
+        if not self.is_collapsed():
+            self.update()
+
+    def _toggle_rect(self) -> QRectF:
+        return QRectF(4, 2, self.TOGGLE_W, 14)
+
+    def _title_x(self) -> int:
+        return 8 + self.TOGGLE_W if self._collapsible else 8
+
+    def _paint_header(self, p: QPainter) -> None:
+        """The [+]/[-] marker. Every paintEvent draws it, collapsed or not --
+        it is the only way back from a collapsed plot.
+
+        An auto-collapsed plot draws [.] instead: expanding it would show an
+        empty pane, so the toggle genuinely does nothing and must not advertise
+        otherwise. Its data arrives by another route (checking its channel),
+        and a [+] that silently no-ops would read as a broken control."""
+        if not self._collapsible:
+            return
+        p.setFont(QFont("Consolas", 7))
+        p.setPen(TXT_DIM)
+        if self._auto_collapsed:
+            mark = "[.]"
+        else:
+            mark = "[+]" if self.is_collapsed() else "[-]"
+        p.drawText(6, 12, mark)
+
+    def _paint_collapsed(self, p: QPainter) -> bool:
+        """Draw the header-only form and report that painting is done."""
+        if not self.is_collapsed():
+            return False
+        p.fillRect(self.rect(), BG)
+        self._paint_header(p)
+        p.setFont(QFont("Consolas", 7))
+        p.setPen(TXT_DIM)
+        p.drawText(self._title_x(), 12, self.title)
+        p.end()
+        return True
 
     def set_band_active(self, on: bool) -> None:
         """Show/hide the draggable band. Lazily seeds it wide open (+/-inf).
@@ -320,16 +417,19 @@ class MiniPlot(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
+        if self._paint_collapsed(p):
+            return
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.fillRect(self.rect(), BG)
         r = self._plot_rect()
         p.fillRect(r, PLOT_BG)
+        self._paint_header(p)
 
         n = self.y.size
         p.setFont(QFont("Consolas", 7))
         if n == 0:
             p.setPen(TXT_DIM)
-            p.drawText(8, 12, self.title)
+            p.drawText(self._title_x(), 12, self.title)
             p.end()
             return
 
@@ -370,7 +470,7 @@ class MiniPlot(QWidget):
 
         cur = float(self.y[min(self.cursor, n - 1)])
         p.setPen(TXT)
-        p.drawText(8, 12, self.title)
+        p.drawText(self._title_x(), 12, self.title)
         val_txt = f"{cur:.4g} {self.unit}".strip()
         p.setPen(QColor(self.color))
         p.drawText(int(r.right()) - 7 * len(val_txt) - 2, 12, val_txt)
@@ -444,6 +544,15 @@ class MiniPlot(QWidget):
         self.band_changed.emit()
 
     def mousePressEvent(self, e):
+        # The marker is checked before anything else and swallows the click:
+        # collapsed, it is the only live target on the widget, and expanded it
+        # sits inside the plot rect where a seek would otherwise fire.
+        if self._collapsible and self._toggle_rect().contains(QPointF(e.pos())):
+            self.set_collapsed(not self._user_collapsed)
+            self.collapse_toggled.emit(not self.is_collapsed())
+            return
+        if self.is_collapsed():
+            return
         if self.band_active and self.y.size:
             ylo, yhi, _ = self._line_ys()
             yv = e.pos().y()
@@ -504,6 +613,22 @@ class DensityPlot(MiniPlot):
         # only where a given raw value gets drawn/picked on the Y axis.
         self._log_axis = False
 
+        # T13: an unpopulated heatmap has nothing but a black slab to draw, so
+        # it collapses itself to header height until its matrix arrives.
+        self._auto_collapse_empty = False
+
+    def set_auto_collapse_empty(self, on: bool) -> None:
+        self._auto_collapse_empty = bool(on)
+        self._refresh_auto_collapse()
+
+    def _refresh_auto_collapse(self) -> None:
+        self.set_auto_collapsed(self._auto_collapse_empty
+                                and self.matrix.size == 0)
+
+    def _release_render_cache(self) -> None:
+        self._img = None
+        self._img_key = None
+
     def set_log_axis(self, on: bool) -> None:
         self._log_axis = bool(on)
         self._img = None
@@ -532,7 +657,8 @@ class DensityPlot(MiniPlot):
             self.y = np.zeros(0, np.float32)
         self._img = None
         self._ver += 1
-        self.update()
+        self._refresh_auto_collapse()
+        self._repaint_unless_collapsed()
 
     def _data_range(self) -> tuple[float, float]:
         m = self.matrix
@@ -578,13 +704,16 @@ class DensityPlot(MiniPlot):
 
     def paintEvent(self, _):
         p = QPainter(self)
+        if self._paint_collapsed(p):
+            return
         p.fillRect(self.rect(), BG)
         r = self._plot_rect()
         p.fillRect(r, PLOT_BG)
+        self._paint_header(p)
         p.setFont(QFont("Consolas", 7))
         if self.matrix.size == 0:
             p.setPen(TXT_DIM)
-            p.drawText(8, 12, self.title)
+            p.drawText(self._title_x(), 12, self.title)
             p.end()
             return
 
@@ -604,7 +733,8 @@ class DensityPlot(MiniPlot):
 
         cur = float(self.y[min(self.cursor, n - 1)]) if n else 0.0
         p.setPen(TXT)
-        p.drawText(8, 12, self.title + (" [log axis]" if self._log_axis else ""))
+        p.drawText(self._title_x(), 12,
+                   self.title + (" [log axis]" if self._log_axis else ""))
         val_txt = f"max {cur:.4g} {self.unit}".strip()
         p.setPen(QColor(self.color))
         p.drawText(int(r.right()) - 7 * len(val_txt) - 2, 12, val_txt)
@@ -664,13 +794,16 @@ class PixelBarPlot(MiniPlot):
 
     def paintEvent(self, _):
         p = QPainter(self)
+        if self._paint_collapsed(p):
+            return
         p.fillRect(self.rect(), BG)
         r = self._plot_rect()
         p.fillRect(r, PLOT_BG)
+        self._paint_header(p)
         p.setFont(QFont("Consolas", 7))
         if self.y.size == 0:
             p.setPen(TXT_DIM)
-            p.drawText(8, 12, self.title)
+            p.drawText(self._title_x(), 12, self.title)
             p.end()
             return
 
@@ -686,7 +819,7 @@ class PixelBarPlot(MiniPlot):
 
         cur = float(self.y[min(self.cursor, n - 1)])
         p.setPen(TXT)
-        p.drawText(8, 12, self.title)
+        p.drawText(self._title_x(), 12, self.title)
         val_txt = f"{cur:.4g} {self.unit}".strip()
         p.setPen(QColor(self.color))
         p.drawText(int(r.right()) - 7 * len(val_txt) - 2, 12, val_txt)

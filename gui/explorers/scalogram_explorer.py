@@ -1,4 +1,4 @@
-"""Scalogram explorer: the expanded-cache proposal in the explorer idiom.
+﻿"""Scalogram explorer: the expanded-cache proposal in the explorer idiom.
 
 Same contract as the speed / coherent-flow / structure-tensor explorers -- video
 with a channel overlay on the left, custom-painted detection plots on the right,
@@ -112,13 +112,17 @@ class ScalogramPlot(MiniPlot):
     def _data_range(self):
         return float(self.freqs[0]), float(self.freqs[-1])
 
+    def _release_render_cache(self) -> None:
+        self._img = None
+        self._img_key = None
+
     def set_scalogram(self, matrix: np.ndarray) -> None:
         self.matrix = np.asarray(matrix, np.float32)   # (F, T)
         self.y = self.matrix.sum(axis=0) if self.matrix.size \
             else np.zeros(0, np.float32)               # cursor readout: total power
         self._img = None
         self._ver += 1
-        self.update()
+        self._repaint_unless_collapsed()
 
     def band_hz(self) -> tuple[float, float]:
         lo, hi = self.band()
@@ -153,13 +157,16 @@ class ScalogramPlot(MiniPlot):
 
     def paintEvent(self, _):
         p = QPainter(self)
+        if self._paint_collapsed(p):
+            return
         p.fillRect(self.rect(), BG)
         r = self._plot_rect()
         p.fillRect(r, PLOT_BG)
+        self._paint_header(p)
         p.setFont(QFont("Consolas", 7))
         if self.matrix.size == 0:
             p.setPen(TXT_DIM)
-            p.drawText(8, 12, self.title)
+            p.drawText(self._title_x(), 12, self.title)
             p.end()
             return
         lo, hi = self._data_range()
@@ -175,7 +182,8 @@ class ScalogramPlot(MiniPlot):
         p.drawLine(int(cx), int(r.top()), int(cx), int(r.bottom()))
         flo, fhi = self.band_hz()
         p.setPen(TXT)
-        p.drawText(8, 12, f"{self.title}   band {flo:.2f}-{fhi:.2f} Hz")
+        p.drawText(self._title_x(), 12,
+                   f"{self.title}   band {flo:.2f}-{fhi:.2f} Hz")
         p.setPen(TXT_DIM)
         p.drawText(int(r.left()), int(r.bottom()) + 8, f"{lo:.3g} Hz")
         p.drawText(int(r.left()), int(r.top()) + 4, f"{hi:.3g} Hz")
@@ -280,7 +288,7 @@ class ScalogramExplorer(QWidget):
         self.channel = "change energy Jtt"
         # One-line status ("what is it doing right now") shown persistently under
         # the video. Set before every heavy step so a GUI-thread stall is legible.
-        self._phase = "starting…"
+        self._phase = "startingâ€¦"
         self.frame = int(state.current_frame) if state is not None else 0
         self.playing = False
         self._overlay_peek_hidden = False
@@ -302,6 +310,9 @@ class ScalogramExplorer(QWidget):
         # short clip many -- degrades correctly instead of running out of RAM.
         self._sg_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         self._worker = None
+        # Channels whose band-power sum was skipped because their plot was
+        # collapsed; re-summed when the user expands one.
+        self._density_dirty: set[str] = set()
 
         self.source = None
         self._owns_source = False
@@ -525,7 +536,7 @@ class ScalogramExplorer(QWidget):
         self.region_combo = QComboBox()
         if len(self.regions) > 1:
             self.region_combo.addItem(
-                "— all replicates (click one to select) —", -1)
+                "â€” all replicates (click one to select) â€”", -1)
         for i, r in enumerate(self.regions):
             rid = r["id"]
             suffix = f" (#{rid})" if rid is not None else ""
@@ -617,7 +628,7 @@ class ScalogramExplorer(QWidget):
         # Per-channel band-power heatmaps, each with an inline exclusive checkbox
         # (the structure-tensor idiom). Checking one selects it as the detection
         # channel AND triggers its lazy cube build; visited channels stay cached.
-        section("Per-block band power by channel — check to detect (builds on "
+        section("Per-block band power by channel â€” check to detect (builds on "
                 "demand)")
         grid_w = QWidget()
         grid = QGridLayout(grid_w)
@@ -635,7 +646,7 @@ class ScalogramExplorer(QWidget):
             cb.setEnabled(available)
             cb.setToolTip(
                 f"Detect on {name} (builds its cube on first check)" if available
-                else f"{name} needs a flow cache — unavailable on the live source")
+                else f"{name} needs a flow cache â€” unavailable on the live source")
             cb.setChecked(available and name == self.channel)
             self.chan_group.addButton(cb)
             self.chan_checks[name] = cb
@@ -678,6 +689,17 @@ class ScalogramExplorer(QWidget):
         scroll.setMinimumWidth(480)
         root.addWidget(scroll, 2)
 
+        # T14/T10: every plot gets a [+] header and starts collapsed. At block=1
+        # with weak downsampling the plots -- not the extraction -- are the main
+        # source of lag, so the panel opens costing nothing and the user pays
+        # only for the readouts they expand.
+        for pl in self._all_plots():
+            pl.set_collapsible(True)
+            pl.set_collapsed(True)
+            pl.collapse_toggled.connect(self._on_plot_expanded)
+        for dp in self.density_plots.values():
+            dp.set_auto_collapse_empty(True)
+
         self._apply_selected_plot_ui()
         self._sync_labels()
         self._update_status()
@@ -703,6 +725,16 @@ class ScalogramExplorer(QWidget):
             dp.set_band_active(sel)
             dp.set_expanded(sel)
 
+    def _on_plot_expanded(self, expanded: bool):
+        """A plot the user just opened may have been skipped while collapsed.
+        Fill in whatever was deferred; collapsing needs no work."""
+        if not expanded:
+            return
+        if not self.scalo_plot.is_collapsed() and self.scalo_plot.matrix.size == 0:
+            self._rebuild_selected_views()
+        if self._density_dirty:
+            self._refresh_densities()
+
     def _sync_labels(self):
         self.sweep_win_lbl.setText(
             f"Detection window D (count mean): {self.sweep_win} fr "
@@ -721,14 +753,34 @@ class ScalogramExplorer(QWidget):
         if self.active_region_index < 0:
             return
         i, j = self._band_indices()
-        n_cached = sum(1 for name in self.density_plots
+        # The sum is O(F*T*B) per cube and is the expensive half of this
+        # refresh, so a collapsed plot skips it outright rather than computing
+        # a matrix nothing will draw. The name is remembered instead, and
+        # _on_plot_expanded re-enters here when the user opens it.
+        #
+        # THE SELECTED CHANNEL IS EXEMPT, and that exemption is load-bearing.
+        # Its matrix is not a picture -- _recompute_counts and _recompute_clump
+        # read it as the DETECTOR'S INPUT. Skipping it because it is collapsed
+        # empties the whole detection sweep while the cube sits built in the
+        # cache: a silent false negative, and a deadlock besides, since an
+        # empty matrix re-arms the auto-collapse that caused it. Visibility
+        # decides what is drawn; it must never decide what is computed.
+        wanted = [n for n, dp in self.density_plots.items()
+                  if n == self.channel or not dp.is_collapsed()]
+        self._density_dirty = {
+            n for n in self.density_plots
+            if n not in wanted
+            and self._sg_cache.get((self.active_region_index, n)) is not None}
+        n_cached = sum(1 for name in wanted
                        if self._sg_cache.get((self.active_region_index, name))
                        is not None)
         if n_cached:
             self._set_phase(f"summing band power ({n_cached} cube"
-                            f"{'s' if n_cached > 1 else ''})…", paint=True)
+                            f"{'s' if n_cached > 1 else ''})â€¦", paint=True)
         empty = np.zeros((0, 0), np.float32)
         for name, dp in self.density_plots.items():
+            if name not in wanted:
+                continue
             cube = self._sg_cache.get((self.active_region_index, name))
             dp.set_matrix(cube[i:j].sum(axis=0) if cube is not None else empty)
 
@@ -741,8 +793,17 @@ class ScalogramExplorer(QWidget):
         pooled = blocks.mean(axis=1)
         self.trace_plot.set_series(pooled)
         self.trace_plot.set_cursor(self.frame)
-        self._set_phase("transforming pooled scalogram…", paint=True)
-        self.scalo_plot.set_scalogram(morlet_power(pooled, self.fps, self.freqs))
+        # The pooled Morlet transform is the one unconditional per-rebuild cost
+        # here, so a collapsed scalogram skips it. It is left EMPTY rather than
+        # stale, which is what _on_plot_expanded tests to know it owes a build:
+        # a stale matrix would be indistinguishable from a current one and
+        # would quietly show the previous replicate's spectrum.
+        if self.scalo_plot.is_collapsed():
+            self.scalo_plot.set_scalogram(np.zeros((0, 0), np.float32))
+        else:
+            self._set_phase("transforming pooled scalogramâ€¦", paint=True)
+            self.scalo_plot.set_scalogram(
+                morlet_power(pooled, self.fps, self.freqs))
         self.scalo_plot.set_cursor(self.frame)
         # Overlay color scale is a whole-clip percentile of this channel/scope;
         # freeze it here so scrubbing (which redraws every frame) never
@@ -803,8 +864,8 @@ class ScalogramExplorer(QWidget):
         # so the wait has a number attached before the worker even starts.
         b = blocks.shape[1]
         est = len(self.freqs) * self.T * b * 4
-        self._set_phase(f"building scalogram · {channel} · "
-                        f"{len(self.freqs)}×{self.T}×{b} (~{self._fmt_bytes(est)})…",
+        self._set_phase(f"building scalogram Â· {channel} Â· "
+                        f"{len(self.freqs)}Ã—{self.T}Ã—{b} (~{self._fmt_bytes(est)})â€¦",
                         paint=True)
         self._worker = _ScalogramWorker(key, blocks, self.fps, self.freqs, self)
         self._worker.done.connect(self._on_cube_ready)
@@ -860,16 +921,16 @@ class ScalogramExplorer(QWidget):
         parts = [self._phase]
         total = sum(c.nbytes for c in self._sg_cache.values())
         parts.append(
-            f"cubes {len(self._sg_cache)} · {self._fmt_bytes(total)}/"
+            f"cubes {len(self._sg_cache)} Â· {self._fmt_bytes(total)}/"
             f"{self._fmt_bytes(self._SG_CACHE_BUDGET)}")
         cube = self._sg_cache.get((self.active_region_index, self.channel))
         if cube is not None:
             f, t, b = cube.shape
-            parts.append(f"cube {f}×{t}×{b} ({self._fmt_bytes(cube.nbytes)})")
+            parts.append(f"cube {f}Ã—{t}Ã—{b} ({self._fmt_bytes(cube.nbytes)})")
         parts.append(f"channels {self._fmt_bytes(self._channels_bytes)}")
         # The frequency band is deliberately absent: ScalogramPlot already draws
         # it in its own title, right above the handles you drag to set it.
-        text = "   ·   ".join(parts)
+        text = "   Â·   ".join(parts)
         self._status_lbl.setText(text)
         if self._status_relay is not None:
             self._status_relay.setText(text)
@@ -877,7 +938,7 @@ class ScalogramExplorer(QWidget):
     def set_status_relay(self, label) -> None:
         """Mirror the status line into a host-supplied QLabel (the live surface's
         top strip). The direct reference matters: ``_set_phase(paint=True)`` force-
-        repaints this label so a 'computing…' phase shows *during* the blocking
+        repaints this label so a 'computingâ€¦' phase shows *during* the blocking
         GUI-thread step, which a queued signal could not do. Pushes the current
         text immediately so the host is not blank until the next state change."""
         self._status_relay = label
@@ -1010,7 +1071,7 @@ class ScalogramExplorer(QWidget):
             self.clump_plot.set_series(np.zeros(0, np.float32))
             return
         lo, hi = dp.band()
-        self._set_phase(f"computing connected clumps ({m.shape[0]} frames)…",
+        self._set_phase(f"computing connected clumps ({m.shape[0]} frames)â€¦",
                         paint=True)
         largest = largest_clump_per_frame(m, lo, hi, dy, dx, gy, gx)
         self.clump_plot.set_series(largest)
