@@ -31,7 +31,8 @@ to the relevant section rather than restating it.
 | **T21** | Suspected runaway memory issue somewhere on the replicate tab. **Not reproduced by inspection** — `_refresh_list` was the obvious suspect and is clean (14x14 swatch pixmaps, `list.clear()` releases the items). Needs an actual measurement, not more code reading; do not guess at a fix. |
 | **T22** | New **viewer tab** consuming a fully-processed video: detection/no-detection only, full-clip bar plus a ~1 min bar zoomed on the scrubber, and a hand-off back into preprocessing at the paused position *without* auto-triggering a pass. |
 | **T23** | **ROI pre-transcode**: cut each source once into per-replicate clips + manifest, so later passes decode ~1/16 the pixels. The only lever that moves the decode floor. |
-| **T24** | **Headless batch driver**: no-GUI entry point (video + replicate JSON → detection results) and file-level job partitioning, so runs fan out across nodes. **Entry point and partitioning both landed** (Batch J); only the N-worker throughput measurement is still open. |
+| ~~**T24**~~ | ~~**Headless batch driver**: no-GUI entry point, file-level partitioning, N-worker throughput.~~ **DONE** — all three slices landed; throughput measured in `FINDINGS.md` §14 (**~130 fps / 5.4x realtime, ceiling at 8 workers**). |
+| **T26** | **The container frame count is not the decodable frame count.** `GX010047c2` advertises 11328 frames and decodes 11308, which (a) fails the pre-transcode cut outright and (b) fails the headless truncation guard on any full-length pass — so Batch I is unusable on this video and Batch J needs `--allow-truncated`, the one habit that disarms the guard. Alignment is **not** affected (verified whole-file). Full diagnosis and fix constraints in `FINDINGS.md` §15. |
 
 ## 2. Standing decisions
 
@@ -262,7 +263,7 @@ Reuses the `ReplicateVideoSource` filter-graph geometry. **Watch the three traps
 `FINDINGS.md` §3** — especially `format=gray16le` after `scale`, and fps at full
 precision in the manifest.
 
-### Batch J — headless batch driver (T24) · new CLI + `core` only  ← **IN PROGRESS** (throughput measurement only)
+### Batch J — headless batch driver (T24) · new CLI + `core` only  ← **CLOSED**
 No-GUI entry point plus file-level job partitioning. This is what gets linear
 scaling, because each node brings its own decode capacity. Pairs with I (a batch
 run should consume pre-transcoded ROI clips).
@@ -316,10 +317,22 @@ Linux, so a mixed fan-out leaves footage examined by nobody. And a completed
 resolved counts, so it was reused as one — `requested_n` and `start_frame` are
 now recorded and are part of the resume identity.
 
-**Still open in J:** the N-worker throughput measurement below. Single process on
-one small-ROI replicate at scale 1.0 measured **~88 fps / ~1.47x realtime** — a
-real number but *not* a basis for a node count, being one replicate on a 512x512
-working ROI.
+**Landed — the throughput measurement, and J is now closed.**
+`scripts/bench_worker_scaling.py`, on `GX010047c2` (7 replicates, 5312x2988) at
+scale 1.0. Full table and its caveats in `FINDINGS.md` §14; the operational
+summary is:
+
+- **Ceiling ~130 fps / ~5.4x realtime, reached at N=8** on a 32-logical-core box.
+  N=16 delivers identical aggregate throughput with every worker taking twice as
+  long, so 8 workers per node is the setting and one-worker-per-core is actively
+  worse (same output, double the latency, more work lost to preemption).
+- **Single process on real footage is 36.6 fps, not §12's 88.** Same scale and
+  channel; the difference is 7 replicates on a 41x5 grid rather than 1 on 8x8.
+- **3.6x from 32 cores is not what compute-bound work looks like.** §1's caveat
+  predicted math-bound work would parallelize where decode did not, and it only
+  half did. Suspected memory bandwidth (`tensor_blur` 52% + `tensor_products` 28%
+  are low-arithmetic-intensity large-array passes) — **hypothesis, not measured.**
+- At 5.4x realtime, 3000 h ≈ 555 node-hours: **~23 nodes for 24 h**, ~70 for 8 h.
 
 **Extension point, deliberately not built:** a job-spec runner (a JSON list of
 per-job video/replicates/manifest/params/out). `--shard` over a file list covers
@@ -331,12 +344,28 @@ import turns every headless job into a startup crash on a display-less node, and
 the `core` → `gui` import chain makes that easy to break by accident.
 
 **Do not carry the old "3000 h / 10x / 50 nodes ≈ 6 h" figure forward** — it used
-the decode ceiling at the old default scale. At scale 1.0 a single process is
-~1.03x realtime because the work is math-bound. Re-measure per-node throughput at
-scale 1.0 with N workers before quoting any node count (`FINDINGS.md` §1).
+the decode ceiling at the old default scale. Superseded by the measured ~23 nodes
+for a 24 h turnaround above (`FINDINGS.md` §14), which is the figure to quote.
 
 Storage ~289 MB/h at block 64, rising to ~3.6 GB/h if block does not track scale.
 Either way a multi-hour clip wants chunked writes rather than one in-memory pass.
+
+### Batch O — decodable frame count (T26) · `core/pretranscode.py` + `core/batch.py`
+**Blocks Batch I on real footage** — the cut fails outright on `GX010047c2`, so
+no clip-backed run is possible on it and §14's clip-backed throughput half could
+not be measured. Diagnosis, the alignment verification that clears the cut of
+wrongdoing, and the fix constraints are all in `FINDINGS.md` §15. In short: the
+container's frame count is a *claim*, the decoder's is a *measurement*, and the
+code compares one to the other while asserting in a comment that they are the
+same quantity. A tolerance is not an acceptable fix — it is a magic constant and
+it would blind the guard to the small re-timings it exists to catch.
+
+The cut half is cheap and clearly right (ffmpeg already reports frames decoded in
+the same pass; `_pump_progress` parses that stream). The source-path half is the
+design question: there is no free way to learn how many frames decode, "reached
+EOF" and "stopped early" are indistinguishable at read time, so the true count
+has to become a recorded, provenance-carried fact with the container's claim
+demoted to an explicitly-marked unverified upper bound.
 
 ### Batch L — quiet-tile gating (DEFERRED, design recorded) · `core/tensor_channels.py`
 Wanted, explicitly not now. Recorded so the reasoning is not re-derived. Becomes
@@ -409,11 +438,12 @@ degradation.
 
 ## 6. Order
 
-**I → J**, then D/E/F/G/H as day-to-day use demands.
+**I → J both landed. O is next**, then D/E/F/G/H as day-to-day use demands.
 
-I is next: under the scale-1.0 default it is the *only* remaining decode lever and
-it is lossless, so it costs nothing scientifically. Then J — the default got ~4x
-more expensive by deliberate choice, so fan-out is what pays for the principle.
+O is next because it is what stands between I and actually being usable: the cut
+refuses to run on the primary test video, so the ~25x decode win I exists to
+deliver is currently unavailable on that footage, and J needs `--allow-truncated`
+on it. It is a small batch with one real design question (the source-path half).
 
 D/E (interactive polish) sit behind J unless day-to-day use becomes the near-term
 milestone; they live in `gui/explorers/scalogram_explorer.py`, the widget inside

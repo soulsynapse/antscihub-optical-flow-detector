@@ -21,6 +21,9 @@ Contents:
 10. [ROI pre-transcode](#10-roi-pre-transcode)
 11. [Per-channel extraction (T18)](#11-per-channel-extraction-t18)
 12. [The headless path (T24)](#12-the-headless-path-t24-batch-j-first-slice)
+13. [File-level partitioning (T24)](#13-file-level-partitioning-t24-batch-j-second-slice)
+14. [N-worker throughput, and the node count](#14-n-worker-throughput)
+15. [The container frame count is not the decodable frame count](#15-the-container-frame-count-is-not-the-decodable-frame-count)
 
 ---
 
@@ -62,6 +65,12 @@ flag (`-hwaccel cuda` before `-i`), not a project, if it is ever wanted.
 At scale 1.0 the work is math-bound and **parallelizes across processes where
 decode did not**, so per-node throughput must be re-measured before quoting any
 node count. Do not carry the old "3000 h / 10x / 50 nodes ≈ 6 h" forward.
+
+**That re-measurement is now done — see §14, and it only half-confirms the
+caveat above.** The math-bound pass does scale further than decode's 2-4 worker
+plateau, but it plateaus too, at N≈8 and **3.6x** — and its ceiling in realtime
+terms (5.4x) is *below* this table's decode-only ceiling (7.6x), because the
+whole pass is decode plus math and the table prices only the decode.
 
 ## 2. Landed optimizations
 
@@ -765,3 +774,179 @@ the first failure would discard the decode already paid for by every earlier
 video in the shard. The two exit codes are kept distinct on purpose: **2** is
 bad usage (retrying on every node is pointless) and **1** is a failed job (it is
 not).
+
+## 14. N-worker throughput
+
+The number Batch J was missing. §12's single-process figure was one replicate on
+a 512x512 ROI and said in as many words not to extrapolate it; this is
+`GX010047c2_02_17_26.MP4` — **7 replicates, 5312x2988, 23.976 fps** — at the
+scale-1.0 default, `change` only, 600 frames per worker, measured by
+`scripts/bench_worker_scaling.py`.
+
+| workers | wall fps | extract fps | speedup | realtime | slowest worker |
+|---|---|---|---|---|---|
+| 1 | 35.2 | 36.6 | 1.00x | 1.53x | 16.4 s |
+| 2 | 58.3 | 60.2 | 1.64x | 2.51x | 19.9 s |
+| 4 | 99.6 | 102.7 | 2.81x | 4.28x | 23.4 s |
+| 8 | 128.9 | **131.6** | **3.60x** | **5.49x** | 36.5 s |
+| 16 | 129.1 | 130.9 | 3.58x | 5.46x | 73.3 s |
+
+**The ceiling is ~130 fps / ~5.4x realtime, reached at N=8 on a 32-logical-core
+box.** N=16 delivers the *same* aggregate throughput with every worker taking
+twice as long — past the knee, added workers only redistribute a fixed budget.
+So the useful per-node figure is **8 workers**, and launching one per core wastes
+15 of them while doubling every job's latency, which is worse than neutral: a
+preempted long job loses more work.
+
+**Single-process on real footage is 36.6 fps, not §12's 88.** Same scale, same
+channel — the difference is 7 replicates on a 41x5 block grid rather than 1 on
+8x8. Extraction is per video (§12), so replicate count is close to free in
+*decode* and very much not free in *math*.
+
+**Do not read the 3.6x as "math-bound work parallelizes".** §1's caveat
+predicted it would, and directionally it does — decode alone is flat past ~2-4
+workers, this reaches 8. But 3.6x from 32 cores is not what compute-bound work
+looks like, and the plateau is flat rather than gradual. The likely constraint is
+**memory bandwidth**: `tensor_blur` (52% of the pass) and `tensor_products` (28%)
+are large-array elementwise/convolution passes with low arithmetic intensity, and
+those saturate a shared memory bus long before they saturate cores. This is a
+hypothesis consistent with the shape of the curve, **not a measured attribution**
+— confirming it needs a bandwidth counter or a cache-blocked reimplementation,
+neither of which anything here depends on yet.
+
+**Consequences for a node count.** At 5.4x realtime per node, 3000 h of footage
+is ~555 node-hours: **~23 nodes for a 24 h turnaround**, ~70 for 8 h. That is
+per *node*, not per core, and it assumes each node has its own memory bus — which
+is exactly why the fan-out unit being a whole machine (`--shard i/N` over a file
+list, §13) is the right granularity and why more workers per node is not the
+lever. Treat these as the same machine's numbers: a node with more memory
+channels moves the ceiling and one with fewer moves it down.
+
+**Detection is still ~0.5% of the pass** (0.047 s against 8.60 s over 7
+replicates), so extraction throughput and job throughput are the same number.
+That equivalence is assumed by the table's `extract fps` column and stops holding
+if a future channel makes the detector expensive.
+
+**Two throughputs are reported because they bracket the truth.** `wall` includes
+each worker's interpreter and numpy startup — real cost, but amortized to nothing
+over a job of thousands of frames rather than this benchmark's 600. `extract`
+divides by the *slowest* worker's in-process extraction time, which excludes
+startup but retains all contention. A real long job approaches `extract`. The
+harness gives each worker its own frame window rather than the same one, because
+N workers over identical ranges share the OS page cache and flatter every N > 1;
+offsets are free (seeking to frame 8000 cost 8.43 s against 8.60 s at frame 0).
+
+**Two limits of the method, found by review after the numbers were taken.**
+Neither is worth re-running the sweep over, but both bound how tightly the table
+should be read, and the first becomes serious if anyone re-uses this harness at
+low scale. (a) **Each level covers a different span** — offsets are `i * stride`,
+so the N=1 baseline is only the first 600 frames while N=16 spans 9600. Harmless
+here because decode is ~0% of a math-bound pass and tensor cost is
+content-independent; **confounding at low scale**, where §1 says decode dominates
+and decode cost does vary with content. (b) **`extract fps` flatters scaling
+slightly**, dividing by `max(extract_seconds)` when workers start staggered by
+interpreter startup, so the true overlap window is longer. Visible as `wall_s`
+minus `slowest_extract_s` — 74.4 vs 73.3 at N=16, ~1.5% — and it grows with N.
+Both are documented in the script's docstring.
+
+**The clip-backed half of this measurement was not obtained**, because the
+pre-transcode cut fails on this footage — see §15.
+
+## 15. The container frame count is not the decodable frame count
+
+Found while trying to obtain §14's clip-backed half, which is why that half is
+missing. **The pre-transcode cut fails outright on `GX010047c2_02_17_26.MP4`**,
+the project's own primary test footage:
+
+```
+GX010047c2_02_17_26__rep14.mkv holds 11308 frames but the source has 11328;
+the cut re-timed the stream, so clip frame N is no longer source frame N
+```
+
+**The guard is right to exist and wrong here.** The stream was not re-timed.
+The source container advertises 11328 video packets (`ffprobe -count_packets`
+agrees: `nb_frames=11328`, `nb_read_packets=11328`) but **only 11308 frames
+decode** — `ffmpeg -i src -f null -` with no filters, no crop and no
+`-fps_mode` reports `frame=11308`. The 20 missing frames are lost in the
+*source*, before anything this project does touches it. The cut wrote one frame
+out per frame in, which is exactly the invariant the guard is meant to protect.
+
+**Why the guard could not see that.** Its comment asserts "both counts come from
+the same `CAP_PROP_FRAME_COUNT` estimator, so they are comparable even where that
+estimator is approximate." That is false, and it is the whole bug. For the
+H.264/MP4 source OpenCV returns the container's *claim* (11328); for the
+transcoded Matroska clip it returns the true frame count (11308). Two different
+quantities behind one property name — so the guard compares a claim against a
+measurement and reports the difference as a defect in the cut.
+
+### Alignment is not affected, and this was verified rather than argued
+
+The dangerous reading of a 20-frame gap is that frames were dropped *scattered*
+through the file, which would mean clip frame N ≠ source frame N and would break
+every seek — the exact failure the guard names. It is not what happened. Whole
+file, `rep14`'s box, source crop vs clip decoded to raw gray:
+
+| comparison | mean abs diff (grey levels) |
+|---|---|
+| clip[N] vs source[N], sampled every 500 frames | **0.35 – 0.43** |
+| the same at the last three frames | 0.75 – 0.85 |
+| clip[N] vs source[N-1] (1-frame shift) | **2.39** |
+| clip[N] vs source[N-2] | 3.09 |
+
+The aligned residual is crf-12 encode noise; a one-frame shift is ~6x larger, so
+the separation is unambiguous and holds from frame 0 to frame 11307. **The cut is
+frame-accurate on real footage** — the first time Batch I's central invariant has
+been checked against anything but a `testsrc` fixture, which could not have shown
+this because a synthetic source has no undecodable packets.
+
+### The same root cause independently breaks the source path
+
+This is not a pre-transcode-only bug, and that is easy to miss because the cut
+fails loudly first. `core/batch.run_video` computes `available = fc - start` from
+the same OpenCV count, so **any pass that reaches the true end of this video
+fails the truncation guard**:
+
+```
+--start 11000 --frames 400
+error: decode covered 308 of 328 requested frames (93.9%);
+everything after frame 11308 is UNEXAMINED, not clear
+```
+
+A full-length headless pass over this video therefore cannot complete without
+`--allow-truncated` — which §12 identifies by name as the thing that "trains
+operators into habitual `--allow-truncated` and thereby disarms the guard." The
+guard is fail-closed, so this is a false *positive*, not the silent-false-negative
+shape most of this file catalogues. It is still the more corrosive failure in
+practice, because the standing workaround for it is to switch the real guard off.
+
+### It is a per-file property, not a corpus-wide one
+
+| video | packets | decoded |
+|---|---|---|
+| `GX010047c2_02_17_26.MP4` | 11328 | **11308** |
+| `GX320051c2_02_19_26.MP4` | 32040 | 32040 |
+| `stab_GX010050c2_02_18_26.MP4` | 30579 | 30579 |
+| `rep3_intermittent_crop.MP4` | 30579 | 30579 |
+
+One of four. So it cannot be dismissed as a quirk of one bad export, and it also
+cannot be handled by a blanket constant — whatever the fix is, it has to derive
+the count per file rather than assume a relationship between the two numbers.
+
+### What the fix has to respect (not yet implemented)
+
+The honest framing is that **the container count is a claim and the pipeline
+treats it as a measurement.** A tolerance would be wrong twice over: it is a
+magic constant, and it would blind the guard to exactly the small re-timings it
+exists to catch.
+
+- **For the cut**, the true count is free: ffmpeg reports the frames it decoded
+  in the same pass, and `_pump_progress` already parses that stream. Comparing
+  the clip against *that* is exact, needs no extra decode, and would have passed
+  here. The manifest's `frame_count` should then record the true count, which
+  makes it authoritative for every later clip-backed pass.
+- **For the source path** there is no free answer: the only way to know how many
+  frames decode is to decode them. "Reached EOF" cannot be distinguished from
+  "stopped early" at read time — they are the same event — so the count has to
+  become a *recorded* fact (produced by the cut, or by a one-off counting pass)
+  carried in provenance, with the container's claim used only as an unverified
+  upper bound and marked as such in the result.
