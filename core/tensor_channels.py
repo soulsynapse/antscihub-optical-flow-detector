@@ -35,7 +35,8 @@ from core.preprocess import Preprocessor
 from core.structure_tensor import (flow_from_tensor, spatial_min_eigen,
                                    tensor_products)
 from core.timing import Timer
-from core.video import ReplicateVideoSource, VideoSource, prefetch
+from core.video import (ClipAtlasSource, ReplicateVideoSource, VideoSource,
+                        prefetch)
 
 CHANNELS = ("intensity", "change", "appearance", "texture", "tensor_speed")
 CHANNEL_VERSION = 3     # bump when the extraction math changes (sidecar key)
@@ -137,10 +138,48 @@ def _open_roi(video_path: str, tiles: list[dict], first: int, count: int,
     return roi, frames()
 
 
+def _open_clips(clip_paths: list[str], tiles: list[dict], first: int,
+                count: int, fps: float):
+    """``(decoder, frame_iter)`` for pre-transcoded clips. **Never falls back.**
+
+    The deliberate difference from :func:`_open_roi`: a clip decoder that fails
+    raises instead of quietly reverting to whole-source decode. The fallback is
+    right for the ROI path, where both routes read the same source pixels and
+    only speed differs. It is wrong here. Below ``lossless`` a clip's pixels are
+    *not* the source's (``FINDINGS.md`` section 10), and the caller has already
+    folded the clips' provenance key into whatever it caches -- so a silent
+    fallback would file source-decoded numbers under a clip-decoded identity,
+    which is exactly the confusion ``provenance_key`` exists to prevent.
+    """
+    # verify_sizes=False: callers reach this through
+    # ``channel_source.resolve_clip_paths``, which has already checked every
+    # clip's recorded size against its replicate box using the manifest, for
+    # free. Probing the files again would cost ~42 ms per pass on 6 clips --
+    # against a ~160 ms decode, on a surface that starts a pass per knob edit.
+    clips = ClipAtlasSource(clip_paths, _roi_layout(tiles), count, start=first,
+                            fps=fps, verify_sizes=False)
+    inner = clips.iter_frames()
+    try:
+        head = next(inner)
+    except StopIteration:
+        clips.release()
+        raise RuntimeError("clip decode yielded no frames")
+    except BaseException:
+        clips.release()
+        raise
+
+    def frames():
+        yield head
+        yield from inner
+
+    return clips, frames()
+
+
 def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                      start: int = 0, n: int | None = None,
                      cached_uv: tuple[np.ndarray, np.ndarray] | None = None,
                      cached_texture: np.ndarray | None = None,
+                     clip_paths: list[str] | None = None,
                      denoise: str | None = None, progress=None) -> dict:
     """Stream a frame window [start, start+n) and return per-block channel arrays.
 
@@ -185,7 +224,12 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
         out["meta"] = {"fps": fps, "block": block, "grid": (ny, nx),
                        "n_frames": 0, "channel_version": CHANNEL_VERSION,
                        "approximated": approximated, "sigma": sigma,
-                       "window_start": start}
+                       "window_start": start,
+                       # Present on both exits: an empty window was asked for and
+                       # delivered, which is not the same as a decode ending
+                       # early, and a consumer reading meta["truncated"] should
+                       # not have to know which return path produced its dict.
+                       "truncated": False}
         return out
 
     pres = {t["id"]: Preprocessor(pre_cfg, t["source_box"][2] - t["source_box"][0],
@@ -203,10 +247,17 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
 
     tm = Timer("extract_channels")
     done = 0            # stored frames, so a cancelled pass can report how far it got
-    # ROI decode first: FFmpeg crops, greyscales and downsamples each replicate
-    # box in its own process, so the ~92% of a 5.3K frame no replicate owns never
-    # crosses into Python. Falls back to full-frame OpenCV when unavailable.
-    roi, frames = _open_roi(video_path, tiles, first, count, fps)
+    # Pre-transcoded clips when the caller has them: the decoder then reads files
+    # that are already only replicate pixels, which is the one thing that moves
+    # the decode floor (~25x, FINDINGS.md section 10). Otherwise ROI decode:
+    # FFmpeg crops, greyscales and downsamples each replicate box in its own
+    # process, so the ~92% of a 5.3K frame no replicate owns never crosses into
+    # Python -- though the decoder still paid for it. Falls back to full-frame
+    # OpenCV when even that is unavailable.
+    if clip_paths is not None:
+        roi, frames = _open_clips(clip_paths, tiles, first, count, fps)
+    else:
+        roi, frames = _open_roi(video_path, tiles, first, count, fps)
     src = None if roi is not None else VideoSource(video_path)
     try:
         # The decode is driven by hand rather than with a plain ``for`` so the
@@ -311,13 +362,30 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
         # wanted -- most passes leave by the exception path. ``done`` distinguishes
         # a partial line from a complete one.
         tm.log(frames=n, done=done, tiles=len(tiles), grid=f"{ny}x{nx}",
-               block=block, scale=f"{scale:.3f}")
+               block=block, scale=f"{scale:.3f}",
+               src="clips" if clip_paths is not None else
+                   ("roi" if roi is not None else "full"))
 
+    # A decoder that ended early leaves the tail of every channel at zero. Return
+    # a SHORT window rather than a full-length one padded with zeros: a short
+    # window is self-describing, whereas zeros are indistinguishable from
+    # "measured, and nothing happened" -- i.e. a silent false negative, on the
+    # detection default (``change``) above all. Reachable in practice: a clip
+    # truncated by a crash or a full disk during the cut passes
+    # ``verify_manifest`` (which checks a clip exists, not how long it is), and a
+    # 20-of-64-frame clip was measured yielding 36 all-zero frames of 40 reported
+    # as real. The ROI and full-frame paths get the same treatment; they can hit
+    # it too, just far less often.
+    short = done < n
+    if short:
+        for k in CHANNELS:
+            out[k] = out[k][:done]
+        n = done
     if progress:
         progress(n, n)
     out["meta"] = {"fps": fps, "block": block, "grid": (ny, nx), "n_frames": n,
                    "channel_version": CHANNEL_VERSION, "approximated": approximated,
-                   "sigma": sigma, "window_start": start,
+                   "sigma": sigma, "window_start": start, "truncated": short,
                    # The spans are already measured for the log line; returning
                    # them too is what lets the cost model be built from passes
                    # the user actually ran instead of from asserted constants.
@@ -351,12 +419,21 @@ def extract_channels(cache, sigma: float = 2.0, max_frames: int | None = None,
 
 def extract_channels_live(video_path: str, meta: dict, *, start: int = 0,
                           n: int | None = None, sigma: float = 2.0,
+                          clip_paths: list[str] | None = None,
                           progress=None) -> dict:
     """Cacheless windowed extraction: geometry from ``meta``, appearance against
     the tensor's own flow, temporal denoise forced off (stateful, can't reproduce
-    mid-clip). This is what feeds the live scalogram surface."""
+    mid-clip). This is what feeds the live scalogram surface.
+
+    ``clip_paths`` (aligned with ``meta['replicate_tiles']`` by position) reads
+    pre-transcoded per-replicate clips instead of the source. The math is
+    untouched -- only where the pixels come from changes. Callers should go
+    through ``channel_source.live_channel_source``, which resolves the paths from
+    a manifest and verifies the geometry still matches; passing raw paths here
+    skips those checks."""
     return _stream_channels(video_path, meta, sigma=sigma, start=start, n=n,
-                            cached_uv=None, cached_texture=None, denoise="off",
+                            cached_uv=None, cached_texture=None,
+                            clip_paths=clip_paths, denoise="off",
                             progress=progress)
 
 

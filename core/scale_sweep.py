@@ -62,6 +62,10 @@ class ScalePass:
     wall: float
     spans: dict[str, float] = field(default_factory=dict)
     approximated: bool = False
+    # The decode ended before the requested window did, so ``frames`` counts what
+    # was actually computed. Carried rather than inferred because a consumer
+    # comparing scales cannot otherwise tell a cheap scale from a short pass.
+    truncated: bool = False
 
     @property
     def seconds_per_frame(self) -> float:
@@ -75,8 +79,14 @@ class ScalePass:
         pulling the fitted decode floor toward zero and putting the knee where
         aggressive downsampling looks free -- the one direction the cost model
         must never err in.
+
+        A truncated pass is excluded for the same asymmetry. Its wall time covers
+        the frames it managed, so admitting it with the requested frame count
+        would understate seconds-per-frame and, again, move the knee toward
+        "downsampling is free". Dropping the point loses one sample; keeping it
+        biases every fit built from the sweep.
         """
-        return self.frames > 0 and self.wall > 0.0
+        return self.frames > 0 and self.wall > 0.0 and not self.truncated
 
     def pass_sample(self) -> PassSample:
         return PassSample(scale=self.scale, frames=self.frames, wall=self.wall,
@@ -102,10 +112,17 @@ def measure_scale(video_path: str, cfg, replicates: list[dict], *, dims,
         scale=float(t.get("scale", scale)),
         block=int(t.get("block", cfg.flow.resolve_block_size(scale))),
         grid=(int(ny), int(nx)),
-        frames=int(t.get("frames", cd.n_frames)),
+        # ``cd.n_frames``, NOT the timer's ``frames``: the timer logs the window
+        # that was *requested*, while the wall time it logs alongside covers only
+        # the frames the decode actually delivered. Pairing the two divides real
+        # seconds by imagined frames, which understates cost by exactly the
+        # truncation ratio -- a 20-of-64 pass would price this scale at a third
+        # of its true per-frame cost, and this number feeds the knee.
+        frames=int(cd.n_frames),
         wall=float(t.get("wall", 0.0)),
         spans=dict(t.get("spans") or {}),
-        approximated=bool(cd.approximated))
+        approximated=bool(cd.approximated),
+        truncated=bool(cd.meta.get("truncated", False)))
 
 
 def storage_curve(replicates: list[dict], src_width: int, src_height: int,

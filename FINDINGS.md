@@ -418,8 +418,42 @@ differencing, and it is the detection default. Lossy *inter-frame* coding
 perturbs precisely the frame-to-frame quantity that channel measures, rather than
 degrading generically. So quality is in `Manifest.provenance_key()` and clips cut
 at different quality must never share a cache entry. Whether a given behaviour is
-robust across these settings is **measurable once extraction consumes the
-manifest — measure it, per behaviour, rather than assuming either way.**
+robust across these settings is now **measurable end to end** (extraction consumes
+the manifest) — **measure it, per behaviour, rather than assuming either way.**
+
+### "Lossless" clips are still not bit-exact against the live crop
+
+Found while wiring extraction onto the manifest, and it invalidates the obvious
+test. `lossless` names the *encode*, not the route. The live path converts the
+source's yuv luma straight to `gray16le` and keeps the sub-8-bit precision that
+the limited→full range conversion produces — **81% of luma values are not
+multiples of 257**, i.e. genuinely not representable in 8 bits. A clip stores
+8-bit gray, so it rounds by up to **0.494 grey levels** before any codec runs.
+
+Nothing is wrong here and nothing needs fixing: that 0.494 max (≈0.29 RMS for
+uniform rounding) sits *below* §3's 0.364 RMS for the live ROI path itself, and
+far below the 1.041 the `high` default already accepts. But it means an
+extraction test must never assert clip == live, and the first one written did.
+
+**How the error reaches the channels.** 160x120 `testsrc`, 2 replicates, 12
+frames, RMS difference clip-vs-live normalized by each channel's own scale:
+
+| quality | change | appearance | tensor_speed | intensity |
+|---|---|---|---|---|
+| lossless | 0.0049 | 0.0093 | 0.0111 | **0.00011** |
+| high | 0.0164 | 0.0273 | 0.0441 | **0.00014** |
+| standard | 0.0438 | 0.0770 | 0.0552 | **0.00033** |
+
+Two things to read off it. Agreement degrades monotonically with quality, so the
+knob means what it claims. And **`intensity` is 100-500x less affected than the
+differencing channels** — it is a block mean, and averaging destroys exactly the
+noise that squared frame differencing amplifies. That is the measured form of the
+argument above for keeping `quality` in `provenance_key()`, which until now was
+asserted from the structure of `<I_t^2>` rather than observed.
+
+Caveat: `testsrc` at 160x120 is close to a worst case — high spatial frequency,
+small blocks, nothing to average over. Real footage will differ, probably
+favourably. These numbers order the presets; they are not an error budget.
 
 ### Lossless cost is distributed backwards from intuition
 
@@ -451,3 +485,49 @@ under the true 131%. That error was made once here.
 4. Gray-only encoding saves just ~6% here, not the ~33% the chroma planes suggest:
    this backlit footage is nearly monochrome already. Still worth taking, since
    the pipeline reads only luma.
+5. **A clip decoder must not fall back to whole-source decode on failure.** The
+   fallback is right for the ROI path (`_open_roi`), where both routes read the
+   same source pixels and only speed differs. It is wrong for clips: below
+   lossless the pixels genuinely differ, and the caller has already folded the
+   clips' `provenance_key` into what it caches — so a silent fallback would file
+   source-decoded numbers under a clip-decoded identity, the exact confusion that
+   key exists to prevent. `_open_clips` raises.
+6. **Match clips to tiles by replicate id, not list position.** Both lists come
+   out of `build_layout` over the same replicates and do align today, but a
+   positional match would fail *silently* if that ever stopped holding, and the
+   failure mode is one replicate's pixels being attributed to another's
+   detections. An id lookup raises instead.
+7. **`vstack` needs `shortest=1` when its inputs are separate files.** This is
+   the worst bug found in the batch. At the default `shortest=0`, vstack does not
+   end the stream when an input runs out — it *repeats that input's last frame*
+   while the others advance. With N clips as N inputs, one clip cut short by a
+   crash or a full disk therefore **freezes its replicate**: identical
+   consecutive frames, so `change == 0`, read downstream as "measured, and
+   nothing moved" — for that replicate alone, while every other replicate looks
+   healthy, and with no symptom reported anywhere. Precisely the failure mode the
+   governing principle forbids: deleted signal indistinguishable from "nothing
+   happened". `shortest=1` ends the stream instead, and `_stream_channels` now
+   trims the window to what actually decoded and flags `truncated`.
+   `ReplicateVideoSource` needs no such flag — its inputs are one split of one
+   decode and cannot differ in length. `verify_manifest` does not close this:
+   it checks that a clip exists, not how long it is.
+8. **Zero-padding a short decode was the same bug one level up.** Independently
+   of vstack, `_stream_channels` left the tail of every channel at zero when the
+   decode ended early and still reported the full window length. It now returns a
+   short window. All three decode paths get this; clips just make it reachable.
+9. Probing clip dimensions per pass is not free: opening a `VideoCapture` per
+   clip measured **41.8 ms for 6 clips**, against a ~160 ms clip decode and 1.4 ms
+   for the whole manifest verification — on a surface that starts a pass per knob
+   edit. The manifest already records each clip's size, so `resolve_clip_paths`
+   checks it for free and `ClipAtlasSource` takes `verify_sizes=False`.
+
+### One measurement trap, recorded because it nearly caused a wrong fix
+
+Investigating trap 7, a truncated clip showed "17 of 21 frames all-zero in rep0's
+`change`" — which looks damning and nearly justified a manifest schema change to
+record per-clip frame counts. **The control refuted it**: healthy clips show
+18/20 and the *live source* shows 16/20 on the same box. The all-zero frames are
+`testsrc` content (a mostly-static region at block granularity), not truncation.
+Run the healthy-path control before attributing an absolute number to the change
+under test — the real defect here was visible only in the *reported window
+length* (40 → 20), never in the zero count.

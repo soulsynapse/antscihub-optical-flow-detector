@@ -20,6 +20,7 @@ See docs/expanded_cache_plan.md and the branch plan for the larger restructure.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -106,15 +107,69 @@ def synth_live_meta(video_path: str, cfg, replicates: list[dict], *,
     }
 
 
+def resolve_clip_paths(manifest, clip_dir: str, replicates: list[dict],
+                       tiles: list[dict]) -> list[str]:
+    """Clip paths in ``tiles`` order, after checking they may be used at all.
+
+    Matched by replicate id rather than by list position. Both lists do come out
+    of ``build_layout`` over the same replicates and so happen to align today,
+    but a positional match would fail *silently* if that ever stopped being true,
+    and the failure mode is a replicate's pixels being attributed to another
+    replicate's detections. An id lookup raises instead.
+
+    ``verify_manifest`` runs on every call: it re-checks the geometry hash and
+    the source's identity, and it is cheap by construction (a quick head+tail
+    signature, not a re-hash of an 11 GB file) precisely so that a live surface
+    starting a pass on every knob edit can afford it.
+    """
+    from core.pretranscode import verify_manifest
+
+    verify_manifest(manifest, clip_dir, replicates)
+    paths = []
+    for t in tiles:
+        entry = manifest.clip_for(t["id"])
+        x0, y0, x1, y1 = (int(v) for v in t["source_box"])
+        if tuple(int(v) for v in entry.source_box) != (x0, y0, x1, y1):
+            raise ValueError(
+                f"replicate {t['id']} box {t['source_box']} does not match the "
+                f"clip's {entry.source_box}; re-run the pre-transcode")
+        # The frame size the clip is supposed to hold, checked here because it
+        # is free -- the manifest already recorded it. ClipAtlasSource would
+        # otherwise probe each file to learn the same thing (41.8 ms for 6
+        # clips), and a wrong size is the one mismatch its filter graph would
+        # silently absorb by rescaling rather than reject.
+        if (entry.width, entry.height) != (x1 - x0, y1 - y0):
+            raise ValueError(
+                f"clip {entry.filename} records {entry.width}x{entry.height} "
+                f"but replicate {t['id']}'s box is {x1-x0}x{y1-y0}; "
+                "re-run the pre-transcode")
+        paths.append(os.path.join(clip_dir, entry.filename))
+    return paths
+
+
 def live_channel_source(video_path: str, cfg, replicates: list[dict], *,
                         start: int = 0, n: int | None = None,
                         width: int | None = None, height: int | None = None,
                         fps: float | None = None, frame_count: int | None = None,
+                        manifest=None, clip_dir: str | None = None,
                         progress=None) -> ChannelData:
     """Cacheless windowed source: geometry from ``build_layout``, channels from a
     structure-tensor pass over frames [start, start+n). Video info is read from
     the file unless all of width/height/fps/frame_count are supplied (the GUI
-    passes them to avoid reopening the decoder)."""
+    passes them to avoid reopening the decoder).
+
+    Pass a ``manifest`` (and the ``clip_dir`` holding its clips) to decode
+    pre-transcoded per-replicate clips instead of the source. The channel math is
+    identical; what changes is that the decoder stops paying for the ~92% of each
+    frame no replicate owns. The manifest's ``provenance_key`` lands in the
+    returned meta as ``clip_provenance`` and MUST be folded into the key of
+    anything cached downstream -- below ``lossless`` these are different pixels
+    from the source's, so a clip-derived result and a live-crop-derived one are
+    different measurements (``FINDINGS.md`` section 10). ``PipelineConfig.cache_key``
+    takes it as an optional third argument; note that nothing passes it yet, so
+    this is an obligation on the next caller to cache clip-derived output rather
+    than a guarantee already in force.
+    """
     if None in (width, height, fps, frame_count):
         with VideoSource(video_path) as src:
             info = src.info
@@ -122,13 +177,31 @@ def live_channel_source(video_path: str, cfg, replicates: list[dict], *,
             fps, frame_count = info.fps, info.frame_count
     full_meta = synth_live_meta(video_path, cfg, replicates, width=width,
                                 height=height, fps=fps, frame_count=frame_count)
+    clip_paths = None
+    if manifest is not None:
+        if not clip_dir:
+            raise ValueError("a manifest needs the clip_dir holding its clips")
+        clip_paths = resolve_clip_paths(manifest, clip_dir, replicates,
+                                        _tiles_from_meta(full_meta))
+        # The manifest's rational rate, not the float OpenCV reported: the clip
+        # seek divides a frame index by this, and a rounded rate lands
+        # progressively earlier as the index grows (FINDINGS.md section 3 trap 2).
+        full_meta = {**full_meta, "fps": manifest.fps,
+                     "clip_provenance": manifest.provenance_key(),
+                     "clip_dir": clip_dir,
+                     "clip_quality": manifest.quality,
+                     "clip_quality_rms": manifest.quality_rms}
     res = extract_channels_live(video_path, full_meta, start=start, n=n,
-                                progress=progress)
+                                clip_paths=clip_paths, progress=progress)
     win = int(res["meta"]["n_frames"])
     wstart = int(res["meta"]["window_start"])
     # The explorer's T axis is the window, so advertise the window length as
     # n_frames; keep the full-clip geometry otherwise.
-    meta = {**full_meta, "n_frames": win, "window_start": wstart}
+    # ``truncated`` rides along: the window is already short, but a consumer that
+    # only sees a length cannot tell "you asked for a short window" from "the
+    # decode ended early and this is less data than you asked for".
+    meta = {**full_meta, "n_frames": win, "window_start": wstart,
+            "truncated": bool(res["meta"].get("truncated", False))}
     # Carried through so the downsample decision tool can price the lever from
     # passes that actually ran on this machine and this footage. Absent when the
     # pass was empty or timing was disabled.

@@ -23,6 +23,15 @@ luma error against a bit-exact reference and full-clip size for all 6 replicates
     high    (crf 12)     1.041      24%        1.24x   <- default
     standard(crf 18)     1.540      11%        1.11x
 
+``lossless`` names the **encode**, not the whole route. A clip stores 8-bit gray,
+while the live crop converts the source's yuv luma straight to ``gray16le`` and
+keeps the sub-8-bit precision the limited->full range conversion produces (81% of
+luma values are not multiples of 257). So even a lossless clip differs from the
+live crop by up to 0.494 grey levels of pure quantization -- below the 0.364 RMS
+the live ROI path itself carries against a float reference. Nothing here needs
+fixing, but no consumer may assume clip == live, and a test asserting it is
+wrong. See ``FINDINGS.md`` section 10 for how that reaches each channel.
+
 The default is ``high``. Bit-exactness was considered and deliberately not made
 the default: these sources are *already* a lossy re-encode (the ``stab_`` files
 are a stabilization generation removed from the sensor), so preserving an
@@ -39,8 +48,9 @@ and folded into :meth:`Manifest.provenance_key`: the ``change`` channel is
 measures, rather than degrading it generically. So the setting must never be
 silently variable across clips being compared, and clips cut at different
 quality must not compare as equal. Whether a given behaviour is robust across
-these settings is measurable once extraction consumes the manifest -- measure it
-per behaviour rather than assuming either way.
+these settings is now measurable end to end (extraction consumes the manifest via
+``channel_source.live_channel_source``) -- measure it per behaviour rather than
+assuming either way.
 
 Lossless cost is also distributed counter-intuitively, worth not re-deriving:
 
@@ -75,7 +85,13 @@ import cv2
 from core.replicates import build_layout, geometry_hash, validate_replicates
 
 
-PRETRANSCODE_VERSION = 1
+# 2: -fps_mode passthrough on every output, plus per-clip frame_count/size_bytes.
+# Bumped rather than defaulted-in because the flag can change WHICH FRAMES a clip
+# holds on a source whose timestamps wobble -- a version-1 clip is not
+# necessarily frame-aligned with its source, and provenance_key carries this
+# field precisely so old and new cuts cannot compare as equal. Old manifests are
+# refused by read_manifest, which is the intended outcome: re-cut.
+PRETRANSCODE_VERSION = 2
 MANIFEST_SUFFIX = ".pretranscode.json"
 
 # The pipeline reads luma and discards chroma, so encoding gray is free
@@ -143,6 +159,23 @@ class ClipEntry:
     width: int
     height: int
     filename: str
+    # Frames actually written, probed after the cut, and the file's size on disk.
+    #
+    # Both exist to make a short clip detectable BEFORE a pass reads it. Length is
+    # what a truncated clip gets wrong, and it was the one property nothing
+    # recorded: verify_manifest checked that a clip existed, so a clip cut short
+    # by a crash or a full disk was rediscovered at decode time, per pass,
+    # forever. ``frame_count`` is checked once at the cut against the source's
+    # (which catches a CFR conversion inserting or dropping frames); ``size_bytes``
+    # is what verify_manifest re-checks on every pass, because an os.stat costs
+    # microseconds while re-probing 6 clips with VideoCapture measured 41.8 ms --
+    # on a surface that starts a pass per knob edit. A truncation cannot shorten a
+    # file without changing its size, so the cheap check is not the weaker one.
+    #
+    # Defaulted so a manifest written before these existed still loads; absent
+    # values simply skip the checks rather than failing an older cut outright.
+    frame_count: int = 0
+    size_bytes: int = 0
 
     def to_meta(self) -> dict:
         return {
@@ -153,6 +186,8 @@ class ClipEntry:
             "width": self.width,
             "height": self.height,
             "filename": self.filename,
+            "frame_count": self.frame_count,
+            "size_bytes": self.size_bytes,
         }
 
     @staticmethod
@@ -165,6 +200,8 @@ class ClipEntry:
             width=int(d["width"]),
             height=int(d["height"]),
             filename=str(d["filename"]),
+            frame_count=int(d.get("frame_count", 0)),
+            size_bytes=int(d.get("size_bytes", 0)),
         )
 
 
@@ -364,6 +401,23 @@ def probe_source(path: str) -> tuple[int, int, int, int, int]:
     return w, h, num, den, max(0, n)
 
 
+def _clip_frame_count(path: str) -> int:
+    """Frames in a written clip, from the container.
+
+    Split out from :func:`probe_source` rather than reusing it because a clip has
+    no rate to recover and no geometry worth re-deriving -- and because
+    ``probe_source`` raises when a rate is missing, which would turn a legitimate
+    single-frame or rateless clip into a cut failure.
+    """
+    cap = cv2.VideoCapture(path)
+    try:
+        if not cap.isOpened():
+            raise PretranscodeError(f"cannot open clip {path}")
+        return max(0, int(round(cap.get(cv2.CAP_PROP_FRAME_COUNT))))
+    finally:
+        cap.release()
+
+
 def _as_rational(fps: float) -> tuple[int, int]:
     """Exact rational for a reported frame rate, preferring known NTSC rates."""
     for base in (24, 25, 30, 48, 50, 60, 100, 120):
@@ -428,13 +482,28 @@ def clip_command(video_path: str, tiles, out_paths: list[str],
     them into gray16 reproduces the existing high-precision path rather than
     inheriting a decision made here. Cropping is the only geometric operation
     this module performs.
+
+    ``-fps_mode passthrough`` on every output, and it is load-bearing. FFmpeg's
+    default output mode is ``cfr``, which *duplicates or drops* frames to force a
+    constant rate on an input whose timestamps wobble. That would silently break
+    the invariant every consumer of these clips rests on -- clip frame N is
+    source frame N. ``ClipAtlasSource`` seeks by dividing a frame index by the
+    manifest's rate, and the manifest records the SOURCE's frame count, so a cut
+    that inserted or dropped even one frame yields a window of the right length
+    from the wrong place, drifting further the deeper into the clip you look.
+    Exactly the failure FINDINGS.md section 3 trap 2 describes for a rounded fps,
+    reached by a different road. No effect on a genuinely CFR source, which is
+    why a ``testsrc`` fixture cannot catch its absence; the ``stab_`` sources are
+    a stabilization generation removed from the sensor and are not guaranteed to
+    be one. Both atlas decoders already pass this flag on their own outputs --
+    it was missing only here, at the one place that writes a file.
     """
     preset = resolve_quality(quality)
     graph, labels = build_filter_graph(tiles)
     cmd = [_ffmpeg(), "-hide_banner", "-loglevel", "error", "-nostdin",
            "-i", video_path, "-filter_complex", graph]
     for label, out in zip(labels, out_paths):
-        cmd += ["-map", label, *preset["args"], out]
+        cmd += ["-map", label, "-fps_mode", "passthrough", *preset["args"], out]
     cmd += ["-progress", "pipe:1", "-nostats"]
     return cmd
 
@@ -500,6 +569,26 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
         _cleanup(out_paths)
         raise PretranscodeError(f"ffmpeg wrote no clip for {missing}")
 
+    # Every clip must hold exactly as many frames as the source. This is the one
+    # check that catches a frame-rate conversion having quietly re-timed the cut:
+    # with -fps_mode passthrough it should be unreachable, but the consequence of
+    # being wrong (clip frame N is no longer source frame N, so every later seek
+    # lands in the wrong place) is silent and unbounded, so it is verified rather
+    # than assumed. Both counts come from the same CAP_PROP_FRAME_COUNT
+    # estimator, so they are comparable even where that estimator is approximate.
+    # Paid once per cut, against a transcode measured in minutes.
+    clip_frames = []
+    for p in out_paths:
+        n_clip = _clip_frame_count(p)
+        if n_clip != frame_count:
+            _cleanup(out_paths)
+            raise PretranscodeError(
+                f"{os.path.basename(p)} holds {n_clip} frames but the source "
+                f"has {frame_count}; the cut re-timed the stream, so clip frame "
+                "N is no longer source frame N and every later seek would land "
+                "in the wrong place")
+        clip_frames.append(n_clip)
+
     man = Manifest(
         version=PRETRANSCODE_VERSION,
         source_path=os.path.abspath(video_path),
@@ -526,8 +615,9 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
                       source_box=t.source_box,
                       width=t.source_box[2] - t.source_box[0],
                       height=t.source_box[3] - t.source_box[1],
-                      filename=os.path.basename(p))
-            for t, p in zip(layout.tiles, out_paths)),
+                      filename=os.path.basename(p),
+                      frame_count=nf, size_bytes=os.path.getsize(p))
+            for t, p, nf in zip(layout.tiles, out_paths, clip_frames)),
     )
     write_manifest(man, manifest_path_for(video_path, out_dir))
     if progress is not None:
@@ -618,10 +708,19 @@ def verify_manifest(man: Manifest, out_dir: str, replicates: list[dict] | None =
                     *, deep: bool = False) -> None:
     """Raise if these clips cannot be trusted for the given geometry.
 
-    Checks the source is the same file, every clip is present, and -- when
-    ``replicates`` is given -- that the boxes still match the ones the clips were
-    cut from. A moved box silently reading a stale clip would attribute one
-    region's pixels to another's detections, so this is not advisory.
+    Checks the source is the same file, every clip is present *and unchanged in
+    size*, and -- when ``replicates`` is given -- that the boxes still match the
+    ones the clips were cut from. A moved box silently reading a stale clip would
+    attribute one region's pixels to another's detections, so this is not
+    advisory.
+
+    The size check is what makes a truncated clip a hard error here rather than a
+    surprise at decode time. It is deliberately size and not frame count: a file
+    cannot lose frames without losing bytes, so ``os.stat`` catches the same
+    thing that re-probing every clip with ``VideoCapture`` would, for
+    microseconds instead of the measured 41.8 ms per 6 clips -- and this runs on
+    every pass, on a surface that starts one per knob edit. Clips cut before the
+    size was recorded carry 0 and skip the check rather than failing outright.
     """
     if replicates is not None and geometry_hash(replicates) != man.geometry_hash:
         raise PretranscodeError(
@@ -638,3 +737,8 @@ def verify_manifest(man: Manifest, out_dir: str, replicates: list[dict] | None =
         p = os.path.join(out_dir, c.filename)
         if not os.path.isfile(p):
             raise PretranscodeError(f"clip is missing: {p}")
+        if c.size_bytes and os.path.getsize(p) != c.size_bytes:
+            raise PretranscodeError(
+                f"clip {c.filename} is {os.path.getsize(p)} bytes but was cut at "
+                f"{c.size_bytes}; it was truncated or replaced -- re-run the "
+                "pre-transcode")

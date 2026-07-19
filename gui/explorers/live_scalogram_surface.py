@@ -186,6 +186,9 @@ class _ProcessWorker(_StreamWorker):
                  parent=None):
         super().__init__(parent)
         self._args = (video_path, cfg, replicates, dims, region_index, params)
+        # ``(covered, requested)`` when the decode ended early, else None. Read by
+        # the done handler; see _run.
+        self.short: tuple[int, int] | None = None
 
     def _run(self):
         video_path, cfg, reps, dims, region_index, params = self._args
@@ -193,6 +196,16 @@ class _ProcessWorker(_StreamWorker):
         cd = live_channel_source(
             video_path, cfg, reps, start=0, n=None,
             width=w, height=h, fps=fps, frame_count=fc, progress=self._tick)
+        # A decode that ended early yields a SHORT track, not a padded one, so
+        # the detector below runs over less video than the user asked for and
+        # every "no detection here" past the cut point is unexamined rather than
+        # examined-and-clear. The result object carries no notion of coverage, so
+        # the shortfall is recorded on the worker for the done handler to report
+        # -- silently returning a partial pass as a whole-video pass is the exact
+        # false negative the truncation trim exists to prevent, and trimming
+        # without reporting only moves where it hides.
+        self.short = (int(cd.n_frames), int(fc)) if cd.meta.get("truncated") \
+            else None
         # Extraction (the whole-clip per-pixel tensor stream) is done; the band
         # power + gate that follow are a much smaller slice of the wall time,
         # but the phase note keeps the status honest across the handoff.
@@ -1115,11 +1128,23 @@ class LiveScalogramSurface(QWidget):
             f"processing whole video · {phase} · {self._proc_ctx}…")
 
     def _on_processed(self, res):
+        # Read before the worker reference is dropped.
+        short = getattr(self._proc_worker, "short", None)
         self._proc_worker = None
         self._set_busy(None)
         self.navigator.set_result(res, self.fps)
         self.navigator.setVisible(True)
         n = len(res.detected_intervals())
+        if short is not None:
+            # Never call this a whole-video pass. Past the cut point there is no
+            # evidence either way, and a detection count presented without that
+            # caveat reads as "this is what the video contains".
+            covered, requested = short
+            self.status_lbl.setText(
+                f"PARTIAL pass · decode ended at frame {covered} of {requested} "
+                f"· {n} detection{'s' if n != 1 else ''} in the part that was "
+                f"read — the rest of the video was NOT examined")
+            return
         self.status_lbl.setText(
             f"whole-video pass done · {n} detection{'s' if n != 1 else ''} — "
             f"click one (or step strongest) to verify in a window")

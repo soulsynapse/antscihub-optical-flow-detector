@@ -178,11 +178,57 @@ manifest, `provenance_key()`, and verification. Measured on `GX010047c2`:
 **~25x faster decode**, 1/12.1 the pixels. See `FINDINGS.md` §10 for the codec
 measurements and why the quality default is what it is.
 
-**Still open — the wiring:** teach `live_channel_source` / `extract_channels_live`
-to consume a manifest, and **fold `Manifest.provenance_key()` into the cache key**.
-That last part is not optional: the cache key already omits decoder and bit depth
-(§3 trap 3), and clips add a third axis on top of it, so without it a result from
-a live crop and one from a clip cut at a different quality compare as equal.
+**Landed — the wiring:** `video.ClipAtlasSource` (one ffmpeg process, N clip
+inputs, same atlas contract as `ReplicateVideoSource` via the shared
+`_AtlasStream` / `_tile_tail`), `extract_channels_live(clip_paths=...)`, and
+`live_channel_source(manifest=, clip_dir=)`, which resolves paths by replicate
+id, re-verifies geometry and source identity per pass, and puts
+`clip_provenance` in the meta. `cfg.cache_key` takes a `provenance_key` —
+**omitted from the blob when absent**, so every pre-clip cache keeps its key.
+Tests in `tests/test_clip_extraction.py`.
+
+Four things came out of it, all in `FINDINGS.md` §10. **Lossless clips are not
+bit-exact against the live crop** (8-bit store vs the live path's gray16le,
+≤0.494 grey levels — do not write a test asserting equality). A per-channel
+sensitivity table that turns "quality belongs in the provenance key" from
+asserted into measured. And two real bugs, both silent-false-negative shaped:
+**`vstack` at its default `shortest=0` freezes a replicate** whose clip is short,
+and `_stream_channels` **zero-padded a short decode** while reporting full
+length. Both fixed; windows now trim and carry a `truncated` flag.
+
+**Landed — the review fixes.** A `/code-review high` over the wiring slice found
+three real defects, all silent-shaped, all fixed:
+
+- **The cut had no `-fps_mode passthrough`.** FFmpeg's default output mode is
+  `cfr`, which duplicates or drops frames to force a constant rate — breaking
+  *clip frame N is source frame N*, the invariant every seek rests on. Same
+  failure as `FINDINGS.md` §3 trap 2 by a different road, and invisible to a
+  `testsrc` fixture because that source is already CFR. `PRETRANSCODE_VERSION`
+  is now **2**, so old cuts are refused rather than silently mixed — a v1 clip
+  is not guaranteed frame-aligned with its source.
+- **Nothing recorded how long a clip was.** `verify_manifest` checked existence,
+  so a clip truncated by a crash or a full disk was rediscovered at decode time,
+  per pass, forever. `ClipEntry` now carries `frame_count` (checked once at the
+  cut against the source's, which also catches a re-timed cut) and `size_bytes`
+  (re-checked every pass — an `os.stat` costs microseconds against the 41.8 ms
+  a `VideoCapture` re-probe of 6 clips measured). The decode-time trim stays as
+  the second line of defence for the ROI/full-frame paths, which have no
+  manifest at all.
+- **`scale_sweep` priced a truncated pass as full-length**, dividing real wall
+  time by the *requested* frame count. A 20-of-64 pass reported a third of its
+  true per-frame cost — biased toward "downsampling is free", the one direction
+  §6 says the cost model must never err in. Now uses the delivered count and
+  carries `truncated`, which `usable` excludes from any fit.
+
+**Still open:** nothing on the tensor path. `run_pipeline` accepts no manifest —
+deliberately, since the flow cache is not the detection path on this branch. Wire
+it there only if Batch J needs it.
+
+**One unenforced obligation, carried to J.** `cfg.cache_key` accepts a
+`provenance_key` third argument and **no caller passes it**, because nothing
+caches a clip-derived result yet. The first code that does must thread
+`meta["clip_provenance"]` into it; otherwise a source-derived and a clip-derived
+result collide in one cache entry. Available guard, not an active one.
 
 **Why this beats the live ROI crop that already exists.** H.264 decode is
 whole-frame: the `crop` in `ReplicateVideoSource`'s filter graph runs *after*
