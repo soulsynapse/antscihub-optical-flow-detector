@@ -415,24 +415,50 @@ forced off for the tensor path (results flagged `approximated`), because backgro
 models are fitted assets the cache cannot reconstruct. The `J_tt` route sidesteps
 that entirely, being recomputed from the frames like everything else.
 
-### Batch N — the same decision tool for block size (stub)
-A sibling pop-out for `block_size`, built on Batch M's components
-(`core/cost_model.py`, `gui/cost_panels.py`, `core/scale_sweep.py`,
-`core/scale_render.py`, `gui/calibration_dialog.py`) rather than a divergent second
-dialog. Same discipline: explanatory prose on open, no fused quality score.
+### Batch N — block size: three small things, **not** a sibling decision tool
+**Rescoped.** This was specced as a pop-out dialog for `block_size` built on
+Batch M's components (`core/cost_model.py`, `gui/cost_panels.py`,
+`core/scale_sweep.py`, `core/scale_render.py`). That framing is wrong and the
+work is much smaller than a dialog.
 
-**The substantive difference, which sets what its "what you lose" panel shows:**
-downsampling loses detail *within* a block (the per-pixel field feeding the tensor
-solve is coarser); block size loses **spatial localization** (fewer, larger cells,
-so clump area and where-in-the-arena resolution degrade) while the per-pixel math
-is untouched. So N's evidence panel is about grid granularity and clump resolution,
-not image sharpness. Per `FINDINGS.md` §5 it is the storage lever and does **not**
-carry downsampling's "may decide what is detectable" warning in the same form.
+**Why the dialog does not transfer: block size has no knee.** M earned its
+complexity because downsampling has a genuine curve — `t(s) = F + M·s²`,
+`s* = √(F/M)` (§6) — so a frontier plot has a shape to show and an optimum to
+mark. Block size does not: per §5 compute is **flat** (−13% across the whole
+range) while storage falls as ~1/block². That is monotonic in one axis. There is
+no tradeoff to visualize, so `FrontierPlot` and `cost_model` — the two components
+that made M worth building — have nothing to do here. Inheriting them would be
+machinery for a problem shape that is not present.
 
-Also inherit M's required prose pattern: state plainly both that the lever can be
-what makes a project feasible, *and* that it is deliberately not assumed on the
-user's behalf. One half without the other produces either avoidance or silent
-degradation.
+Nor does the "what you lose" panel transfer. Downsampling coarsens the per-pixel
+field feeding the tensor solve, so the image is visibly blurrier and
+`RenderStrip` shows it. Block size leaves the per-pixel math **untouched** and
+loses **spatial localization** instead — fewer, larger cells. There is no
+blurrier image to render.
+
+**What is actually wanted, in place of the dialog:**
+
+1. **State the storage cost.** One sentence, already measured in §5: ~0.9 TB per
+   3000 h at block 64 against ~11 TB at block 16. This is the whole decision for
+   most users and it does not need a plot.
+2. **Warn that changing block size invalidates the tuned detector — the item
+   this stub previously missed entirely.** `inband_count` produces a **raw block
+   count** and `detect_gate` compares it against raw `count_band` endpoints, with
+   no normalization by region size; `clump` is in block units too. A region holds
+   ~29 blocks at block 64 and ~377 at block 16, so **the same `count_band` means
+   something ~13x different** — a threshold of `[20, ∞)` is meaningful at block 16
+   and unreachable at block 64. Same class as T17: tuned state that quietly stops
+   meaning what it meant. Offer the re-scaled equivalent rather than only warning,
+   if that is cheap.
+3. **Possibly a grid overlay** on the live view showing cell size against the
+   animal, which is the honest form of "what you lose" for a localization lever.
+
+Item 2 is the load-bearing one and is worth doing even if 1 and 3 never happen.
+
+**Still inherit M's required prose pattern** wherever this surfaces: state
+plainly both that the lever can be what makes a project feasible, *and* that it
+is deliberately not assumed on the user's behalf. One half without the other
+produces either avoidance or silent degradation.
 
 ---
 

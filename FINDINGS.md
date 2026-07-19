@@ -220,6 +220,42 @@ across a scale sweep (1.0 / 0.5 / 0.25 → 4.20 s / 2.15 s / 1.51 s) while compu
 moves ~3.5x; an explicit `block_size=16` override reaches the finer 146x19 grid on
 demand at 6.29 s.
 
+### Changing block size silently re-denominates the tuned detector
+
+The consequence of the grid moving, and the reason the tracking decision above is
+load-bearing rather than tidy. **`count_band` and `clump` are in raw block
+units.** `inband_count` returns a block *count*, `detect_gate` compares it
+straight against the `count_band` endpoints, and `largest_clump_per_frame`
+returns an area in blocks. Nothing is normalized by how many blocks the region
+happens to hold.
+
+So the same numeric threshold means ~13x different things across the block range:
+
+| block | atlas grid | blocks/replicate (7 reps) |
+|---|---|---|
+| 64 (default) | 41x5 = 205 | **~29** |
+| 16 | 139x19 = 2641 | **~377** |
+
+A `count_band` of `[20, ∞)` is a reasonable threshold at block 16 and
+**unreachable** at block 64, where a region holds only ~29 blocks in total. The
+detector does not fail, warn, or clamp — it simply stops firing. This is the same
+shape as T17 (tuned state that quietly stops meaning what it meant) and the same
+standing hazard as everything else in this file: the failure presents as *no
+detections*, which is indistinguishable from *nothing happened*.
+
+Two things follow. **Any UI that exposes `block_size` must convert the tuned
+bands, or refuse to change it without saying what it invalidates** — this is the
+load-bearing item in Batch N and the reason that batch is not the cost dialog it
+was originally specced as. And **a `count_band` is only comparable across runs at
+equal block size**, which is why resolved block size is already part of the
+resume identity in §13; a summary carrying one block size must never be reused
+for a request at another.
+
+(Note: the 479-frame table above records the block-16 grid as 139x19 and the
+120-frame verification as 146x19. Grid does not depend on frame count, so one of
+the two is misrecorded. It does not affect anything here — the ratio is ~13x
+either way — but do not treat either as exact without re-deriving it.)
+
 ## 6. The cost model and the knee
 
 Cost is **`t(s) = F + M·s²`** — decode is whole-frame so `F` is fixed, everything
