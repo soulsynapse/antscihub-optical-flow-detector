@@ -1,4 +1,4 @@
-﻿"""Scalogram explorer: the expanded-cache proposal in the explorer idiom.
+"""Scalogram explorer: the expanded-cache proposal in the explorer idiom.
 
 Same contract as the speed / coherent-flow / structure-tensor explorers -- video
 with a channel overlay on the left, custom-painted detection plots on the right,
@@ -288,7 +288,7 @@ class ScalogramExplorer(QWidget):
         self.channel = "change energy Jtt"
         # One-line status ("what is it doing right now") shown persistently under
         # the video. Set before every heavy step so a GUI-thread stall is legible.
-        self._phase = "startingâ€¦"
+        self._phase = "starting…"
         self.frame = int(state.current_frame) if state is not None else 0
         self.playing = False
         self._overlay_peek_hidden = False
@@ -536,7 +536,7 @@ class ScalogramExplorer(QWidget):
         self.region_combo = QComboBox()
         if len(self.regions) > 1:
             self.region_combo.addItem(
-                "â€” all replicates (click one to select) â€”", -1)
+                "— all replicates (click one to select) —", -1)
         for i, r in enumerate(self.regions):
             rid = r["id"]
             suffix = f" (#{rid})" if rid is not None else ""
@@ -628,7 +628,7 @@ class ScalogramExplorer(QWidget):
         # Per-channel band-power heatmaps, each with an inline exclusive checkbox
         # (the structure-tensor idiom). Checking one selects it as the detection
         # channel AND triggers its lazy cube build; visited channels stay cached.
-        section("Per-block band power by channel â€” check to detect (builds on "
+        section("Per-block band power by channel — check to detect (builds on "
                 "demand)")
         grid_w = QWidget()
         grid = QGridLayout(grid_w)
@@ -646,7 +646,7 @@ class ScalogramExplorer(QWidget):
             cb.setEnabled(available)
             cb.setToolTip(
                 f"Detect on {name} (builds its cube on first check)" if available
-                else f"{name} needs a flow cache â€” unavailable on the live source")
+                else f"{name} needs a flow cache — unavailable on the live source")
             cb.setChecked(available and name == self.channel)
             self.chan_group.addButton(cb)
             self.chan_checks[name] = cb
@@ -776,7 +776,7 @@ class ScalogramExplorer(QWidget):
                        is not None)
         if n_cached:
             self._set_phase(f"summing band power ({n_cached} cube"
-                            f"{'s' if n_cached > 1 else ''})â€¦", paint=True)
+                            f"{'s' if n_cached > 1 else ''})…", paint=True)
         empty = np.zeros((0, 0), np.float32)
         for name, dp in self.density_plots.items():
             if name not in wanted:
@@ -801,7 +801,7 @@ class ScalogramExplorer(QWidget):
         if self.scalo_plot.is_collapsed():
             self.scalo_plot.set_scalogram(np.zeros((0, 0), np.float32))
         else:
-            self._set_phase("transforming pooled scalogramâ€¦", paint=True)
+            self._set_phase("transforming pooled scalogram…", paint=True)
             self.scalo_plot.set_scalogram(
                 morlet_power(pooled, self.fps, self.freqs))
         self.scalo_plot.set_cursor(self.frame)
@@ -864,8 +864,8 @@ class ScalogramExplorer(QWidget):
         # so the wait has a number attached before the worker even starts.
         b = blocks.shape[1]
         est = len(self.freqs) * self.T * b * 4
-        self._set_phase(f"building scalogram Â· {channel} Â· "
-                        f"{len(self.freqs)}Ã—{self.T}Ã—{b} (~{self._fmt_bytes(est)})â€¦",
+        self._set_phase(f"building scalogram · {channel} · "
+                        f"{len(self.freqs)}×{self.T}×{b} (~{self._fmt_bytes(est)})…",
                         paint=True)
         self._worker = _ScalogramWorker(key, blocks, self.fps, self.freqs, self)
         self._worker.done.connect(self._on_cube_ready)
@@ -921,16 +921,16 @@ class ScalogramExplorer(QWidget):
         parts = [self._phase]
         total = sum(c.nbytes for c in self._sg_cache.values())
         parts.append(
-            f"cubes {len(self._sg_cache)} Â· {self._fmt_bytes(total)}/"
+            f"cubes {len(self._sg_cache)} · {self._fmt_bytes(total)}/"
             f"{self._fmt_bytes(self._SG_CACHE_BUDGET)}")
         cube = self._sg_cache.get((self.active_region_index, self.channel))
         if cube is not None:
             f, t, b = cube.shape
-            parts.append(f"cube {f}Ã—{t}Ã—{b} ({self._fmt_bytes(cube.nbytes)})")
+            parts.append(f"cube {f}×{t}×{b} ({self._fmt_bytes(cube.nbytes)})")
         parts.append(f"channels {self._fmt_bytes(self._channels_bytes)}")
         # The frequency band is deliberately absent: ScalogramPlot already draws
         # it in its own title, right above the handles you drag to set it.
-        text = "   Â·   ".join(parts)
+        text = "   ·   ".join(parts)
         self._status_lbl.setText(text)
         if self._status_relay is not None:
             self._status_relay.setText(text)
@@ -938,7 +938,7 @@ class ScalogramExplorer(QWidget):
     def set_status_relay(self, label) -> None:
         """Mirror the status line into a host-supplied QLabel (the live surface's
         top strip). The direct reference matters: ``_set_phase(paint=True)`` force-
-        repaints this label so a 'computingâ€¦' phase shows *during* the blocking
+        repaints this label so a 'computing…' phase shows *during* the blocking
         GUI-thread step, which a queued signal could not do. Pushes the current
         text immediately so the host is not blank until the next state change."""
         self._status_relay = label
@@ -1071,7 +1071,7 @@ class ScalogramExplorer(QWidget):
             self.clump_plot.set_series(np.zeros(0, np.float32))
             return
         lo, hi = dp.band()
-        self._set_phase(f"computing connected clumps ({m.shape[0]} frames)â€¦",
+        self._set_phase(f"computing connected clumps ({m.shape[0]} frames)…",
                         paint=True)
         largest = largest_clump_per_frame(m, lo, hi, dy, dx, gy, gx)
         self.clump_plot.set_series(largest)
