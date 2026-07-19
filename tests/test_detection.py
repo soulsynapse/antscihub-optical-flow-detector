@@ -10,7 +10,8 @@ import numpy as np
 from core.wavelet import band_indices, default_freqs, morlet_band_power, morlet_power
 from core.detection import (detect_channel_region, detect_over_blocks,
                            inband_count, recompute_from_band_power,
-                           region_blocks_and_grid, windowed_mean)
+                           region_blocks_and_grid, rescale_count_band,
+                           windowed_mean)
 
 
 class MorletBandPowerTest(unittest.TestCase):
@@ -35,6 +36,50 @@ class MorletBandPowerTest(unittest.TestCase):
         band = morlet_band_power(x, fps, freqs, i, j)
         self.assertEqual(band.shape, (200,))
         np.testing.assert_allclose(band, full, rtol=1e-4, atol=1e-4)
+
+
+class RescaleCountBandTest(unittest.TestCase):
+    """FINDINGS.md section 5: a count band is in raw block units, so it only
+    means what it meant on a grid of the same size."""
+
+    def test_scales_by_the_region_size_ratio(self):
+        # The documented case: ~29 blocks per replicate at block 64 against ~377
+        # at block 16. A threshold of 20 is sane on the fine grid and
+        # unreachable on the coarse one.
+        lo, hi = rescale_count_band((20.0, np.inf), 377, 29)
+        self.assertAlmostEqual(lo, 20.0 * 29 / 377)
+        self.assertTrue(np.isinf(hi))
+
+    def test_unplaced_endpoints_stay_unplaced(self):
+        # None means "never placed" and is seeded lazily by the widget.
+        # Converting one would invent an explicit threshold.
+        self.assertEqual(rescale_count_band((None, None), 100, 25), (None, None))
+        self.assertEqual(rescale_count_band((None, 8.0), 100, 25)[0], None)
+
+    def test_zero_survives(self):
+        # "at least none" is grid-independent and must not drift off zero.
+        self.assertEqual(rescale_count_band((0.0, 10.0), 100, 25)[0], 0.0)
+
+    def test_degenerate_geometry_is_a_no_op(self):
+        band = (3.0, 7.0)
+        self.assertEqual(rescale_count_band(band, 0, 25), band)
+        self.assertEqual(rescale_count_band(band, 100, 0), band)
+        self.assertEqual(rescale_count_band(band, 50, 50), band)
+
+    def test_round_trip_returns_to_the_original(self):
+        there = rescale_count_band((12.0, 40.0), 377, 29)
+        back = rescale_count_band(there, 29, 377)
+        self.assertAlmostEqual(back[0], 12.0)
+        self.assertAlmostEqual(back[1], 40.0)
+
+    def test_uses_actual_counts_not_the_block_ratio_squared(self):
+        # Ragged edges are dropped, by a different amount at each block size, so
+        # the real grids are not related by exactly (old_block/new_block)**2.
+        # A 100x100 working frame: block 16 -> 6x6 = 36, block 32 -> 3x3 = 9.
+        # The area ratio says 4x; the true ratio here is also 4, but at block 64
+        # it is 1x1 = 1 against 36, i.e. 36x, where the squared ratio says 16x.
+        lo, _ = rescale_count_band((36.0, np.inf), 36, 1)
+        self.assertAlmostEqual(lo, 1.0)
 
 
 class DetectionMathTest(unittest.TestCase):

@@ -79,6 +79,50 @@ def detect_gate(windowed: np.ndarray, blo: float, bhi: float) -> np.ndarray:
     return ((windowed >= blo) & (windowed <= bhi)).astype(np.float32)
 
 
+def rescale_count_band(band, old_blocks: int, new_blocks: int):
+    """Carry a ``count_band`` across a change of block grid.
+
+    ``inband_count`` returns a RAW BLOCK COUNT and ``detect_gate`` compares it
+    straight against the band endpoints -- nothing normalizes by how many blocks
+    the region holds. So a band tuned on one grid means something different on
+    another by exactly the ratio of region sizes: ~29 blocks per replicate at
+    block 64 against ~377 at block 16, so ``[20, inf)`` is a sane threshold on
+    one and unreachable on the other (FINDINGS.md section 5). The detector does
+    not fail or clamp when that happens; it silently stops firing, which reads
+    as "nothing happened".
+
+    The factor is ``new_blocks / old_blocks`` measured from the ACTUAL region
+    block counts, not from the block-size ratio squared. The two disagree
+    whenever the grid does not divide the working frame evenly -- the ragged
+    last row and column are dropped, and by a different amount at each block
+    size -- and the actual count is the quantity the detector really compares
+    against.
+
+    Preserved deliberately:
+
+    * ``None`` endpoints stay ``None``. They mean "never placed", which the
+      widget seeds lazily; converting one would invent an explicit threshold.
+    * Infinite endpoints stay infinite. "Unbounded above" is not a count and
+      does not re-denominate.
+    * Zero endpoints survive the multiply unchanged, which is correct: "at
+      least none" is grid-independent.
+
+    Returns the band unchanged when either side of the ratio is unusable, so a
+    caller can pass a degenerate geometry without special-casing it.
+    """
+    lo, hi = band
+    if old_blocks <= 0 or new_blocks <= 0 or old_blocks == new_blocks:
+        return (lo, hi)
+    factor = float(new_blocks) / float(old_blocks)
+
+    def conv(v):
+        if v is None or not np.isfinite(v):
+            return v
+        return float(v) * factor
+
+    return (conv(lo), conv(hi))
+
+
 def largest_clump_per_frame(m: np.ndarray, lo: float, hi: float, dy: int, dx: int,
                             gy: np.ndarray, gx: np.ndarray) -> np.ndarray:
     """Largest in-band, 8-connected clump per frame on the block grid. ``m`` is

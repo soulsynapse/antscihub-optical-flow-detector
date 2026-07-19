@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 from core.channel_source import cache_channel_source
 from core.detection import (detect_gate, inband_count, largest_clump_per_frame,
+                            rescale_count_band,
                             window_bounds, windowed_mean)
 from core.wavelet import band_indices, default_freqs, morlet_power
 from gui.video_panel import FrameView
@@ -315,6 +316,14 @@ class ScalogramExplorer(QWidget):
         # Channels whose band-power sum was skipped because their plot was
         # collapsed; re-summed when the user expands one.
         self._density_dirty: set[str] = set()
+        # Density plots the user explicitly opened with [+]. Distinct from "open
+        # because it is the selected channel", which _apply_selected_plot_ui
+        # forces and must be able to UNDO on deselection: a plot left open by a
+        # selection that has moved on stays in _refresh_densities' `wanted` set
+        # forever, so visiting every channel once would make every later band
+        # drag re-sum every cube -- exactly the per-refresh cost T14 removed.
+        # Only a real [+] click belongs here (set_collapsed emits no signal).
+        self._density_user_open: set[str] = set()
 
         self.source = None
         self._owns_source = False
@@ -406,6 +415,23 @@ class ScalogramExplorer(QWidget):
             "value_bands": {name: (dp.band_lo, dp.band_hi)
                             for name, dp in self.density_plots.items()},
             "count_band": (self.count_w_plot.band_lo, self.count_w_plot.band_hi),
+            # What the count band is implicitly denominated in. The band is a
+            # raw block count, so it only means what it meant on a grid of the
+            # same size; apply_view_state converts it when this differs.
+            # block_size says WHETHER the grid moved (a replicate switch changes
+            # the count for an unrelated reason and must not re-scale the
+            # threshold); region_blocks says BY HOW MUCH.
+            #
+            # region_index travels with them and is load-bearing. Replicate
+            # tiles are NOT uniform -- build_layout sizes each from its own frac
+            # box -- and the rebuilt explorer resets its selection, so measuring
+            # the new denominator against whatever is selected THERE would
+            # compare a large replicate's old count against region 0's new one
+            # and scale the threshold by the ratio of two different boxes.
+            "count_denom": {"block_size": self._resolved_block(),
+                            "region_index": self.active_region_index,
+                            "region_blocks": self._region_block_count(
+                                self.active_region_index)},
         }
 
     def detection_params(self) -> dict:
@@ -424,8 +450,83 @@ class ScalogramExplorer(QWidget):
             "centered": self.centered,
         }
 
-    def apply_view_state(self, st: dict) -> None:
-        """Restore a captured view state onto this (freshly built) explorer."""
+    def _converted_count_band(self, st: dict):
+        """The captured count band, re-denominated onto THIS explorer's grid.
+
+        Returns ``(band, note)``; ``note`` is None when nothing was converted and
+        a human sentence otherwise. The note is not decoration -- a threshold
+        that silently changes value is the same class of surprise as one that
+        silently stops meaning what it meant, so the conversion has to be
+        visible even though it is the correct thing to do."""
+        cb = st.get("count_band")
+        if cb is None:
+            return None, None
+
+        def fmt(v):
+            return "unset" if v is None else ("inf" if not np.isfinite(v)
+                                              else f"{float(v):.3g}")
+
+        def band_txt(b):
+            return f"[{fmt(b[0])}, {fmt(b[1])}]"
+
+        den = st.get("count_denom") or {}
+        old_block = int(den.get("block_size") or 0)
+        old_blocks = int(den.get("region_blocks") or 0)
+        new_block = self._resolved_block()
+        # An unchanged grid (or one we cannot identify at all) leaves the band
+        # alone and says nothing: there is no re-denomination to report.
+        if not old_block or not new_block or old_block == new_block:
+            return cb, None
+        # The grid MOVED. From here the band is wrong unless it is converted,
+        # so every exit below either converts or warns -- returning it quietly
+        # is the one outcome this method exists to prevent.
+        #
+        # Denominate against the region the band was tuned on, not against
+        # whatever this explorer has selected: a rebuild resets the selection to
+        # none, and replicate tiles differ in size, so the two are not the same
+        # replicate and their block counts are not comparable.
+        #
+        # A NEGATIVE index is pooled scope, not a missing region, and it must
+        # take the same regions[0] fallback the capture side took: capture calls
+        # _region_block_count(-1), which falls back and records a real count, so
+        # rejecting -1 here would compare a usable denominator against nothing
+        # and warn "could not be re-scaled" about a conversion that was
+        # available. Only an index past the end is genuinely unresolvable.
+        idx = den.get("region_index")
+        new_blocks = (self._region_block_count(int(idx))
+                      if idx is not None and int(idx) < len(self.regions)
+                      else 0)
+        # A band with no finite endpoint carries no tuning, so neither branch
+        # below has anything to say about it.
+        if all(v is None or not np.isfinite(v) for v in cb):
+            return cb, None
+        if old_blocks <= 0 or new_blocks <= 0:
+            # The denominator is unknown: state captured before it was
+            # recorded, no regions, or a tuned region that no longer exists.
+            # Guessing a factor would be worse than leaving the number alone --
+            # the user can see an unchanged threshold and re-tune, but cannot
+            # see a wrong conversion -- so the band stands and the WARNING
+            # carries the whole load. Silence here is the one outcome that
+            # reproduces the original hazard.
+            return cb, (
+                f"block {old_block}→{new_block} changed the grid but the "
+                f"detection threshold {band_txt(cb)} could NOT be re-scaled "
+                f"(no comparable block count for the tuned replicate). It is "
+                f"still in {old_block}-block units and will not mean the same "
+                f"thing — re-tune it.")
+        conv = rescale_count_band(cb, old_blocks, new_blocks)
+        if tuple(conv) == tuple(cb):
+            return cb, None                     # same block count; nothing moved
+        return conv, (
+            f"block {old_block}→{new_block} re-scaled the detection "
+            f"threshold {band_txt(cb)} → {band_txt(conv)} "
+            f"({old_blocks}→{new_blocks} blocks in the tuned replicate)")
+
+    def apply_view_state(self, st: dict) -> str | None:
+        """Restore a captured view state onto this (freshly built) explorer.
+
+        Returns a note describing any conversion the restore had to perform, for
+        the caller to surface; None when the state transferred as-is."""
         ch = st.get("channel")
         if ch in self.chan_checks and self._channel_available(ch):
             self.channel = ch
@@ -450,7 +551,7 @@ class ScalogramExplorer(QWidget):
             if dp is not None:
                 dp.band_lo, dp.band_hi = band
                 dp.update()
-        cb = st.get("count_band")
+        cb, note = self._converted_count_band(st)
         if cb is not None:
             self.count_w_plot.band_lo, self.count_w_plot.band_hi = cb
             self.count_w_plot.set_band_active(True)
@@ -460,8 +561,32 @@ class ScalogramExplorer(QWidget):
             self._apply_frame(int(frame))
         if self.active_region_index >= 0:
             self._on_freq_band_committed()
+        return note
 
     # -- scope / geometry ----------------------------------------------------
+    def _resolved_block(self) -> int:
+        """Working pixels per block for this source, 0 when unrecorded."""
+        try:
+            return int(self.meta.get("block_size") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _region_block_count(self, idx: int) -> int:
+        """Blocks in ONE region -- the denominator a count band is implicitly
+        expressed in. Region 0 stands in when no region is selected (the count
+        band is tuned against a single replicate, and in a packed atlas the
+        tiles are the same size), so the denominator survives being captured
+        from the selection view.
+
+        Taken from the atlas bbox rather than from ny*nx/len(regions), so a
+        source whose regions do not tile the grid exactly still reports the
+        count the detector actually sums over."""
+        if not self.regions:
+            return 0
+        r = self.regions[idx] if 0 <= idx < len(self.regions) else self.regions[0]
+        y0, x0, y1, x1 = r["atlas_bbox"]
+        return max(0, int(y1) - int(y0)) * max(0, int(x1) - int(x0))
+
     def _regions_for_index(self, idx: int) -> list[dict]:
         """The regions a scope index covers: all of them when pooled (<0)."""
         return self.regions if idx < 0 else [self.regions[idx]]
@@ -658,6 +783,7 @@ class ScalogramExplorer(QWidget):
             dp.band_changed.connect(partial(self._on_density_band_changed, name))
             dp.band_committed.connect(
                 partial(self._on_density_band_committed, name))
+            dp.collapse_toggled.connect(partial(self._on_density_toggled, name))
             self.density_plots[name] = dp
             grid.addWidget(dp, r, 1)
         col.addWidget(grid_w)
@@ -706,13 +832,23 @@ class ScalogramExplorer(QWidget):
         # the heatmaps -- visible on open and whenever no replicate is selected.
         for pl in (self.count_plot, self.count_w_plot, self.clump_plot):
             pl.set_auto_collapse_empty(True)
-        # T28: count_w_plot is exempt from collapsed-by-default. It carries the
-        # detection threshold band AND (since T15) the detection readout, so
-        # collapsing it hides both the primary tuning control and its result
-        # behind a click on the one panel whose purpose is to show them. The
-        # auto-collapse above still applies: with no data there is nothing to
-        # tune against, and it opens itself when a series arrives.
-        self.count_w_plot.set_collapsed(False)
+        # Three readouts are PERMANENT: not collapsed by default, and with no
+        # [+] to collapse them at all. They are the panel's three axes of
+        # control -- the frequency band is dragged on the scalogram, the value
+        # band on the selected channel's heatmap, the detection threshold on
+        # the windowed count -- and each is also where you read what the drag
+        # did. A toggle that hides a live control is a way to make the panel
+        # look broken, so the toggle is removed rather than merely defaulted
+        # open. The selected-channel heatmap is handled in
+        # _apply_selected_plot_ui, since which plot it is changes at runtime.
+        #
+        # Auto-collapse-empty still applies to the windowed count (T27): with
+        # no series there is nothing to tune against, and it reopens itself
+        # when data arrives. That is data-driven, not a control the user can
+        # lose. The scalogram takes no auto-collapse -- see _rebuild_selected_views.
+        for pl in (self.scalo_plot, self.count_w_plot):
+            pl.set_collapsible(False)
+            pl.set_collapsed(False)
 
         self._apply_selected_plot_ui()
         self._sync_labels()
@@ -733,19 +869,53 @@ class ScalogramExplorer(QWidget):
 
     def _apply_selected_plot_ui(self):
         """Expand + activate the value band on the selected channel's density;
-        collapse and deactivate the rest (their matrices stay visible)."""
+        deactivate the rest (their matrices stay visible).
+
+        The selected plot is also made PERMANENT -- uncollapsed, and stripped
+        of its [+] -- because it carries the value band that defines the
+        detection, and _refresh_densities already exempts it from the
+        collapsed-skip for exactly that reason: it is the detector's input, not
+        a picture. Hiding it hid the control, not the cost.
+
+        The selected plot is exempt from T13's auto-collapse-empty as well, and
+        that is not the same call as the [+]. Auto-collapse fires exactly when
+        the cube is not built -- i.e. for the whole build after every channel
+        switch, the moment the user just asked to look at this channel. An
+        empty pane costs one black slab; a vanished pane costs the value band
+        that defines the detection, and takes it away at the least defensible
+        moment.
+
+        Deselecting restores the toggle, the empty-collapse, and the user's OWN
+        collapse state -- not the open state the selection imposed. A plot the
+        user opened with [+] stays open; one that was only open because it was
+        selected closes again. Leaving it open instead is not a harmless
+        courtesy: _refresh_densities keys off is_collapsed(), so every channel
+        ever visited would stay in `wanted` and be re-summed on every band
+        drag."""
         for name, dp in self.density_plots.items():
             sel = (name == self.channel)
             dp.set_band_active(sel)
             dp.set_expanded(sel)
+            dp.set_collapsible(not sel)
+            dp.set_auto_collapse_empty(not sel)
+            dp.set_collapsed(False if sel
+                             else name not in self._density_user_open)
+
+    def _on_density_toggled(self, name: str, expanded: bool) -> None:
+        """Record a real [+]/[-] click so deselection can restore it. Only the
+        user's own intent lands here; the forced open/close in
+        _apply_selected_plot_ui goes through set_collapsed, which emits
+        nothing."""
+        if expanded:
+            self._density_user_open.add(name)
+        else:
+            self._density_user_open.discard(name)
 
     def _on_plot_expanded(self, expanded: bool):
         """A plot the user just opened may have been skipped while collapsed.
         Fill in whatever was deferred; collapsing needs no work."""
         if not expanded:
             return
-        if not self.scalo_plot.is_collapsed() and self.scalo_plot.matrix.size == 0:
-            self._rebuild_selected_views()
         if self._density_dirty:
             self._refresh_densities()
 
@@ -808,16 +978,12 @@ class ScalogramExplorer(QWidget):
         self.trace_plot.set_series(pooled)
         self.trace_plot.set_cursor(self.frame)
         # The pooled Morlet transform is the one unconditional per-rebuild cost
-        # here, so a collapsed scalogram skips it. It is left EMPTY rather than
-        # stale, which is what _on_plot_expanded tests to know it owes a build:
-        # a stale matrix would be indistinguishable from a current one and
-        # would quietly show the previous replicate's spectrum.
-        if self.scalo_plot.is_collapsed():
-            self.scalo_plot.set_scalogram(np.zeros((0, 0), np.float32))
-        else:
-            self._set_phase("transforming pooled scalogram…", paint=True)
-            self.scalo_plot.set_scalogram(
-                morlet_power(pooled, self.fps, self.freqs))
+        # here. It used to be skipped while the scalogram was collapsed; the
+        # scalogram is now permanent (see _build_ui), so the transform runs on
+        # every rebuild and there is no deferred-build state to represent.
+        self._set_phase("transforming pooled scalogram…", paint=True)
+        self.scalo_plot.set_scalogram(
+            morlet_power(pooled, self.fps, self.freqs))
         self.scalo_plot.set_cursor(self.frame)
         # Overlay color scale is a whole-clip percentile of this channel/scope;
         # freeze it here so scrubbing (which redraws every frame) never

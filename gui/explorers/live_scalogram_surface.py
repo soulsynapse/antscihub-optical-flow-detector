@@ -1082,8 +1082,14 @@ class LiveScalogramSurface(QWidget):
         # explorer can force a synchronous repaint of it before blocking work.
         new.set_status_relay(self.graph_status_lbl)
         if self._pending_state is not None:
-            new.apply_view_state(self._pending_state)
+            note = new.apply_view_state(self._pending_state)
             self._pending_state = None
+            # A Block change re-denominates the detection threshold (it is a raw
+            # block count). The conversion is the right thing to do, but a tuned
+            # number that changes itself has to say so -- silently correct and
+            # silently wrong look identical from here.
+            if note:
+                self.status_lbl.setText(note)
         if old is not None:
             old.close()                             # releases source + event filter
             old.setParent(None)

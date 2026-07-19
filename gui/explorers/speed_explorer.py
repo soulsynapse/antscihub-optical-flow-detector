@@ -359,8 +359,17 @@ class MiniPlot(QWidget):
     def _toggle_rect(self) -> QRectF:
         return QRectF(4, 2, self.TOGGLE_W, 14)
 
+    def _has_marker(self) -> bool:
+        """Whether the header carries a marker at all.
+
+        A collapsible plot always shows one. A NON-collapsible plot shows one
+        only while auto-collapsed: it has no [+] to offer, but it has still
+        shrunk to a header, and a pane that silently loses its body with no
+        mark is the same unexplained control the [.] form exists to prevent."""
+        return self._collapsible or self._auto_collapsed
+
     def _title_x(self) -> int:
-        return 8 + self.TOGGLE_W if self._collapsible else 8
+        return 8 + self.TOGGLE_W if self._has_marker() else 8
 
     def _paint_header(self, p: QPainter) -> None:
         """The [+]/[-] marker. Every paintEvent draws it, collapsed or not --
@@ -370,7 +379,7 @@ class MiniPlot(QWidget):
         empty pane, so the toggle genuinely does nothing and must not advertise
         otherwise. Its data arrives by another route (checking its channel),
         and a [+] that silently no-ops would read as a broken control."""
-        if not self._collapsible:
+        if not self._has_marker():
             return
         p.setFont(QFont("Consolas", 7))
         p.setPen(TXT_DIM)

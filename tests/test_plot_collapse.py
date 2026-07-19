@@ -292,7 +292,14 @@ class CollapseDoesNotDisarmTheDetectorTest(unittest.TestCase):
         self._settle(ex)
         self.assertTrue(ex._sg_cache, "cube never built; test proves nothing")
         sel = ex._selected_density()
-        self.assertTrue(sel.is_collapsed(), "precondition: collapsed by default")
+        # The selected channel's heatmap is now permanently open (it carries the
+        # value band), so the collapse it must survive can no longer be reached
+        # by default -- it is forced here. The exemption in _refresh_densities is
+        # still the thing under test: visibility must never decide what is
+        # computed, whatever route sets the flag.
+        sel.set_collapsed(True)
+        ex._refresh_densities()
+        self.assertTrue(sel.is_collapsed(), "precondition: collapsed")
         self.assertEqual(sel.matrix.shape[0], T,
                          "selected channel's matrix was skipped while collapsed")
         for name, pl in (("count", ex.count_plot),
@@ -318,6 +325,85 @@ class CollapseDoesNotDisarmTheDetectorTest(unittest.TestCase):
                          "the threshold plot opened collapsed")
         self.assertTrue(ex.count_plot.is_collapsed(),
                         "T14 stopped applying to the other sweep plots")
+
+    def test_the_three_control_readouts_are_permanent(self):
+        """Scalogram, selected-channel heatmap and windowed count each carry a
+        drag control (frequency band, value band, detection threshold) and show
+        what the drag did. All three open uncollapsed and offer no [+] at all:
+        a toggle that hides a live control is a way to make the panel look
+        broken, so it is removed rather than merely defaulted open."""
+        ex, _ = self._explorer()
+        self._settle(ex)
+        for name, pl in (("scalogram", ex.scalo_plot),
+                         ("selected density", ex._selected_density()),
+                         ("windowed count", ex.count_w_plot)):
+            self.assertFalse(pl.is_collapsed(), f"{name} opened collapsed")
+            self.assertFalse(pl._collapsible, f"{name} still offers a [+]")
+
+    def test_selection_moves_the_permanent_heatmap(self):
+        """Which density plot is permanent follows the channel selection: the
+        newly selected one opens and loses its [+]; the old one gets its toggle
+        back and closes again, since it was only ever open because it was
+        selected."""
+        ex, _ = self._explorer()
+        self._settle(ex)
+        first = ex.channel
+        other = next(n for n in ex.density_plots if n != first)
+        ex.channel = other
+        ex._apply_selected_plot_ui()
+        self.assertFalse(ex.density_plots[other].is_collapsed())
+        self.assertFalse(ex.density_plots[other]._collapsible)
+        self.assertTrue(ex.density_plots[first]._collapsible,
+                        "deselected heatmap never got its toggle back")
+        self.assertTrue(ex.density_plots[first].is_collapsed(),
+                        "a heatmap open only by selection stayed open")
+
+    def test_visiting_every_channel_does_not_leave_them_all_summing(self):
+        """_refresh_densities keys off is_collapsed(), so a plot left open by a
+        selection that has moved on stays in `wanted` forever. Cycling the
+        channels would then make every later band drag re-sum every cube --
+        the exact per-refresh cost T14 removed."""
+        ex, _ = self._explorer()
+        self._settle(ex)
+        names = list(ex.density_plots)
+        for n in names:
+            ex.channel = n
+            ex._apply_selected_plot_ui()
+        open_now = [n for n in names if not ex.density_plots[n].is_collapsed()]
+        self.assertEqual(open_now, [ex.channel],
+                         "every visited channel stayed open and billable")
+
+    def test_a_user_opened_heatmap_survives_deselection(self):
+        """The flip side: an explicit [+] is real intent and must outlive the
+        selection that happens to move away from it."""
+        ex, _ = self._explorer()
+        self._settle(ex)
+        first = ex.channel
+        other = next(n for n in ex.density_plots if n != first)
+        # Deselect `first` so it is collapsible, then open it as the user would.
+        ex.channel = other
+        ex._apply_selected_plot_ui()
+        ex._on_density_toggled(first, True)
+        ex.density_plots[first].set_collapsed(False)
+        # Move the selection again; the explicit open must not be undone.
+        ex.channel = names_next = next(n for n in ex.density_plots
+                                       if n not in (first, other))
+        ex._apply_selected_plot_ui()
+        self.assertFalse(ex.density_plots[first].is_collapsed(),
+                         "an explicitly opened heatmap was force-closed")
+        self.assertEqual(ex.channel, names_next)
+
+    def test_a_non_collapsible_plot_still_marks_an_auto_collapse(self):
+        """count_w_plot has no [+], but T27 can still auto-collapse it. Without
+        a marker it just silently loses its body, which is the unexplained
+        control the [.] form exists to prevent."""
+        ex, _ = self._explorer()
+        self._settle(ex)
+        pl = ex.count_w_plot
+        self.assertFalse(pl._collapsible)
+        pl.set_series(np.zeros(0, np.float32))       # empty -> auto-collapse
+        self.assertTrue(pl.is_collapsed(), "precondition: auto-collapsed")
+        self.assertTrue(pl._has_marker(), "no marker on a collapsed pane")
 
     def test_gate_reaches_the_plot_it_is_shaded_on(self):
         """T15's wiring: the gate is computed (asserted above) AND published."""
