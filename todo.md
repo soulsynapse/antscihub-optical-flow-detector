@@ -31,7 +31,7 @@ to the relevant section rather than restating it.
 | **T21** | Suspected runaway memory issue somewhere on the replicate tab. **Not reproduced by inspection** — `_refresh_list` was the obvious suspect and is clean (14x14 swatch pixmaps, `list.clear()` releases the items). Needs an actual measurement, not more code reading; do not guess at a fix. |
 | **T22** | New **viewer tab** consuming a fully-processed video: detection/no-detection only, full-clip bar plus a ~1 min bar zoomed on the scrubber, and a hand-off back into preprocessing at the paused position *without* auto-triggering a pass. |
 | **T23** | **ROI pre-transcode**: cut each source once into per-replicate clips + manifest, so later passes decode ~1/16 the pixels. The only lever that moves the decode floor. |
-| **T24** | **Headless batch driver**: no-GUI entry point (video + replicate JSON → detection results) and file-level job partitioning, so runs fan out across nodes. |
+| **T24** | **Headless batch driver**: no-GUI entry point (video + replicate JSON → detection results) and file-level job partitioning, so runs fan out across nodes. **Entry point and partitioning both landed** (Batch J); only the N-worker throughput measurement is still open. |
 
 ## 2. Standing decisions
 
@@ -106,6 +106,8 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 9. GUI bugs | the Qt exit-9 crash, the silent 20x downsample, the false pass |
 | 10. ROI pre-transcode | the 25x decode win, why lossless saves no storage, and four traps |
 | 11. Per-channel extraction | the measured 1.59x (not the ~4x this plan asserted), and why the placeholder is zero-length |
+| 12. The headless path | per-video extraction, the two clocks, why truncation fails the job |
+| 13. File-level partitioning | the four silent ways a shard examines less than it claims; resume by identity, not existence |
 
 ---
 
@@ -238,6 +240,9 @@ it there only if Batch J needs it.
 caches a clip-derived result yet. The first code that does must thread
 `meta["clip_provenance"]` into it; otherwise a source-derived and a clip-derived
 result collide in one cache entry. Available guard, not an active one.
+**Still unenforced after J's first slice** — the headless summary *records*
+`clip_provenance`, but writing a result file is not caching, so no caller has
+appeared yet.
 
 **Why this beats the live ROI crop that already exists.** H.264 decode is
 whole-frame: the `crop` in `ReplicateVideoSource`'s filter graph runs *after*
@@ -257,10 +262,73 @@ Reuses the `ReplicateVideoSource` filter-graph geometry. **Watch the three traps
 `FINDINGS.md` §3** — especially `format=gray16le` after `scale`, and fps at full
 precision in the manifest.
 
-### Batch J — headless batch driver (T24) · new CLI + `core` only
+### Batch J — headless batch driver (T24) · new CLI + `core` only  ← **IN PROGRESS** (throughput measurement only)
 No-GUI entry point plus file-level job partitioning. This is what gets linear
 scaling, because each node brings its own decode capacity. Pairs with I (a batch
 run should consume pre-transcoded ROI clips).
+
+**Landed — the single-video entry point.** `core/batch.py` (the logic, no
+argparse) + `cli/detect.py` (`python -m cli.detect VIDEO --params tuned.json`),
+with `tests/test_batch_cli.py`. Consumes the video, a replicate sidecar, tuned
+params as JSON, and optionally a Batch I manifest. Writes a summary JSON plus an
+`.npz` of per-frame series; `--band-power` additionally retains the `(T,B)` cube,
+which is what makes value-band and window re-tuning possible without a fresh
+pass. Exit codes are a contract for a job runner: 0 / 1 untrusted / 2 usage.
+
+Details and measurements in `FINDINGS.md` §12. Four things worth knowing here:
+
+- **Extraction is per video, not per region** — the atlas already holds every
+  replicate's blocks, so N regions cost one decode. The GUI's per-commit extract
+  is right for one-region-at-a-time and wrong for a batch.
+- **A truncated pass fails the job** rather than warning. Two arithmetic traps in
+  that guard were found by review, both dangerous-direction: coverage ignoring
+  `--start` failed every offset run *after* paying full extraction, and an
+  unclamped over-long `--frames` would have failed every job that passed a
+  generous count — which trains operators into habitual `--allow-truncated` and
+  disarms the guard.
+- **`freqs` comes from the extraction meta**, so clip-backed passes build the
+  wavelet bank from the manifest's rational fps. The GUI worker still uses the
+  decoder's float; they differ only for clip-backed passes.
+- **The GUI-agreement test asserts arrays, not intervals.** A summary can agree
+  while the series underneath has drifted.
+
+**Landed — file-level partitioning.** `core/shard.py` + `cli/run.py`
+(`python -m cli.run "footage/*.MP4" --params tuned.json --shard 3/8`), with
+`tests/test_shard.py`. A shard is `sorted(list)[i::N]` — stateless, so a runner
+launches N identical commands differing only in `--shard`, and a preempted shard
+is relaunched rather than reconciled. Stride rather than contiguous chunks,
+because file size correlates with position within a session. A failed video does
+not stop its shard-mates; the shard exits 1 with the failures named in a report.
+Finished videos are skipped on re-run, but only against a *matching identity*
+(params, resolved scale, resolved block, frame window) — never mere existence.
+Pre-transcoded clips (Batch I) are discovered per video from the manifest naming
+convention, since a manifest belongs to one source and cannot be a single flag.
+
+**Details in `FINDINGS.md` §13, and it is worth reading before touching this.**
+Every defect review found had one shape — *a shard that exits 0 having examined
+less footage than asked* — and none would have failed a test that only checked
+the happy path. Colliding basenames across session directories (the normal
+multi-session case) silently **skipped** a video rather than merely overwriting
+it, because resume and naming are individually reasonable and interact badly. A
+platform-dependent sort key (`normcase`) partitions differently on Windows and
+Linux, so a mixed fan-out leaves footage examined by nobody. And a completed
+`--frames` smoke test is indistinguishable from a completed full pass in the
+resolved counts, so it was reused as one — `requested_n` and `start_frame` are
+now recorded and are part of the resume identity.
+
+**Still open in J:** the N-worker throughput measurement below. Single process on
+one small-ROI replicate at scale 1.0 measured **~88 fps / ~1.47x realtime** — a
+real number but *not* a basis for a node count, being one replicate on a 512x512
+working ROI.
+
+**Extension point, deliberately not built:** a job-spec runner (a JSON list of
+per-job video/replicates/manifest/params/out). `--shard` over a file list covers
+the uniform case, which is the one that exists today; the spec form is what
+per-video *differing* params would need, and nothing needs that yet.
+
+**No Qt on this path, enforced by a test** (`NoQtImportTest`): a transitive PyQt
+import turns every headless job into a startup crash on a display-less node, and
+the `core` → `gui` import chain makes that easy to break by accident.
 
 **Do not carry the old "3000 h / 10x / 50 nodes ≈ 6 h" figure forward** — it used
 the decode ceiling at the old default scale. At scale 1.0 a single process is

@@ -18,6 +18,9 @@ Contents:
 7. [Why the empirical detection panel was removed](#7-why-the-detection-panel-was-removed)
 8. [Calibration](#8-calibration)
 9. [GUI bugs worth remembering](#9-gui-bugs-worth-remembering)
+10. [ROI pre-transcode](#10-roi-pre-transcode)
+11. [Per-channel extraction (T18)](#11-per-channel-extraction-t18)
+12. [The headless path (T24)](#12-the-headless-path-t24-batch-j-first-slice)
 
 ---
 
@@ -602,3 +605,163 @@ them, for the same reason it records `truncated`: wall time depends on a second
 axis that a consumer comparing scales cannot recover from the number alone, and a
 fit mixing a four-channel sample with a one-channel one reads the difference as
 scale.
+
+---
+
+## 12. The headless path (T24, Batch J first slice)
+
+`core/batch.py` + `cli/detect.py`. The GUI commit worker
+(`live_scalogram_surface._ProcessWorker`) is the reference implementation and the
+headless path runs the same two calls, `live_channel_source` then
+`detect_channel_region`, so neither road reimplements detector math.
+`tests/test_batch_cli.py::test_matches_gui_worker_path` asserts array equality on
+`band_power`/`count`/`windowed`/`gate`/`clump` rather than on interval counts — a
+summary can agree while the series underneath has drifted.
+
+### Extraction is per video, not per region
+
+The GUI extracts once per commit because a user commits one region at a time. A
+batch run over six replicates that copied that would decode the same video six
+times for one video's worth of pixels: the channel pass already produces the
+whole atlas, and `detect_channel_region` only slices a region's block columns out
+of it. Measured on the 2-replicate synthetic, two regions cost **1.0x** one
+region's extraction, and detection is ~0.2% of the pass.
+
+### Two clocks disagree, and the manifest's is the right one
+
+`_ProcessWorker` passes `default_freqs(fps)` built from the decoder's float fps.
+When clips are in play, the authoritative rate is the manifest's rational one
+(§3 trap 2), and the wavelet bank is built *from* fps. The headless path passes
+`freqs=None` so `detect_channel_region` reads `meta["fps"]`, which
+`live_channel_source` has already replaced with the manifest's. The GUI worker is
+the inconsistent one here; it matters only for clip-backed passes, where the two
+rates differ.
+
+### Truncation is a job failure, not a warning
+
+Interactively a short decode can be a status-bar note because a human is
+watching. Across a fan-out nobody reads the logs of runs that "succeeded", and
+frames past a cut are **unexamined, not examined-and-clear** — the standing
+false-negative shape. So a truncated pass raises unless `allow_truncated`, and
+the shortfall is recorded in the result either way.
+
+Two arithmetic traps in that guard, both found by review and each wrong in the
+dangerous direction once:
+
+- **Coverage must be measured against what the file holds past the offset.**
+  `requested` was the whole clip regardless of `start`, so a `--start N` run with
+  no `--frames` could never reach it and aborted as truncated — after paying the
+  full extraction (238 s on a 30 479-frame clip before the error appeared).
+- **An over-long request is not truncation.** Asking for more frames than the
+  video has is the end of the video. Left unclamped it would fail every job that
+  passed a generous `--frames`, which trains operators to pass
+  `--allow-truncated` habitually and thereby disarms the guard entirely.
+
+### Single-process throughput at scale 1.0
+
+`rep3_intermittent_crop` (1 replicate, 8x8 grid at block 64, i.e. 512x512 working
+px), `change` only, scale 1.0: **~88 frames/s**, against the clip's 59.94 fps —
+**~1.47x realtime**. Split `tensor_blur` 53%, `tensor_products` 31%,
+`preprocess` 11%, `block_reduce` 3%, decode ~0%.
+
+This is math-bound, as §1 predicts at scale 1.0, and it is one replicate on a
+small ROI — **do not extrapolate it to a node count.** The figure Batch J needs
+is N-worker throughput on real multi-replicate footage, which this is not.
+
+### The provenance obligation from Batch I is still unenforced
+
+The summary records `clip_provenance`, but nothing here caches a clip-derived
+result, so `cfg.cache_key`'s third argument still has no caller. Unchanged from
+§10: the first code to cache clip-derived output must thread it.
+
+## 13. File-level partitioning (T24, Batch J second slice)
+
+`core/shard.py` + `cli/run.py`. A shard is `sorted(list)[i::N]` — stateless, so
+a job runner launches N identical commands differing only in `--shard i/N` and
+a preempted shard is relaunched rather than reconciled.
+
+**Stride, not contiguous chunks.** Footage is named in capture order and file
+size correlates strongly with position within a session, so `paths[i*k:(i+1)*k]`
+hands one shard the long files and another the short ones. Both forms are
+deterministic; only the stride balances.
+
+### Every bug found here had the same shape: a shard that exits 0 having examined less footage than asked
+
+Four distinct defects, all caught by review rather than by a failing test, and
+all of them silent. They are recorded together because the *pattern* is the
+finding — in a fan-out, "this shard completed the list it saw" is not evidence
+that the list was right, and nothing downstream re-checks it.
+
+**Output paths keyed on the basename collide, and the collision is invisible.**
+Cameras number files per card, so `s1/GX010047.MP4` and `s2/GX010047.MP4` in one
+run is the *normal* multi-session case. Both mapped to
+`GX010047.detections.json`. The second video then found the first's summary,
+matched on params and scale, and was reported **"skipped (up to date)"** — its
+footage never decoded, the run exiting 0. Note the interaction: resume turned an
+overwrite (bad) into a silent skip (worse), because the two features are
+individually reasonable. `assign_output_names` now extends colliding stems
+leftward with parent directories (`s1_GX010047`), computed over the **whole**
+list so the mapping is independent of which shard a video lands in and identical
+on every node. Unique stems keep the plain name `cli/detect.py` writes.
+
+**`os.path.normcase` as a sort key makes the partition platform-dependent.**
+It lowercases on Windows and is the identity on POSIX. `['B.mp4','a.mp4','C.mp4',
+'d.mp4']` sorts `a,B,C,d` on Windows and `B,C,a,d` on Linux, so a Windows shard
+0/2 covers `{a,C}` while a Linux shard 1/2 covers `{C,d}`: **`B.mp4` is examined
+by nobody and `C.mp4` is decoded twice**, both exiting 0. normcase is still
+correct for *de-duplication* — it is the filesystem's own rule for whether two
+spellings are one file, and case-folding there would silently drop one of
+`a.mp4`/`A.mp4` on POSIX where both can exist. So the two uses genuinely need
+different keys, which is why one function had it right and wrong at once.
+
+**Glob inherits the filesystem's case rules, for the same reason.** `*.mp4`
+matches `GX010047.MP4` on Windows and not on Linux — and GoPro writes uppercase.
+`_ci_pattern` rewrites each alphabetic character to a two-case class so the match
+is platform-independent. It must skip path segments with no glob magic: a literal
+`C:` rewritten to `[cC]:` is no longer a drive letter, which broke every absolute
+Windows path on the first attempt.
+
+**A completed short pass is indistinguishable from a completed full pass in the
+resolved counts.** `--frames 1000` and a to-the-end run over a 1000-frame video
+both end with `requested == covered == 1000, truncated == False`. So a shard run
+once as a `--frames` smoke test and then re-run full-length was **skipped as up
+to date**, leaving the smoke test standing as the video's detections. Only the
+*raw* request distinguishes them, so `BatchResult` now records `requested_n`
+(`None` = to the end) and `start_frame`, and both are part of the resume
+identity. A summary lacking them is treated as not current and recomputed — the
+safe direction.
+
+### Resume must compare identity, not existence
+
+The general rule the above is one instance of: skipping on output existence
+alone silently returns results computed under *different* settings. The skip
+requires the recorded params, resolved scale, resolved block size, and frame
+window all to match. Two directions each cost something and only one is
+recoverable: a false *stale* re-decodes work needlessly, a false *current*
+returns a wrong answer forever. Resolved rather than raw settings are compared
+for exactly this reason — `downsample=None` and `downsample=1.0` are the same
+scale, and calling them stale would re-decode hours for a difference that does
+not exist.
+
+### Silence is the failure mode to design against, not just wrongness
+
+Three guards exist only to convert silence into noise, none of which change any
+result: a glob matching nothing raises, a directory holding no videos raises
+(the wrong-nesting-level typo — videos one folder deeper contributed *nothing*
+and the run still succeeded), and a missing pre-transcode manifest under an
+explicit `--clip-dir` warns and records `used_clips: false` per video rather
+than quietly decoding the source at ~25x the cost across a provenance boundary
+(§10 — below `lossless` those are not the same pixels).
+
+`--shard i/N` is 0-based and `i == N` is rejected by name, because an operator
+launching `1/N`..`N/N` otherwise never runs shard 0 and every job reports
+success.
+
+### Failure isolation
+
+A failed video records its error and the shard continues; the shard exits 1 at
+the end with the failed videos **enumerated by name** in the report. Aborting at
+the first failure would discard the decode already paid for by every earlier
+video in the shard. The two exit codes are kept distinct on purpose: **2** is
+bad usage (retrying on every node is pointless) and **1** is a failed job (it is
+not).
