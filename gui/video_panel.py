@@ -12,7 +12,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor, QImage, QPainter, QPen, QColor, QPixmap
+from PyQt6.QtGui import (QCursor, QFont, QImage, QPainter, QPen, QColor,
+                         QPixmap)
 from PyQt6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSizePolicy,
                              QSlider, QStyle, QStyleOptionSlider, QVBoxLayout,
                              QWidget)
@@ -29,6 +30,14 @@ from gui.state import AppState
 # grid is 45x81, so the overlay has nowhere near enough detail to justify being
 # composited at 5K.
 DISPLAY_MAX_W = 1280
+
+
+# The DETECTED badge fill. Must match ``speed_explorer.DETECT``, the colour of
+# the detection spans on the plots -- the badge and the shading report the same
+# gate, and two greens would read as two different states. Duplicated rather
+# than imported because speed_explorer imports THIS module; importing back
+# would make the cycle.
+DETECT_BADGE = QColor(60, 220, 110)
 
 
 class FrameView(QLabel):
@@ -69,6 +78,7 @@ class FrameView(QLabel):
         # Persistent boxes to render: [(x0,y0,x1,y1 fractions, label, hex, selected)]
         self.boxes: list[tuple] = []
         self._overlays_hidden = False
+        self._detected = False
         self._rubber: tuple | None = None    # in-progress drag, display coords
         self._drag_start: QPoint | None = None
 
@@ -80,6 +90,13 @@ class FrameView(QLabel):
         """Temporarily suppress persistent annotations without discarding them."""
         self._overlays_hidden = bool(hidden)
         self.update()
+
+    def set_detected(self, on: bool) -> None:
+        """T16: flag the current frame as a positive detection."""
+        on = bool(on)
+        if on != self._detected:
+            self._detected = on
+            self.update()
 
     def set_focus_frac(self, frac: tuple[float, float, float, float] | None
                        ) -> None:
@@ -187,6 +204,25 @@ class FrameView(QLabel):
                 if label:
                     p.setPen(QPen(col, 1))
                     p.drawText(rect.x() + 3, rect.y() + 14, label)
+
+        # T16: the DETECTED badge, bottom-right of the drawn frame.
+        #
+        # Deliberately OUTSIDE the _overlays_hidden guard above. Shift-to-peek
+        # hides the annotations so the raw pixels can be read -- which is
+        # exactly when you are judging whether a detection is real, so that is
+        # the worst possible moment to take the detector's verdict away. It
+        # also annotates nothing: it reports a per-frame result rather than
+        # marking a place in the image, so it never occludes what peek reveals.
+        if self._detected:
+            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+            txt = "DETECTED"
+            fm = p.fontMetrics()
+            bw, bh = fm.horizontalAdvance(txt) + 16, fm.height() + 8
+            r = self._draw_rect
+            badge = QRect(r.right() - bw - 8, r.bottom() - bh - 8, bw, bh)
+            p.fillRect(badge, DETECT_BADGE)
+            p.setPen(QColor(0, 0, 0))
+            p.drawText(badge, Qt.AlignmentFlag.AlignCenter, txt)
 
         # Rubber-band in progress.
         if self._rubber is not None:

@@ -1180,3 +1180,98 @@ same signature as the `closeEvent`/debounce crash already recorded in §9, from
 an unrelated cause. It only appears when the module runs *alone*; under the full
 suite another module has already made an app that outlives it, so the file
 passes. Hold the `QApplication` at module scope.
+
+---
+
+## 18. Detection readout (T15, T16, T27, T28, Batch E)
+
+Interactive polish with no measurement attached, so this section records the
+decisions and the three traps rather than numbers.
+
+**T15 -- the gate moved onto the plot whose band produces it.** The separate
+0/1 `detect_plot` is gone; `count_w_plot` now shades positive frames green
+behind its series. The reason is not screen real estate: the gate is computed
+against *that plot's own band*, so a threshold drag and its consequence now
+share one x-axis. Previously the user dragged a handle on one plot and read the
+result on another, correlating two axes by eye to see whether the drag had done
+anything.
+
+**The gate is owned by the explorer, not by a widget.** `ScalogramExplorer.detect`
+holds it and `_set_detect` publishes it to its two pictures (the shading and the
+badge). Reading the gate back off a plot -- which the old code effectively did,
+`detect_plot.y` being the only copy -- means a change to a *drawing* can change
+what the detection *is*. That is the Batch D failure (section 17) in a second
+form, and the existing regression test now asserts `ex.detect`, not a widget.
+
+**Three traps, all found in review or by writing the test:**
+
+- **A single positive frame is 0.03 px wide** on a 400 px plot over a 14000
+  frame clip. The series is enveloped down to pixel columns, but a detection
+  must not be: rounding it away draws a clean clip over a real detection.
+  Spans are drawn in frame coordinates with a **1 px floor**. This is the
+  standing silent-false-negative shape and is the one thing in E worth a test.
+- **A stale mask invents events.** `set_series` now clears `_detect_mask`.
+  Held across a replicate switch, the previous clip's detections would shade
+  the new one -- indistinguishable from a real result, and wrong in the
+  direction that *adds* events rather than losing them. Batch D's
+  empty-rather-than-stale rule, second application.
+- **Runs touching either end of the clip** are closed by padding the mask with
+  a zero on both sides before differencing. A naive edge-diff drops a run that
+  reaches the final frame, and the end of a clip is where a truncated event
+  sits.
+
+**T16 -- the badge is exempt from shift-to-peek, and that is the whole point.**
+`DETECTED` (green fill, bold black) is painted bottom-right of the drawn frame,
+deliberately OUTSIDE `FrameView`'s `_overlays_hidden` guard. Shift-to-peek hides
+annotations so the raw pixels can be judged, which is exactly the moment the
+user is deciding whether a detection is real -- the worst possible moment to
+withdraw the detector's verdict. It also annotates nothing (it reports a
+per-frame result rather than marking a place in the image), so it cannot occlude
+what peek exists to reveal. Pinned by a test that renders the widget and
+inspects pixels; confirmed to fail when the badge is moved inside the guard.
+
+**The badge colour is duplicated, not shared.** `speed_explorer` imports
+`video_panel`, so `video_panel` cannot import `DETECT` back. `DETECT_BADGE` is
+a second literal with a test asserting the two are equal -- the cheapest thing
+that stops the shading and the badge drifting into two different greens for one
+gate.
+
+**T27 needed the mechanism moved, not a two-line call.** The plan recorded this
+as "`set_auto_collapse_empty` exists, two-line change". It did exist, but on
+`DensityPlot`, keyed on `self.matrix` -- and the four sweep plots are
+`MiniPlot`/`PixelBarPlot`, which carry a series and no matrix. The flag, its
+setter and `_refresh_auto_collapse` moved up to `MiniPlot` behind an overridable
+`_is_empty()` (series-based by default, matrix-based on `DensityPlot`).
+
+**T28 -- `count_w_plot` is exempt from collapsed-by-default, and T15 is what
+settles it.** It already carried the detection threshold band, the primary
+tuning control; since T15 it also carries the detection readout. Collapsing it
+put both the control and its result one click away on open, on the one panel
+whose purpose is to show them. Following T14 literally was defeating T14's
+reason for existing. The *auto*-collapse still applies: with no series there is
+nothing to tune against, and it opens itself when data arrives.
+
+**Pre-existing encoding damage, found and fixed alongside this batch.**
+`gui/explorers/scalogram_explorer.py` carried a UTF-8 BOM and **18
+double-encoded characters** -- real UTF-8 bytes once decoded as cp1252 and
+re-encoded, so `…` was stored as `â€¦`, `—` as `â€”`, `·` as `Â·`, `×` as `Ã—`.
+Six of them were in *user-visible status strings* (`"startingâ€¦"`, the
+`"â€” all replicates (click one to select) â€”"` combo entry). Repaired by
+targeted replacement, not a whole-file `encode('cp1252').decode('utf-8')` round
+trip: the file is mixed, so a blanket reversal corrupts the characters that were
+already correct.
+
+**Two traps worth keeping, because both cost time here:**
+
+- **`Set-Content -Encoding utf8` on Windows PowerShell 5.1 writes a BOM.** That
+  is how the BOM most likely arrived, and this session reproduced it exactly --
+  a scripted edit to `video_panel.py` added one, visible only as a phantom
+  first-line diff. Use `[System.IO.File]::WriteAllText` with
+  `UTF8Encoding($false)`, or write from Python.
+- **The PowerShell console mis-decodes UTF-8 when *reading*.** `Get-Content` on
+  this file showed `â€"` for every correct em-dash, which led to an initial
+  conclusion that `FINDINGS.md` was corrupted throughout. It is not: every
+  non-ASCII character in this file (`—`, `§`, `→`, `≈`, `√`, `±`, `∞`, `←`, `≠`)
+  is intentional and correctly stored. **Verify encoding claims by reading the
+  bytes in Python, never from console output** -- the display artifact and the
+  real defect look identical in a terminal.

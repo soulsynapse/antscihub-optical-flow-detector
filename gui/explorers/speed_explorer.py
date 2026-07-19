@@ -78,6 +78,7 @@ CURSOR = QColor(255, 210, 80)
 TXT = QColor(210, 210, 210)
 TXT_DIM = QColor(140, 140, 140)
 BAND = QColor(255, 95, 95)          # detection min/max lines drawn on the plot
+DETECT = QColor(60, 220, 110)       # positive-detection spans shaded behind it
 DISPLAY_MAX_W = 1280
 
 
@@ -245,6 +246,10 @@ class MiniPlot(QWidget):
         self.color = color
         self.y: np.ndarray = np.zeros(0, np.float32)
         self.cursor = 0
+        # T15: frames the detector calls positive, painted as green spans behind
+        # the series. A picture of a quantity computed elsewhere -- this widget
+        # never derives it, so a collapsed plot cannot disarm the detector.
+        self._detect_mask: np.ndarray | None = None
         self.band_active = False
         self.band_lo: float | None = None
         self.band_hi: float | None = None
@@ -258,11 +263,29 @@ class MiniPlot(QWidget):
         # that a plot the user expanded stays expanded once its data arrives.
         self._user_collapsed = False
         self._auto_collapsed = False
+        # T13/T27: a plot with no series has nothing but a black slab to draw,
+        # so it collapses itself to header height until its data arrives.
+        self._auto_collapse_empty = False
         self.setMinimumHeight(self.BASE_H)
         self.setMaximumHeight(self.BASE_H)
 
     def set_series(self, y: np.ndarray) -> None:
         self.y = np.asarray(y, np.float32)
+        # A mask belongs to the series it was computed from, so a new series
+        # invalidates it. Batch D's rule again: EMPTY rather than stale. A mask
+        # held across a replicate switch would shade the new clip with the
+        # previous one's detections -- indistinguishable from a real result,
+        # and wrong in the direction that invents events rather than losing
+        # them. Every caller recomputes the gate immediately after setting the
+        # series, so the blank is momentary.
+        self._detect_mask = None
+        self._refresh_auto_collapse()
+        self._repaint_unless_collapsed()
+
+    def set_detect_mask(self, mask: np.ndarray | None) -> None:
+        """Per-frame positive-detection flags to shade behind the series."""
+        self._detect_mask = (None if mask is None
+                             else np.asarray(mask, bool).ravel())
         self._repaint_unless_collapsed()
 
     def set_cursor(self, frame: int) -> None:
@@ -293,6 +316,19 @@ class MiniPlot(QWidget):
         """Data-driven collapse (nothing to draw), independent of user intent."""
         self._auto_collapsed = bool(on)
         self._sync_collapse()
+
+    def set_auto_collapse_empty(self, on: bool) -> None:
+        """Collapse this plot whenever it has nothing to draw."""
+        self._auto_collapse_empty = bool(on)
+        self._refresh_auto_collapse()
+
+    def _is_empty(self) -> bool:
+        """What "nothing to draw" means for this plot. A line plot draws its
+        series; :class:`DensityPlot` draws its matrix and overrides this."""
+        return self.y.size == 0
+
+    def _refresh_auto_collapse(self) -> None:
+        self.set_auto_collapsed(self._auto_collapse_empty and self._is_empty())
 
     def _sync_collapse(self) -> None:
         # Dropping the rendered image is the memory half of T14; skipping the
@@ -434,6 +470,7 @@ class MiniPlot(QWidget):
             return
 
         lo, hi = self._data_range()
+        self._paint_detect_spans(p, r, n)
 
         w = int(r.width())
         cols = max(1, min(n, w))
@@ -479,6 +516,32 @@ class MiniPlot(QWidget):
         p.setPen(TXT_DIM)
         p.drawText(int(r.left()), int(r.bottom()) + 8, f"{lo:.3g}")
         p.end()
+
+    def _paint_detect_spans(self, p: QPainter, r: QRectF, n: int) -> None:
+        """Shade the frames the detector called positive, full plot height.
+
+        Runs are drawn in FRAME coordinates and floored to one pixel wide. The
+        series itself is enveloped down to the widget's pixel columns, but a
+        detection must not be: a single positive frame in a 14k-frame clip is
+        0.03 px, and rounding it away would silently draw "nothing detected"
+        over a real detection -- the failure shape this whole panel exists to
+        avoid.
+        """
+        m = self._detect_mask
+        if m is None or m.size == 0 or n <= 0 or not m.any():
+            return
+        m = m[:n] if m.size >= n else np.pad(m, (0, n - m.size))
+        # Run starts/ends over the padded edges, so a run touching either end is
+        # closed rather than dropped.
+        d = np.diff(np.concatenate(([0], m.view(np.int8), [0])))
+        starts = np.flatnonzero(d == 1)
+        ends = np.flatnonzero(d == -1)
+        fill = QColor(DETECT)
+        fill.setAlpha(48)
+        for a, b in zip(starts, ends):
+            x0 = r.left() + a / n * r.width()
+            x1 = r.left() + b / n * r.width()
+            p.fillRect(QRectF(x0, r.top(), max(1.0, x1 - x0), r.height()), fill)
 
     def _paint_band(self, p: QPainter, r: QRectF, lo: float, hi: float) -> None:
         """Shade the rejected strips outside [band_lo, band_hi] and draw handles."""
@@ -613,17 +676,12 @@ class DensityPlot(MiniPlot):
         # only where a given raw value gets drawn/picked on the Y axis.
         self._log_axis = False
 
-        # T13: an unpopulated heatmap has nothing but a black slab to draw, so
-        # it collapses itself to header height until its matrix arrives.
-        self._auto_collapse_empty = False
-
-    def set_auto_collapse_empty(self, on: bool) -> None:
-        self._auto_collapse_empty = bool(on)
-        self._refresh_auto_collapse()
-
-    def _refresh_auto_collapse(self) -> None:
-        self.set_auto_collapsed(self._auto_collapse_empty
-                                and self.matrix.size == 0)
+    def _is_empty(self) -> bool:
+        # A heatmap draws its matrix, not the per-frame max it derives, so
+        # emptiness is the matrix's. The two can disagree: set_matrix leaves a
+        # zero-length y for an empty matrix, but a subclass could carry a series
+        # with nothing to shade behind it.
+        return self.matrix.size == 0
 
     def _release_render_cache(self) -> None:
         self._img = None

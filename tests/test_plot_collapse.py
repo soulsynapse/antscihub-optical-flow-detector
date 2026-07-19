@@ -297,10 +297,52 @@ class CollapseDoesNotDisarmTheDetectorTest(unittest.TestCase):
                          "selected channel's matrix was skipped while collapsed")
         for name, pl in (("count", ex.count_plot),
                          ("windowed count", ex.count_w_plot),
-                         ("detect", ex.detect_plot),
                          ("clump", ex.clump_plot)):
             self.assertEqual(pl.y.size, T,
                              f"{name} series empty with plots collapsed")
+        # T15 moved the gate off its own plot and onto count_w_plot as shading.
+        # It is asserted on the explorer's own array, not on the shading: the
+        # point of this test is that the detection is COMPUTED, and reading it
+        # back off a widget would let a drawing change mask a detection change.
+        self.assertEqual(ex.detect.size, T,
+                         "detection gate empty with plots collapsed")
+
+    def test_threshold_plot_is_exempt_from_collapsed_by_default(self):
+        """T28. count_w_plot carries the detection threshold band and, since
+        T15, the detection shading. Collapsing it by default put the primary
+        tuning control and its result one click away on open -- following T14
+        literally, and defeating the reason the panel is opened at all."""
+        ex, _ = self._explorer()
+        self._settle(ex)
+        self.assertFalse(ex.count_w_plot.is_collapsed(),
+                         "the threshold plot opened collapsed")
+        self.assertTrue(ex.count_plot.is_collapsed(),
+                        "T14 stopped applying to the other sweep plots")
+
+    def test_gate_reaches_the_plot_it_is_shaded_on(self):
+        """T15's wiring: the gate is computed (asserted above) AND published."""
+        ex, T = self._explorer()
+        self._settle(ex)
+        ex.count_w_plot.band_lo, ex.count_w_plot.band_hi = -1.0, float("inf")
+        ex._recompute_detect()
+        mask = ex.count_w_plot._detect_mask
+        self.assertIsNotNone(mask, "gate never reached count_w_plot")
+        self.assertEqual(mask.size, T)
+        self.assertTrue(mask.all(),
+                        "a wide-open band detected nothing; gate is not wired")
+
+    def test_badge_tracks_the_gate_across_a_seek(self):
+        """T16 at the explorer level: the badge follows the cursor, not just
+        the recompute. A badge that only updates on a band drag would sit stale
+        through an entire scrub."""
+        ex, T = self._explorer()
+        self._settle(ex)
+        ex.detect = np.zeros(T, np.float32)
+        ex.detect[T // 2] = 1.0
+        ex._apply_frame(T // 2)
+        self.assertTrue(ex.video_view._detected, "badge missed a positive frame")
+        ex._apply_frame(T // 2 + 1)
+        self.assertFalse(ex.video_view._detected, "badge stuck on after seeking")
 
     def test_unselected_channels_are_still_skipped(self):
         """The optimization must survive the fix -- otherwise T10 buys nothing."""

@@ -23,10 +23,10 @@ to the relevant section rather than restating it.
 | **T12** | Replicate tab: clicking a replicate should highlight + zoom to it; dragging its box should reposition it; right-click should delete it (that tab only). |
 | ~~**T13**~~ | ~~Per-block band power by channel draws black blocks when unpopulated — collapse those to checkbox height.~~ **FIXED** — see Batch D. |
 | ~~**T14**~~ | ~~All plots should collapse/expand via `[+]`, collapsed by default, and a collapsed plot must not render.~~ **FIXED** — see Batch D. |
-| **T27** | The four **detection-sweep** plots draw the same black slab T13 removed from the density plots when they have no series (visible on open, and in the no-replicate-selected view). T13 scoped only the per-channel heatmaps; the mechanism to fix this now exists (`set_auto_collapse_empty`) and is a two-line change. |
-| **T28** | Collapsed-by-default (T14) hides `count_w_plot`, which carries the **detection threshold band** — the primary tuning control. Following T14 literally is what the plan asked for, but the first thing a user needs on open is now one click away. Decide whether that one plot is exempt. |
-| **T15** | Replace the positive-detection graph with green bands overlaid on the windowed #-blocks-in-band plot. |
-| **T16** | On a detection, show a `DETECTED` badge (green bg, bold black) bottom-right of the viewer box — must survive the shift-held path. |
+| ~~**T27**~~ | ~~The four **detection-sweep** plots draw the same black slab T13 removed from the density plots.~~ **FIXED** — see Batch E. Not the two-line change this entry claimed: the mechanism lived on `DensityPlot` and is keyed on `matrix`, so it had to move up to `MiniPlot` behind an overridable `_is_empty()`. |
+| ~~**T28**~~ | ~~Collapsed-by-default (T14) hides `count_w_plot`, which carries the **detection threshold band**.~~ **RESOLVED: exempt** — see Batch E. T15 settled it, by putting the detection readout on that same plot. |
+| ~~**T15**~~ | ~~Replace the positive-detection graph with green bands overlaid on the windowed #-blocks-in-band plot.~~ **FIXED** — see Batch E. |
+| ~~**T16**~~ | ~~On a detection, show a `DETECTED` badge (green bg, bold black) bottom-right of the viewer box.~~ **FIXED** — see Batch E; the shift-held exemption is pinned by a pixel test. |
 | ~~**T17**~~ | ~~Whole-video processing resets the detection threshold bands when navigating.~~ **FIXED** — see Batch F. |
 | ~~**T18**~~ | ~~"Process whole video" computes every channel regardless of the selected one.~~ **FIXED** — see Batch F. |
 | **T20** | Drop the replicate dropdown — redundant with click navigation. |
@@ -115,6 +115,7 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 15. Decodable frame count | claim vs measurement, and why a tolerance is not a fix |
 | 16. Clip-backed throughput | why the 25x decode win is 1.06x end to end, and where it may still be real |
 | 17. Plot collapse | the 3.2x, why it does not scale with block size, and the detector the collapse nearly disarmed |
+| 18. Detection readout | why the gate moved onto the band's own plot, the 1 px floor, and the badge's shift-peek exemption |
 
 ---
 
@@ -173,10 +174,29 @@ skipping a detection quantity is exactly the failure above.
 
 **Two follow-ups it surfaced: T27 and T28.**
 
-### Batch E — detection readout (T15, T16) · `scalogram_explorer` + `video_panel`
-Replace the separate positive-detection plot with green bands overlaid on the
-windowed-#-blocks-in-band plot. Add a `DETECTED` badge (green bg, bold black) in
-the viewer box's bottom-right that survives the shift-held path.
+### Batch E — detection readout (T15, T16, T27, T28) · **CLOSED**
+All four landed. Full write-up in `FINDINGS.md` §18; what matters here:
+
+**The gate is now owned by the explorer (`ScalogramExplorer.detect`), not by a
+widget.** The old code's only copy lived in `detect_plot.y`, so a change to a
+*drawing* could change what the detection *is* — the Batch D failure in a second
+form. `_set_detect` publishes it to its two pictures (the shading, the badge),
+and the regression test asserts the array, not either picture.
+
+**Three traps, all silent-false-negative or false-positive shaped.** A
+single-frame detection is 0.03 px wide over a 14k clip and rounds away to
+"clean" without the 1 px floor. A mask held across a `set_series` shades the new
+replicate with the previous one's detections — the rarer *invents-events*
+direction. And a run touching the final frame is dropped by a naive edge diff.
+
+**T27 was not the two-line change this plan claimed** — `set_auto_collapse_empty`
+lived on `DensityPlot` and keyed on `matrix`, while the sweep plots carry a
+series. Same hazard the Order section warns about: the mechanism was not in the
+class the item assumed.
+
+**The file-locality line was right this time** (`scalogram_explorer` +
+`video_panel`), but only because `MiniPlot` had already been found and moved in
+Batch D. E's real work still landed in `speed_explorer`.
 
 ### Batch F — whole-video correctness (~~T17~~, T18) · `scalogram_explorer` + `tensor_channels`
 T18 remains; **T17 is landed**. The file locality moved — neither fix was where
@@ -553,7 +573,8 @@ produces either avoidance or silent degradation.
 
 ## 6. Order
 
-**I → J → O → D all landed.** E/F/G/H remain, as day-to-day use demands.
+**I → J → O → D → E all landed.** G/H remain (F is down to its own note), as
+day-to-day use demands. **G is next.**
 
 **What O changed about the ordering.** It was justified as unblocking I's ~25x
 decode win on the primary test video. It did unblock the cut — but the win it
@@ -569,13 +590,10 @@ N=8**, where §14's suspected memory-bandwidth ceiling and 8-way decode contenti
 interact. Single-process says 1.06x; the multi-worker case is untested and is the
 configuration that actually runs a corpus.
 
-**D is closed.** E (interactive polish) lives in
-`gui/explorers/scalogram_explorer.py`, the widget inside **tab 2 · Preprocessing
-(live)**, not the shelved flow-cache tab — and E now has a natural pairing with
-**T28**, since both concern what the detection readout looks like on open. T18
-is already landed, so F is down to nothing but its own note.
+**D and E are closed.** T18 is already landed, so F is down to nothing but its
+own note.
 
-**One thing D showed that applies to E, G and H.** This batch's stated file
+**One thing D showed that applies to G and H.** That batch's stated file
 locality was wrong — the class it had to change lived in a file the spec did not
 name. The remaining GUI batches inherit the same hazard, because these explorers
 share a base-class layer (`MiniPlot`, `FrameView`, `video_panel`) that the

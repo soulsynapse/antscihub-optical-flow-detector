@@ -59,7 +59,6 @@ from gui.explorers.speed_explorer import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
 
 EPS = 1e-6
 SWEEP_C = QColor(110, 230, 120)      # in-band count / clump
-DETECT_C = QColor(120, 255, 140)     # binary detection gate
 
 # Channel -> (attribute, overlay colormap). All are nonnegative energies except
 # cached speed; the scalogram cares only about their temporal fluctuation, so the
@@ -291,6 +290,9 @@ class ScalogramExplorer(QWidget):
         self._phase = "starting…"
         self.frame = int(state.current_frame) if state is not None else 0
         self.playing = False
+        # Per-frame detection gate. Owned here rather than read back off a plot
+        # so that removing or collapsing a readout cannot change the detection.
+        self.detect: np.ndarray = np.zeros(0, np.float32)
         self._overlay_peek_hidden = False
         self._render_frac = (0.0, 0.0, 1.0, 1.0)
         self._ov_scale = EPS       # replaced by a real percentile in _rebuild
@@ -502,8 +504,7 @@ class ScalogramExplorer(QWidget):
 
     def _all_plots(self):
         return [self.trace_plot, self.scalo_plot, *self.density_plots.values(),
-                self.count_plot, self.count_w_plot, self.detect_plot,
-                self.clump_plot]
+                self.count_plot, self.count_w_plot, self.clump_plot]
 
     # -- UI ------------------------------------------------------------------
     def _build_ui(self):
@@ -667,7 +668,13 @@ class ScalogramExplorer(QWidget):
                                        color=SWEEP_C)
         self.count_plot.seek_requested.connect(self._seek)
         col.addWidget(self.count_plot)
-        self.count_w_plot = MiniPlot("windowed # blocks in band (mean over D)",
+        # T15: the detection gate is shaded onto this plot rather than drawn as
+        # a separate 0/1 trace. The gate is read against THIS plot's band, so
+        # the threshold and its consequence now share one set of axes; a
+        # separate plot forced the eye to correlate two x-axes to see whether a
+        # handle drag had done anything.
+        self.count_w_plot = MiniPlot("windowed # blocks in band (mean over D)"
+                                     " -- green = positive detection",
                                      "blocks", SWEEP_C)
         self.count_w_plot.seek_requested.connect(self._seek)
         self.count_w_plot.set_band_active(True)
@@ -675,10 +682,6 @@ class ScalogramExplorer(QWidget):
         self.count_w_plot.band_changed.connect(self._recompute_detect)
         self.count_w_plot.band_committed.connect(self._recompute_detect)
         col.addWidget(self.count_w_plot)
-        self.detect_plot = MiniPlot("positive detection (windowed count in band)",
-                                    "0/1", DETECT_C)
-        self.detect_plot.seek_requested.connect(self._seek)
-        col.addWidget(self.detect_plot)
         self.clump_plot = PixelBarPlot("largest connected clump in band",
                                        unit="blocks", color=SWEEP_C)
         self.clump_plot.seek_requested.connect(self._seek)
@@ -699,6 +702,17 @@ class ScalogramExplorer(QWidget):
             pl.collapse_toggled.connect(self._on_plot_expanded)
         for dp in self.density_plots.values():
             dp.set_auto_collapse_empty(True)
+        # T27: the sweep plots drew the same empty black slab T13 removed from
+        # the heatmaps -- visible on open and whenever no replicate is selected.
+        for pl in (self.count_plot, self.count_w_plot, self.clump_plot):
+            pl.set_auto_collapse_empty(True)
+        # T28: count_w_plot is exempt from collapsed-by-default. It carries the
+        # detection threshold band AND (since T15) the detection readout, so
+        # collapsing it hides both the primary tuning control and its result
+        # behind a click on the one panel whose purpose is to show them. The
+        # auto-collapse above still applies: with no data there is nothing to
+        # tune against, and it opens itself when a series arrives.
+        self.count_w_plot.set_collapsed(False)
 
         self._apply_selected_plot_ui()
         self._sync_labels()
@@ -1025,8 +1039,9 @@ class ScalogramExplorer(QWidget):
         dp = self._selected_density()
         m = dp.matrix if dp is not None else None
         if m is None or m.size == 0:
-            for pl in (self.count_plot, self.count_w_plot, self.detect_plot):
+            for pl in (self.count_plot, self.count_w_plot):
                 pl.set_series(np.zeros(0, np.float32))
+            self._set_detect(np.zeros(0, np.float32))
             return
         lo, hi = dp.band()
         count = inband_count(m, lo, hi)
@@ -1050,9 +1065,25 @@ class ScalogramExplorer(QWidget):
     def _recompute_detect(self):
         blo, bhi = self.count_w_plot.band()
         y = self.count_w_plot.y
-        self.detect_plot.set_series(
-            detect_gate(y, blo, bhi) if y.size else np.zeros(0, np.float32))
-        self.detect_plot.set_cursor(self.frame)
+        self._set_detect(detect_gate(y, blo, bhi) if y.size
+                         else np.zeros(0, np.float32))
+
+    def _set_detect(self, gate: np.ndarray) -> None:
+        """Publish the detection gate to its two consumers.
+
+        The gate is computed unconditionally, whatever is collapsed or hidden --
+        it is a detection quantity, and per Batch D visibility decides what is
+        drawn, never what is computed. Both consumers here are pictures of it.
+        """
+        self.detect = np.asarray(gate, np.float32)
+        self.count_w_plot.set_detect_mask(self.detect > 0)
+        self._sync_detect_badge()
+
+    def _sync_detect_badge(self) -> None:
+        """T16: the DETECTED badge tracks the gate at the current frame."""
+        d = self.detect
+        on = bool(d.size and 0 <= self.frame < d.size and d[self.frame] > 0)
+        self.video_view.set_detected(on)
 
     def _recompute_clump(self):
         """Largest connected in-band clump per frame for the selected channel
@@ -1212,6 +1243,7 @@ class ScalogramExplorer(QWidget):
             self.scrub.blockSignals(False)
         for pl in self._all_plots():
             pl.set_cursor(self.frame)
+        self._sync_detect_badge()
         self.time_lbl.setText(f"{self.frame/self.fps:.2f} s  (#{self.frame})")
         if self.isVisible():
             self._redraw_video()
