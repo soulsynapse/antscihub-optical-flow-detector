@@ -24,6 +24,7 @@ Contents:
 13. [File-level partitioning (T24)](#13-file-level-partitioning-t24-batch-j-second-slice)
 14. [N-worker throughput, and the node count](#14-n-worker-throughput)
 15. [The container frame count is not the decodable frame count](#15-the-container-frame-count-is-not-the-decodable-frame-count)
+16. [Clip-backed throughput: the 25x decode win is ~1.06x end to end](#16-clip-backed-throughput-the-25x-decode-win-is-106x-end-to-end)
 
 ---
 
@@ -968,21 +969,143 @@ One of four. So it cannot be dismissed as a quirk of one bad export, and it also
 cannot be handled by a blanket constant — whatever the fix is, it has to derive
 the count per file rather than assume a relationship between the two numbers.
 
-### What the fix has to respect (not yet implemented)
+### The fix (Batch O, landed)
 
 The honest framing is that **the container count is a claim and the pipeline
-treats it as a measurement.** A tolerance would be wrong twice over: it is a
-magic constant, and it would blind the guard to exactly the small re-timings it
-exists to catch.
+treated it as a measurement.** A tolerance would have been wrong twice over: it
+is a magic constant, and it would blind the guard to exactly the small
+re-timings it exists to catch. So the true count became a recorded fact instead.
 
-- **For the cut**, the true count is free: ffmpeg reports the frames it decoded
-  in the same pass, and `_pump_progress` already parses that stream. Comparing
-  the clip against *that* is exact, needs no extra decode, and would have passed
-  here. The manifest's `frame_count` should then record the true count, which
-  makes it authoritative for every later clip-backed pass.
-- **For the source path** there is no free answer: the only way to know how many
-  frames decode is to decode them. "Reached EOF" cannot be distinguished from
-  "stopped early" at read time — they are the same event — so the count has to
-  become a *recorded* fact (produced by the cut, or by a one-off counting pass)
-  carried in provenance, with the container's claim used only as an unverified
-  upper bound and marked as such in the result.
+`core/framecount.py` resolves a decodable-frame count from, best first, a Batch I
+manifest → a `.framecount.json` sidecar → the container's claim, and returns
+`verified` alongside the number. Every result records which was used.
+
+**The cut's guard was replaced, not adjusted.** It compared each clip's true
+count against the source's claim; it now checks two separate things, because one
+comparison could not see both failures:
+
+- **Re-timing** comes from ffmpeg's own `dup_frames`/`drop_frames` in the
+  `-progress` stream. This is strictly better than what it replaced, and not
+  merely equivalent: `frame=` counts frames **encoded**, so a `cfr` conversion
+  that duplicated frames reports its inflated length and the clip on disk agrees
+  with it. The old count comparison could not have caught the failure it was
+  written to catch. These counters are direct evidence.
+- **Truncation** compares each clip against ffmpeg's `frame=`. Both sides are now
+  measurements of the same quantity, so it is exact, and it passes on
+  `GX010047c2`.
+- **A cut that gave up part way** — found by review, and it is the one that
+  nearly went out. Dropping the claim comparison also dropped the only thing
+  separating *"the container over-claims by 20"* (fine) from *"ffmpeg died at
+  frame 5000 of 11328 and exited 0"* (catastrophic: the manifest would record
+  5000 as the source's true length, `resolve_frame_count` would return it as
+  **verified**, and 6308 unread frames would be reported examined-and-clear).
+
+**The discriminator is stderr, and it was measured rather than assumed.** On
+`GX010047c2`, `ffmpeg -loglevel error -i src -map 0:v:0 -f null -` emits **zero
+bytes of stderr and exits 0** while decoding 20 fewer frames than advertised.
+Those 20 packets are not decode *errors*; they are simply not decodable frames.
+A decode that genuinely fails part way does emit at that level. So *"came up
+short **and** said something"* is evidence of a real failure and provably does
+not fire on the legitimate case — where a tolerance on the size of the gap would
+be a magic constant and would blind the guard to the small re-timings it exists
+to catch.
+
+The general lesson, which is the one worth carrying: **a bare shortfall carries
+no information here.** Any guard keyed on the size of the gap is either the
+original bug (refuse the legitimate case) or the regression above (accept the
+fatal one). The signal has to come from somewhere other than the two counts.
+
+`PRETRANSCODE_VERSION` is **3**. This is a bump rather than an added field
+because `Manifest.frame_count` *changed meaning* — claim → measurement. A v2
+manifest's `frame_count` reads as a decodable count and is not one, and a field
+whose name survives a change of meaning is the T17 shape exactly.
+
+**On the source path, one thing was wrong beyond the denominator.** Fixing
+`available` alone was not enough: `run_video` passed the operator's raw `--frames`
+to the extractor, which sets its own `truncated` flag against what it was asked
+for. So `--start 11000 --frames 400` reported **"308 of 308 requested (100.0%)"
+and failed anyway**. Both halves have to be clamped against the same length or
+the guard contradicts itself in a single sentence. Measured, after: that pass now
+exits 0.
+
+**The remedy offered on a shortfall now depends on `verified`, and that is the
+load-bearing part of the batch.** Against an unverified denominator the guard
+points at `python -m cli.count_frames` — which *resolves* the ambiguity — and
+mentions the override second. Pointing at `--allow-truncated` to work around a
+false alarm is precisely how §12's warning comes true: tell someone to switch off
+a real guard and they leave it off. An unverified count is also recorded as a
+warning on a *clean* pass, because 100% coverage against an unmeasured
+denominator is a different claim from 100% against a measured one.
+
+**Counting costs a full decode and there is no way around it** — measured 1m36s
+on the 11 GB `GX010047c2`. That is why it is written to a sidecar and why the cut
+writes one as a byproduct: the cut decodes the whole source anyway, so it gets
+the number for free.
+
+**A synthetic fixture cannot test the real case, and this is named rather than
+papered over.** `testsrc` has no undecodable packets, so its claim and its true
+count always agree — which is exactly why the bug survived Batch I's test suite.
+The provenance logic is tested on stand-in files; the arithmetic is verified
+against real footage by hand (above).
+
+---
+
+## 16. Clip-backed throughput: the 25x decode win is ~1.06x end to end
+
+Batch O unblocked the cut on `GX010047c2`, which is what §14's missing
+clip-backed half was waiting on. Measured immediately afterwards, and the result
+is not what Batch I's framing predicts.
+
+Same video (7 replicates, 5312x2988), scale 1.0, `change` only, 2000 frames from
+frame 0, single process, `python -m cli.detect` with and without `--manifest`:
+
+| path | extract | throughput |
+|---|---|---|
+| source (live ROI crop) | 54.6 s | 36.6 fps |
+| pre-transcoded clips | 51.7 s | **38.7 fps** |
+
+**1.06x, against a decode measured at 25x faster in isolation (§10).** The
+decode win is real and is not the thing that was limiting the pass. Two reasons,
+both already in this file and neither previously joined up:
+
+- **Decode is already overlapped.** The producer thread (§2) hides decode behind
+  the math, so the pass only pays the part that does not fit underneath. The
+  span table shows this directly: `decode` reads 0.01 s / 0% on both paths,
+  because what it measures is the *blocking wait*, not the work.
+- **The pass is math-bound at scale 1.0**, and §14 already suspected memory
+  bandwidth: `tensor_blur` 53% + `tensor_products` 27% = 80% of the span, both
+  low-arithmetic-intensity passes over large arrays. Removing 92% of the decoded
+  pixels does not touch either.
+
+**This does not retire the pre-transcode**, and it is not evidence the cut was
+not worth building. What it retires is Batch I's headline claim as stated in
+`todo.md` — *"the only lever that moves the decode floor"* is true and is no
+longer the interesting sentence, because at scale 1.0 on this footage **decode is
+not the floor**. §1's "decode-bound vs math-bound" split is footage- and
+scale-dependent, and Batch K moved this workload across it by making scale 1.0
+the default. The cut's value now rests on the cases it still plainly wins:
+storage-local working sets, machines where the source is on slow or remote disk,
+and any future pass at a smaller scale where math shrinks and decode does not.
+
+**Untested, and the case most likely to differ: N-worker.** §14's ceiling is 8
+workers on a 32-core box with a suspected memory-bandwidth wall. Eight processes
+each decoding a full 5.3K frame contend for exactly that resource, so the clip
+win may be substantially larger in the configuration that actually runs a corpus
+than in the single-process one measured here. **Hypothesis, not measured** — the
+honest reading of the table above is "single process only".
+
+### Clip-backed and source-backed detections agreed exactly
+
+Worth recording because it is the first end-to-end check of the thing §10 could
+only reason about. Same params, both paths, `change` at crf 12:
+
+| window | source | clips |
+|---|---|---|
+| 2000 frames from 0 | 14000 detected frames | **14000** |
+| 308 frames from 11000 | 2156 | **2156** |
+
+§10 measured a per-channel sensitivity table and declined to say whether any
+given *behaviour* survives the quality setting. On this footage, at these tuned
+thresholds, it does — exactly. That is one video and one parameter set, so it is
+not a general result about crf 12, but it is a real one and it is the first
+evidence in either direction.

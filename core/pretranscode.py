@@ -91,7 +91,16 @@ from core.replicates import build_layout, geometry_hash, validate_replicates
 # necessarily frame-aligned with its source, and provenance_key carries this
 # field precisely so old and new cuts cannot compare as equal. Old manifests are
 # refused by read_manifest, which is the intended outcome: re-cut.
-PRETRANSCODE_VERSION = 2
+#
+# 3: `frame_count` changed meaning. It was the container's claimed length; it is
+# now the count ffmpeg measured while cutting, with the claim moved to
+# `container_frame_count`. This is a bump and not an additive field because a
+# version-2 manifest's `frame_count` reads as a decodable count and is not one --
+# on GX010047c2 it would be 20 frames long, and every consumer that trusts it
+# (resolve_frame_count most of all) would size a coverage denominator against a
+# number nobody measured. A field whose NAME survives a change of meaning is
+# exactly the T17 shape: tuned state that quietly stops meaning what it meant.
+PRETRANSCODE_VERSION = 3
 MANIFEST_SUFFIX = ".pretranscode.json"
 
 # The pipeline reads luma and discards chroma, so encoding gray is free
@@ -222,6 +231,12 @@ class Manifest:
     # reconstruct the exact rate rather than inheriting someone's rounding.
     fps_num: int
     fps_den: int
+    # The DECODABLE frame count, measured by ffmpeg during the cut -- not the
+    # container's claim, which is `container_frame_count` below. On GX010047c2
+    # these differ by 20 and the difference is real: the source holds packets
+    # that do not decode. Because the cut has to decode the whole source anyway,
+    # this is the one place in the project where the true count is free, which is
+    # what makes a manifest the best available answer for `resolve_frame_count`.
     frame_count: int
     geometry_hash: str
     # The scale this project would have resolved, and the rule that produced it.
@@ -240,6 +255,13 @@ class Manifest:
     # rather than re-deriving it -- and so a future preset cannot quietly change
     # what an old manifest claimed.
     quality_rms: float
+    # The container's CLAIM about its own length, kept only so a consumer can see
+    # the discrepancy rather than having to rediscover it. Never used as a
+    # denominator anywhere: `frame_count` is the measurement. Sits here rather
+    # than beside `frame_count` purely because a defaulted dataclass field cannot
+    # precede an undefaulted one, and it is defaulted so a hand-built Manifest in
+    # a test need not supply a number it does not care about.
+    container_frame_count: int = 0
     clips: tuple[ClipEntry, ...] = field(default_factory=tuple)
 
     @property
@@ -277,6 +299,7 @@ class Manifest:
             lossless=bool(d["lossless"]),
             quality=str(d["quality"]),
             quality_rms=float(d["quality_rms"]),
+            container_frame_count=int(d.get("container_frame_count", 0)),
             clips=tuple(ClipEntry.from_meta(c) for c in d.get("clips", ())),
         )
 
@@ -528,7 +551,10 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
         raise PretranscodeError(f"no such video: {video_path}")
     os.makedirs(out_dir, exist_ok=True)
 
-    w, h, fps_num, fps_den, frame_count = probe_source(video_path)
+    # `container_frames` is the container's CLAIM and is named to say so. It is
+    # used for the progress denominator and recorded as an upper bound; the
+    # authoritative length is what ffmpeg reports having written, below.
+    w, h, fps_num, fps_den, container_frames = probe_source(video_path)
     # block_size does not affect the pixels written; build_layout is used purely
     # for its source_box rounding, so a clip's crop is identical to the box the
     # live path would have read. Passing scale 1.0 keeps work_* == box size.
@@ -553,8 +579,8 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
     frame_progress = (None if progress is None
                       else (lambda f: progress(0.98 * f)))
     try:
-        err_lines = _pump_progress(proc, frame_count, frame_progress,
-                                   should_cancel)
+        err_lines, stats = _pump_progress(proc, container_frames, frame_progress,
+                                          should_cancel)
     except BaseException:
         _kill(proc)
         _cleanup(out_paths)
@@ -569,24 +595,90 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
         _cleanup(out_paths)
         raise PretranscodeError(f"ffmpeg wrote no clip for {missing}")
 
-    # Every clip must hold exactly as many frames as the source. This is the one
-    # check that catches a frame-rate conversion having quietly re-timed the cut:
-    # with -fps_mode passthrough it should be unreachable, but the consequence of
-    # being wrong (clip frame N is no longer source frame N, so every later seek
-    # lands in the wrong place) is silent and unbounded, so it is verified rather
-    # than assumed. Both counts come from the same CAP_PROP_FRAME_COUNT
-    # estimator, so they are comparable even where that estimator is approximate.
-    # Paid once per cut, against a transcode measured in minutes.
+    # The invariant to protect is *clip frame N is source frame N*, and it is
+    # checked in two parts because one comparison cannot see both failures.
+    #
+    # This used to be a single check of each clip against the SOURCE'S FRAME
+    # COUNT, with a comment asserting the two numbers were the same quantity.
+    # They are not, and that was the bug (FINDINGS.md section 15): OpenCV returns
+    # the container's claim for an H.264/MP4 source and the true count for a
+    # transcoded Matroska clip, so the cut compared a claim against a measurement
+    # and refused GX010047c2 -- whose source genuinely holds 20 packets that do
+    # not decode -- for a defect that was not in the cut. The cut was in fact
+    # frame-accurate, verified pixel-wise whole-file.
+    #
+    # (a) RE-TIMING, from ffmpeg's own dup/drop counters. These are direct
+    #     evidence. Note that the old count comparison could not have caught this
+    #     anyway: `frame=` counts frames ENCODED, so a cfr conversion that
+    #     duplicated frames reports its inflated length and the clip on disk
+    #     agrees with it. With -fps_mode passthrough both should be 0.
+    if stats.retimed:
+        _cleanup(out_paths)
+        raise PretranscodeError(
+            f"ffmpeg duplicated {stats.dup} and dropped {stats.drop} frame(s) "
+            "while cutting; the stream was re-timed, so clip frame N is no "
+            "longer source frame N and every later seek would land in the "
+            "wrong place")
+    if stats.frames is None:
+        _cleanup(out_paths)
+        raise PretranscodeError(
+            "ffmpeg reported no frame count for the cut, so clip length cannot "
+            "be verified; refusing to write a manifest that would be trusted")
+    decoded_frames = int(stats.frames)
+    if decoded_frames <= 0:
+        _cleanup(out_paths)
+        raise PretranscodeError(f"the cut decoded no frames from {video_path}")
+
+    # (a2) A CUT THAT GAVE UP PART WAY. Dropping the old claim comparison also
+    #      dropped the only thing standing between "the container over-claims by
+    #      20 frames" (fine, and the case this batch exists to allow) and
+    #      "ffmpeg died at frame 5000 of 11328 and exited 0" (catastrophic: the
+    #      manifest would record 5000 as the source's true length, and
+    #      resolve_frame_count would hand that to the coverage guard as VERIFIED,
+    #      so 6308 frames would be reported examined-and-clear having never been
+    #      read). A shortfall alone cannot separate them -- that is exactly the
+    #      claim-vs-measurement confusion this batch removed.
+    #
+    #      stderr does separate them, and this was measured rather than assumed.
+    #      On GX010047c2, whose container over-claims by 20, ffmpeg at
+    #      -loglevel error emits ZERO bytes and exits 0: those packets are not
+    #      decode errors, they are simply not decodable frames. A decode that
+    #      actually fails part way does emit at that level. So "came up short AND
+    #      said something" is evidence of a real failure, and it provably does
+    #      not fire on the legitimate case.
+    #
+    #      Note this is deliberately not a tolerance on the size of the gap: a
+    #      tolerance is a magic constant and would blind the guard to the small
+    #      re-timings it exists to catch (FINDINGS.md section 15).
+    if decoded_frames < container_frames and err_lines:
+        _cleanup(out_paths)
+        raise PretranscodeError(
+            f"the cut decoded {decoded_frames} of the {container_frames} frames "
+            f"{os.path.basename(video_path)} advertises AND ffmpeg reported "
+            f"errors: {''.join(err_lines).strip()[:300]}. A source can legitimately "
+            "advertise packets that do not decode, but not while also failing -- "
+            "so this is a short decode, and recording it as the source's true "
+            "length would make every later pass report unread frames as "
+            "examined-and-clear")
+
+    # A clean shortfall is the legitimate case and is recorded, not refused. It
+    # is surfaced through the manifest (`container_frame_count` vs
+    # `frame_count`), never absorbed.
+
+    # (b) TRUNCATION, from each clip against what ffmpeg says it wrote. Both
+    #     sides are now measurements of the same quantity, so this is exact --
+    #     it catches a clip cut short by a crash or a full disk, which is the
+    #     failure that survives (a). It would have passed on GX010047c2.
     clip_frames = []
     for p in out_paths:
         n_clip = _clip_frame_count(p)
-        if n_clip != frame_count:
+        if n_clip != decoded_frames:
             _cleanup(out_paths)
             raise PretranscodeError(
-                f"{os.path.basename(p)} holds {n_clip} frames but the source "
-                f"has {frame_count}; the cut re-timed the stream, so clip frame "
-                "N is no longer source frame N and every later seek would land "
-                "in the wrong place")
+                f"{os.path.basename(p)} holds {n_clip} frames but the cut wrote "
+                f"{decoded_frames}; the clip is short, so any pass over it would "
+                "report frames past the cut as examined-and-clear when they were "
+                "never examined")
         clip_frames.append(n_clip)
 
     man = Manifest(
@@ -604,7 +696,8 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
             else (lambda f: progress(0.98 + 0.02 * f))),
         quick_sig=quick_signature(video_path),
         src_width=w, src_height=h,
-        fps_num=fps_num, fps_den=fps_den, frame_count=frame_count,
+        fps_num=fps_num, fps_den=fps_den, frame_count=decoded_frames,
+        container_frame_count=container_frames,
         geometry_hash=geometry_hash(replicates),
         resolved_scale=float(resolved_scale),
         scale_rule=str(scale_rule),
@@ -620,13 +713,64 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
             for t, p, nf in zip(layout.tiles, out_paths, clip_frames)),
     )
     write_manifest(man, manifest_path_for(video_path, out_dir))
+
+    # Also record the measured count beside the SOURCE, not just in the manifest.
+    # The cut is the only place this number is free, and a later source-path run
+    # that is not given --manifest would otherwise be told to spend a full
+    # counting decode on an answer already in hand. Imported here rather than at
+    # module scope because core.framecount imports this module's ffmpeg plumbing;
+    # the cycle is real and a function-level import is the smaller price than
+    # splitting four helpers into a third module.
+    #
+    # Best-effort on purpose: a read-only footage directory is normal, and
+    # failing a finished multi-minute transcode over an optional cache entry
+    # would be a worse outcome than not having it.
+    try:
+        from core.framecount import build_record, write_record
+        write_record(build_record(video_path,
+                                  container_frames=container_frames,
+                                  decoded_frames=decoded_frames,
+                                  method="pretranscode-cut"))
+    except OSError:
+        pass
+
     if progress is not None:
         progress(1.0)
     return man
 
 
-def _pump_progress(proc, frame_count: int, progress, should_cancel) -> list[str]:
-    """Drain stdout for progress while a thread drains stderr. Returns stderr lines.
+@dataclass
+class FFmpegStats:
+    """What ffmpeg's ``-progress`` stream said about the run.
+
+    ``frames`` is the number of frames written to the first video output --
+    ffmpeg's own count, and the only *measurement* of length available anywhere
+    in this module. Everything else (``CAP_PROP_FRAME_COUNT`` on the source) is
+    the container's claim; ``FINDINGS.md`` section 15 is the batch that was spent
+    learning the difference. ``None`` means the stream never reported one.
+
+    ``dup``/``drop`` are the re-timing signal and are why the frame comparison
+    they replaced is no longer needed. FFmpeg's default ``cfr`` output mode
+    duplicates or drops frames to force a constant rate, which would break *clip
+    frame N is source frame N*, the invariant every seek here rests on. Comparing
+    counts could not catch that anyway: ``frame=`` counts frames *encoded*, so a
+    duplicated stream reports its inflated length and the clip on disk agrees
+    with it. These two counters are direct evidence rather than inference.
+    """
+    frames: int | None = None
+    dup: int = 0
+    drop: int = 0
+
+    @property
+    def retimed(self) -> bool:
+        return bool(self.dup or self.drop)
+
+
+def _pump_progress(proc, frame_count: int, progress,
+                   should_cancel) -> tuple[list[str], FFmpegStats]:
+    """Drain stdout for progress while a thread drains stderr.
+
+    Returns ``(stderr_lines, stats)``.
 
     **Both pipes must be drained concurrently.** ffmpeg writes progress to stdout
     and diagnostics to stderr; reading only stdout and deferring stderr until the
@@ -636,9 +780,16 @@ def _pump_progress(proc, frame_count: int, progress, should_cancel) -> list[str]
     mid-stream decode failures as a live concern, and an error-per-frame stream
     crosses 64 KB in seconds. It would hang the multi-minute whole-source runs
     this module exists for while never reproducing on a short test clip.
+
+    The progress fields are parsed unconditionally, not only when ``progress`` is
+    set: the last ``frame=`` is the run's true output length and a caller that
+    wanted no progress bar still needs it. ``frame_count`` remains only the
+    denominator for the reported fraction, and it may be 0 (a caller with no
+    estimate), in which case no fraction is reported and the counting still works.
     """
-    total = max(1, int(frame_count))
+    total = int(frame_count)
     err: list[str] = []
+    stats = FFmpegStats()
     pump = None
     if proc.stderr is not None:
         pump = threading.Thread(target=lambda: err.extend(proc.stderr),
@@ -648,15 +799,35 @@ def _pump_progress(proc, frame_count: int, progress, should_cancel) -> list[str]
         for line in proc.stdout:
             if should_cancel is not None and should_cancel():
                 raise PretranscodeCancelled("pre-transcode cancelled")
-            if progress is not None and line.startswith("frame="):
-                try:
-                    progress(min(1.0, int(line.split("=", 1)[1]) / total))
-                except ValueError:
-                    pass
+            key, sep, val = line.partition("=")
+            if not sep:
+                continue
+            key, val = key.strip(), val.strip()
+            if key not in ("frame", "dup_frames", "drop_frames"):
+                continue
+            # The try covers the PARSE only. ffmpeg writes "N/A" for fields it
+            # cannot fill yet, and skipping such a line is right -- letting it
+            # abort the pump would lose the stderr drain and reintroduce the
+            # deadlock this function exists to avoid. But the progress callback
+            # is the caller's code, and wrapping it here would silently discard a
+            # ValueError raised inside it, leaving a frozen bar and no
+            # diagnostic. Its exceptions belong to the caller.
+            try:
+                num = int(val)
+            except ValueError:
+                continue
+            if key == "frame":
+                stats.frames = num
+                if progress is not None and total > 0:
+                    progress(min(1.0, num / total))
+            elif key == "dup_frames":
+                stats.dup = num
+            else:
+                stats.drop = num
     proc.wait()
     if pump is not None:
         pump.join(timeout=10)
-    return err
+    return err, stats
 
 
 def _kill(proc) -> None:

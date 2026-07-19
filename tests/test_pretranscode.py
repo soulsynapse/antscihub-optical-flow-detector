@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import unittest
+import unittest.mock
 
 import numpy as np
 
@@ -223,6 +224,10 @@ class TestProgressParsing(unittest.TestCase):
         pt._pump_progress(_FakeProc(lines), total, seen.append, cancel)
         return seen
 
+    def _stats(self, lines, total=100):
+        _, stats = pt._pump_progress(_FakeProc(lines), total, None, None)
+        return stats
+
     def test_frame_lines_become_fractions(self):
         self.assertEqual(self._run(["frame=25\n", "frame=50\n"]), [0.25, 0.5])
 
@@ -239,8 +244,15 @@ class TestProgressParsing(unittest.TestCase):
         """Reported frames can exceed a container's advertised count."""
         self.assertEqual(self._run(["frame=250\n"], total=100), [1.0])
 
-    def test_zero_frame_count_does_not_divide_by_zero(self):
-        self.assertEqual(self._run(["frame=5\n"], total=0), [1.0])
+    def test_zero_total_reports_no_fraction_but_still_counts(self):
+        """A caller with no length estimate (core.framecount) passes total=0.
+
+        There is no denominator to divide by, so no fraction is reported -- but
+        the counting must keep working, because the count is the entire reason
+        that caller runs at all.
+        """
+        self.assertEqual(self._run(["frame=5\n"], total=0), [])
+        self.assertEqual(self._stats(["frame=5\n"], total=0).frames, 5)
 
     def test_cancel_raises_before_consuming_the_rest(self):
         with self.assertRaises(pt.PretranscodeCancelled):
@@ -249,9 +261,41 @@ class TestProgressParsing(unittest.TestCase):
     def test_stderr_is_drained_and_returned(self):
         """It must be drained concurrently or a full pipe buffer deadlocks."""
         proc = _FakeProc(["frame=1\n"], err=["boom\n", "bang\n"])
-        err = pt._pump_progress(proc, 10, None, None)
+        err, _ = pt._pump_progress(proc, 10, None, None)
         self.assertEqual("".join(err), "boom\nbang\n")
         self.assertTrue(proc.waited)
+
+    # -- the stats half (Batch O) --------------------------------------------
+
+    def test_last_frame_value_is_the_measured_length(self):
+        """Not the max, not the first: ffmpeg's counter only ever advances, and
+        the final block is what the run actually wrote."""
+        self.assertEqual(
+            self._stats(["frame=10\n", "frame=90\n", "progress=end\n"]).frames,
+            90)
+
+    def test_frames_is_none_when_nothing_was_reported(self):
+        """Distinct from 0. A run that wrote zero frames and a run whose progress
+        stream was never understood are different failures, and the cut refuses
+        to write a manifest in either case rather than recording a length it did
+        not measure."""
+        self.assertIsNone(self._stats(["progress=end\n"]).frames)
+
+    def test_dup_and_drop_are_the_retiming_signal(self):
+        clean = self._stats(["frame=5\n", "dup_frames=0\n", "drop_frames=0\n"])
+        self.assertFalse(clean.retimed)
+        duped = self._stats(["frame=5\n", "dup_frames=3\n", "drop_frames=0\n"])
+        self.assertTrue(duped.retimed)
+        self.assertEqual((duped.dup, duped.drop), (3, 0))
+        dropped = self._stats(["frame=5\n", "dup_frames=0\n", "drop_frames=2\n"])
+        self.assertTrue(dropped.retimed)
+
+    def test_na_values_do_not_abort_the_pump(self):
+        """ffmpeg writes N/A for fields it cannot fill yet. Aborting on one would
+        stop draining stderr, reintroducing the pipe-buffer deadlock."""
+        stats = self._stats(["dup_frames=N/A\n", "frame=N/A\n", "frame=7\n",
+                             "drop_frames=N/A\n"])
+        self.assertEqual((stats.frames, stats.dup, stats.drop), (7, 0, 0))
 
 
 @requires_ffmpeg
@@ -272,6 +316,88 @@ class TestEndToEnd(unittest.TestCase):
         for c in man.clips:
             self.assertTrue(os.path.isfile(os.path.join(self.out, c.filename)))
         self.assertTrue(os.path.isfile(pt.manifest_path_for(self.src, self.out)))
+
+    # -- Batch O: the two halves of the replaced guard ------------------------
+
+    def _forced_stats(self, frames=None, dup=0, drop=0, err=()):
+        """Drive build_pretranscode's checks with a chosen progress result.
+
+        ffmpeg genuinely re-timing or genuinely dying part way cannot be provoked
+        on demand from a synthetic fixture, which is the same reason the original
+        bug survived Batch I's tests. Forcing the parsed result exercises the
+        branch that decides what to DO about it, which is what regressed.
+        """
+        real = pt._pump_progress
+
+        def fake(proc, total, progress, cancel):
+            _, stats = real(proc, total, progress, cancel)
+            if frames is not None:
+                stats.frames = frames
+            stats.dup, stats.drop = dup, drop
+            return list(err), stats
+        return unittest.mock.patch.object(pt, "_pump_progress", fake)
+
+    def test_retiming_is_refused_on_dup_or_drop(self):
+        with self._forced_stats(dup=3):
+            with self.assertRaises(pt.PretranscodeError) as cm:
+                pt.build_pretranscode(self.src, REPS, self.out)
+        self.assertIn("re-timed", str(cm.exception))
+
+    def _over_claiming_source(self, excess=20):
+        """Make the container advertise more frames than decode.
+
+        This is GX010047c2 exactly: the claim is inflated while the decode is
+        clean and complete. Patching the claim rather than the measured count
+        models the real file, and leaves check (b) -- clips against what ffmpeg
+        wrote -- agreeing, as it does on the real file.
+        """
+        real = pt.probe_source
+
+        def fake(path):
+            w, h, num, den, n = real(path)
+            return w, h, num, den, n + excess
+        return unittest.mock.patch.object(pt, "probe_source", fake)
+
+    def test_clean_over_claim_is_accepted_and_recorded(self):
+        """The legitimate case, and the whole reason a bare shortfall cannot be
+        the trigger -- refusing it is the bug this batch fixed. GX010047c2
+        over-claims by 20 while ffmpeg exits 0 with ZERO bytes of stderr,
+        measured rather than assumed."""
+        with self._over_claiming_source(20):
+            man = pt.build_pretranscode(self.src, REPS, self.out)
+        self.assertEqual(man.container_frame_count, man.frame_count + 20)
+        for c in man.clips:
+            self.assertEqual(c.frame_count, man.frame_count)
+
+    def test_short_cut_with_ffmpeg_errors_is_refused(self):
+        """The regression guard. A bare shortfall is legitimate (above), so the
+        discriminator is the stderr ffmpeg emits when it actually fails. Without
+        this, a decode dying at frame 5000 of 11328 and exiting 0 records 5000 as
+        the source's true length, which resolve_frame_count then hands to the
+        coverage guard as VERIFIED -- so 6308 unread frames are reported
+        examined-and-clear."""
+        with self._over_claiming_source(20), \
+                self._forced_stats(err=["Error while decoding stream\n"]):
+            with self.assertRaises(pt.PretranscodeError) as cm:
+                pt.build_pretranscode(self.src, REPS, self.out)
+        self.assertIn("short decode", str(cm.exception))
+        self.assertFalse(os.path.exists(pt.manifest_path_for(self.src, self.out)))
+
+    def test_frame_count_is_the_measurement_not_the_claim(self):
+        man = pt.build_pretranscode(self.src, REPS, self.out)
+        self.assertGreater(man.frame_count, 0)
+        for c in man.clips:
+            self.assertEqual(c.frame_count, man.frame_count)
+
+    def test_the_cut_writes_a_framecount_sidecar(self):
+        """The count is free here and nowhere else, so it is recorded beside the
+        source rather than only inside the manifest."""
+        from core import framecount as fcm
+        man = pt.build_pretranscode(self.src, REPS, self.out)
+        rec = fcm.load_sidecar(self.src)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.decoded_frames, man.frame_count)
+        self.assertEqual(rec.method, "pretranscode-cut")
 
     def test_manifest_round_trips_from_disk(self):
         man = pt.build_pretranscode(self.src, REPS, self.out)

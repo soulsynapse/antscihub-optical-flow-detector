@@ -44,6 +44,7 @@ import numpy as np
 from core.channel_source import LIVE_CHANNELS, live_channel_source
 from core.config import PipelineConfig
 from core.detection import DetectionResult, detect_channel_region
+from core.framecount import resolve_frame_count
 from core.replicates import validate_replicates
 from core.video import VideoSource
 
@@ -231,6 +232,15 @@ class BatchResult:
     # `requested_n is None` means "to the end". See core/shard.py's skip logic.
     start_frame: int = 0
     requested_n: int | None = None
+    # Where the denominator above came from, and whether anybody measured it.
+    # `requested_frames` is derived from a frame count, and a coverage of 100%
+    # means something different depending on whether that count was measured or
+    # merely claimed by the container (core/framecount.py). Defaulted to the
+    # honest worst case so a BatchResult built without one does not claim to be
+    # verified.
+    frame_count_source: str = "container"
+    frame_count_verified: bool = False
+    container_frames: int = 0
 
     @property
     def coverage(self) -> float:
@@ -251,6 +261,13 @@ class BatchResult:
                 "covered_frames": self.covered_frames,
                 "fraction": self.coverage,
                 "truncated": self.truncated,
+                # What the fraction above is a fraction OF. Without these, a
+                # "100% coverage" line is unfalsifiable: it could be measured
+                # against a decode-verified length or against a container claim
+                # that over-states the file by 20 frames.
+                "frame_count_source": self.frame_count_source,
+                "frame_count_verified": bool(self.frame_count_verified),
+                "container_frames": int(self.container_frames),
             },
             "timing": {"extract_seconds": round(self.extract_seconds, 3),
                        "detect_seconds": round(self.detect_seconds, 3)},
@@ -324,7 +341,13 @@ def run_video(video_path: str, replicates: list[dict], cfg: PipelineConfig,
     params = normalize_params(params)
     with VideoSource(video_path) as src:
         info = src.info
-        w, h, fps, fc = info.width, info.height, info.fps, info.frame_count
+        w, h, fps, claimed = info.width, info.height, info.fps, info.frame_count
+    # `claimed` is the container's number and is NOT the decodable length -- see
+    # core/framecount.py. It still goes to live_channel_source as the clip
+    # geometry, where an over-estimate is harmless (the decode simply ends), but
+    # it must never be the denominator the coverage guard divides by.
+    fcount = resolve_frame_count(video_path, claimed, manifest=manifest)
+    fc = fcount.count
     # Rejected here rather than allowed to produce an empty pass: a start past
     # the end would otherwise return a zero-length, zero-detection result that
     # is indistinguishable from "examined the whole video, found nothing".
@@ -333,24 +356,33 @@ def run_video(video_path: str, replicates: list[dict], cfg: PipelineConfig,
             f"--start {start} is outside {os.path.basename(video_path)}, "
             f"which has {fc} frames")
 
-    t0 = time.perf_counter()
-    cd = live_channel_source(
-        video_path, cfg, replicates, start=start, n=n,
-        width=w, height=h, fps=fps, frame_count=fc,
-        manifest=manifest, clip_dir=clip_dir,
-        channels=[params["channel_attr"]], progress=progress)
-    extract_s = time.perf_counter() - t0
-
     # What the file actually holds PAST THE OFFSET. Both terms matter and each
     # was wrong once: asking for more frames than exist is the end of the video
     # rather than a short decode (so the request is clamped), and a window that
     # starts at `start` can never deliver more than `fc - start` (so the offset
     # is subtracted even when n is None). Without the latter, every --start run
     # without an explicit --frames failed the truncation guard -- and failed
-    # only after paying for the whole extraction. Truncation is the decode
-    # delivering less than the file claims, which is cd.meta['truncated'].
+    # only after paying for the whole extraction.
     available = max(0, fc - start)
     requested = available if n is None else min(int(n), available)
+
+    # Resolved BEFORE the extraction, and the CLAMPED count is what goes down.
+    # The extractor sets its own `truncated` flag by comparing what it delivered
+    # against what it was asked for, so handing it the raw `n` makes that flag
+    # contradict the guard below: `--start 11000 --frames 400` over a video whose
+    # true end is 308 frames later reported "308 of 308 requested (100.0%)" and
+    # failed anyway, because the extractor had been asked for 400. Both halves
+    # must be clamped against the same length or the guard disagrees with itself.
+    t0 = time.perf_counter()
+    cd = live_channel_source(
+        video_path, cfg, replicates, start=start, n=requested,
+        width=w, height=h, fps=fps, frame_count=fc,
+        manifest=manifest, clip_dir=clip_dir,
+        channels=[params["channel_attr"]], progress=progress)
+    extract_s = time.perf_counter() - t0
+
+    # Truncation is now unambiguously "the decode delivered less than the file's
+    # measured length", not "less than an operator's over-generous request".
     covered = int(cd.n_frames)
     truncated = bool(cd.meta.get("truncated")) or covered < requested
     warnings: list[str] = []
@@ -359,9 +391,37 @@ def run_video(video_path: str, replicates: list[dict], cfg: PipelineConfig,
         msg = (f"decode covered {covered} of {requested} requested frames"
                f"{pct}; everything after frame "
                f"{start + covered} is UNEXAMINED, not clear")
+        # The remedy offered depends on whether anyone ever measured this file's
+        # length, and getting that wrong is how a guard dies. Against an
+        # UNVERIFIED denominator a shortfall is at least as likely to mean "the
+        # container over-claimed" as "the decode stopped early" -- one file in
+        # four in this corpus over-claims, GX010047c2 by 20 frames -- and the
+        # only remedy previously on offer was --allow-truncated. That is the flag
+        # section 12 names as the thing that "trains operators into habitual
+        # --allow-truncated and thereby disarms the guard": tell someone to
+        # switch off a real guard to work around a false alarm and they will
+        # leave it off. So an unverified shortfall points at the counting pass,
+        # which resolves the ambiguity instead of suppressing it, and mentions
+        # the override second.
         if not allow_truncated:
+            if not fcount.verified:
+                raise BatchError(
+                    msg + f" -- but nothing has measured how many frames "
+                    f"{os.path.basename(video_path)} actually decodes, so this "
+                    "may simply be the container over-claiming its length. Run "
+                    "`python -m cli.count_frames "
+                    f"{os.path.basename(video_path)}` to settle it; use "
+                    "allow_truncated only once you know the decode really did "
+                    "stop early")
             raise BatchError(msg + " -- pass allow_truncated to accept it")
         warnings.append(msg)
+    if not fcount.verified:
+        # Recorded even on a clean pass. A coverage figure of 100% against an
+        # unmeasured denominator is not the same claim as one against a measured
+        # one, and a consumer reading only the summary cannot otherwise tell.
+        warnings.append(
+            f"frame count is unverified (from the {fcount.source}); coverage is "
+            "measured against a claim, not a measurement")
 
     t1 = time.perf_counter()
     out: list[RegionDetection] = []
@@ -387,7 +447,10 @@ def run_video(video_path: str, replicates: list[dict], cfg: PipelineConfig,
                        extract_seconds=extract_s, detect_seconds=detect_s,
                        replicate_path=replicate_path, warnings=warnings,
                        start_frame=int(start),
-                       requested_n=None if n is None else int(n))
+                       requested_n=None if n is None else int(n),
+                       frame_count_source=fcount.source,
+                       frame_count_verified=fcount.verified,
+                       container_frames=int(fcount.container_frames))
 
 
 # -- output ------------------------------------------------------------------

@@ -33,6 +33,7 @@ from core.batch import (BatchError, BatchResult, load_params, load_replicates,
 from core.channel_source import live_channel_source
 from core.config import PipelineConfig
 from core.detection import detect_channel_region
+from core import framecount as fcm
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 requires_ffmpeg = unittest.skipUnless(HAS_FFMPEG, "ffmpeg not on PATH")
@@ -282,6 +283,61 @@ class BatchRunTest(unittest.TestCase):
         self.assertEqual(res.covered_frames, 12)
         self.assertTrue(any("UNEXAMINED" in w for w in res.warnings))
         self.assertTrue(res.to_summary()["coverage"]["truncated"])
+
+    # -- Batch O (T26): which number the coverage guard divides by -------------
+
+    def test_unverified_shortfall_points_at_the_counting_pass(self):
+        """The remedy offered must not be the flag that disarms the guard.
+
+        With nothing having measured the file, a shortfall is at least as likely
+        to be the container over-claiming (one file in four in this corpus) as a
+        decode stopping early. Offering only --allow-truncated to work around a
+        false alarm is how operators learn to pass it habitually, which is what
+        FINDINGS.md section 12 warns disarms the guard everywhere else.
+        """
+        with self._short_source():
+            with self.assertRaises(BatchError) as cm:
+                self._run()
+        msg = str(cm.exception)
+        self.assertIn("cli.count_frames", msg)
+        self.assertIn("over-claiming", msg)
+
+    def test_verified_shortfall_is_a_plain_truncation(self):
+        """Once the length IS measured, a shortfall means what the guard says it
+        means, and the override is the right thing to offer."""
+        fcm.write_record(fcm.build_record(
+            self.video, container_frames=32, decoded_frames=32))
+        self.addCleanup(os.remove, fcm.sidecar_path_for(self.video))
+        with self._short_source():
+            with self.assertRaises(BatchError) as cm:
+                self._run()
+        msg = str(cm.exception)
+        self.assertIn("allow_truncated", msg)
+        self.assertNotIn("cli.count_frames", msg)
+
+    def test_unverified_count_is_recorded_even_on_a_clean_pass(self):
+        """100% coverage against an unmeasured denominator is not the same claim
+        as 100% against a measured one, and the summary must say which."""
+        res = self._run()
+        cov = res.to_summary()["coverage"]
+        self.assertFalse(cov["frame_count_verified"])
+        self.assertEqual(cov["frame_count_source"], "container")
+        self.assertTrue(any("unverified" in w for w in res.warnings))
+
+    def test_a_sidecar_shortens_the_denominator(self):
+        """The whole fix, at this seam: a video whose container over-claims by 4
+        frames runs clean once the true length is recorded, where before it
+        failed the guard and could only be forced through with the override."""
+        fcm.write_record(fcm.build_record(
+            self.video, container_frames=32, decoded_frames=28))
+        self.addCleanup(os.remove, fcm.sidecar_path_for(self.video))
+        res = self._run()
+        self.assertFalse(res.truncated)
+        self.assertEqual(res.requested_frames, 28)
+        cov = res.to_summary()["coverage"]
+        self.assertTrue(cov["frame_count_verified"])
+        self.assertEqual(cov["frame_count_source"], "sidecar")
+        self.assertEqual(cov["container_frames"], 32)
 
     def test_summary_is_json_serializable_with_provenance(self):
         res = self._run()

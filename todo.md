@@ -32,7 +32,7 @@ to the relevant section rather than restating it.
 | **T22** | New **viewer tab** consuming a fully-processed video: detection/no-detection only, full-clip bar plus a ~1 min bar zoomed on the scrubber, and a hand-off back into preprocessing at the paused position *without* auto-triggering a pass. |
 | **T23** | **ROI pre-transcode**: cut each source once into per-replicate clips + manifest, so later passes decode ~1/16 the pixels. The only lever that moves the decode floor. |
 | ~~**T24**~~ | ~~**Headless batch driver**: no-GUI entry point, file-level partitioning, N-worker throughput.~~ **DONE** — all three slices landed; throughput measured in `FINDINGS.md` §14 (**~130 fps / 5.4x realtime, ceiling at 8 workers**). |
-| **T26** | **The container frame count is not the decodable frame count.** `GX010047c2` advertises 11328 frames and decodes 11308, which (a) fails the pre-transcode cut outright and (b) fails the headless truncation guard on any full-length pass — so Batch I is unusable on this video and Batch J needs `--allow-truncated`, the one habit that disarms the guard. Alignment is **not** affected (verified whole-file). Full diagnosis and fix constraints in `FINDINGS.md` §15. |
+| ~~**T26**~~ | ~~**The container frame count is not the decodable frame count.**~~ **FIXED** — see Batch O. The cut and a full-length headless pass both run clean on `GX010047c2` now; `FINDINGS.md` §15 records the fix, §16 the clip-backed throughput it unblocked. |
 
 ## 2. Standing decisions
 
@@ -109,6 +109,9 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 11. Per-channel extraction | the measured 1.59x (not the ~4x this plan asserted), and why the placeholder is zero-length |
 | 12. The headless path | per-video extraction, the two clocks, why truncation fails the job |
 | 13. File-level partitioning | the four silent ways a shard examines less than it claims; resume by identity, not existence |
+| 14. N-worker throughput | the ~130 fps / 8-worker ceiling and the node count to quote |
+| 15. Decodable frame count | claim vs measurement, and why a tolerance is not a fix |
+| 16. Clip-backed throughput | why the 25x decode win is 1.06x end to end, and where it may still be real |
 
 ---
 
@@ -251,6 +254,22 @@ decode, so the live path still pays full decode cost. Pre-transcoding makes the
 *stored file* small, so later decodes genuinely decode fewer pixels. It is the only
 thing that moves the ~3.8 s floor (`FINDINGS.md` §1).
 
+**That last sentence is true and is no longer the interesting one — see
+`FINDINGS.md` §16, measured once Batch O unblocked the cut on real footage.** The
+clip-backed pass is **1.06x** end to end (38.7 vs 36.6 fps), not the 25x the
+isolated decode measurement suggests, because the producer thread already
+overlaps decode and at scale 1.0 this workload is math-bound (`tensor_blur` 53% +
+`tensor_products` 27%). Moving the decode floor stopped mattering much when Batch
+K made scale 1.0 the default. The cut still wins on storage-local working sets,
+slow or remote source disk, and any future smaller-scale pass — and the N-worker
+case, where 8 processes contend for the memory bandwidth §14 suspects is the
+ceiling, is **untested and is where the win is most likely to be real**.
+
+Also from §16, and the first evidence either way: clip-backed and source-backed
+detections **agreed exactly** on this footage (14000/14000 over 2000 frames,
+2156/2156 over 308), so crf 12 did not move this behaviour at these thresholds.
+One video, one parameter set — not a general result about the quality setting.
+
 **Crop is lossless; scale is lossy — do only the crop by default.** Cropping
 discards pixels no replicate owns, so it cannot change any detection result and is
 safe unconditionally. Rescaling would bake a sensitivity decision into artifacts
@@ -350,22 +369,43 @@ for a 24 h turnaround above (`FINDINGS.md` §14), which is the figure to quote.
 Storage ~289 MB/h at block 64, rising to ~3.6 GB/h if block does not track scale.
 Either way a multi-hour clip wants chunked writes rather than one in-memory pass.
 
-### Batch O — decodable frame count (T26) · `core/pretranscode.py` + `core/batch.py`
-**Blocks Batch I on real footage** — the cut fails outright on `GX010047c2`, so
-no clip-backed run is possible on it and §14's clip-backed throughput half could
-not be measured. Diagnosis, the alignment verification that clears the cut of
-wrongdoing, and the fix constraints are all in `FINDINGS.md` §15. In short: the
-container's frame count is a *claim*, the decoder's is a *measurement*, and the
-code compares one to the other while asserting in a comment that they are the
-same quantity. A tolerance is not an acceptable fix — it is a magic constant and
-it would blind the guard to the small re-timings it exists to catch.
+### Batch O — decodable frame count (T26) · `core/framecount.py` + `pretranscode` + `batch`  ← **CLOSED**
+The container's frame count is a *claim*, the decoder's is a *measurement*, and
+two guards compared one to the other. Full write-up in `FINDINGS.md` §15; the
+operational summary:
 
-The cut half is cheap and clearly right (ffmpeg already reports frames decoded in
-the same pass; `_pump_progress` parses that stream). The source-path half is the
-design question: there is no free way to learn how many frames decode, "reached
-EOF" and "stopped early" are indistinguishable at read time, so the true count
-has to become a recorded, provenance-carried fact with the container's claim
-demoted to an explicitly-marked unverified upper bound.
+**`core/framecount.py`** resolves a decodable-frame count from, best first, a
+Batch I manifest → a `.framecount.json` sidecar → the container's claim, and
+returns `verified` alongside the number. `python -m cli.count_frames VIDEO...`
+writes the sidecar; the pre-transcode cut writes one as a byproduct, since it
+decodes the whole source anyway and gets the count for free. Counting costs a
+full decode — **1m36s measured on the 11 GB `GX010047c2`** — which is why it is
+recorded rather than re-derived, and why there is no cheaper design available.
+
+**The cut's guard was replaced, not adjusted.** Re-timing now comes from ffmpeg's
+`dup_frames`/`drop_frames`, which is strictly better than the count comparison it
+replaced — `frame=` counts frames *encoded*, so a `cfr` conversion reports its
+own inflated length and the clip agrees with it, meaning the old check could not
+have caught the failure it was written for. Truncation compares each clip against
+ffmpeg's `frame=`; both sides are now the same quantity. `PRETRANSCODE_VERSION`
+is **3**, a bump and not an added field because `Manifest.frame_count` changed
+meaning (claim → measurement) — a field whose *name* survives a change of meaning
+is the T17 shape exactly.
+
+**The source path had a second bug behind the first.** Fixing the denominator was
+not enough: `run_video` handed the operator's raw `--frames` to the extractor,
+which sets its own `truncated` flag against what it was asked for, so
+`--start 11000 --frames 400` reported *"308 of 308 requested (100.0%)"* and
+failed anyway. Both halves must be clamped against the same length.
+
+**The remedy on a shortfall now depends on `verified`, and that is the point of
+the batch.** Unverified → the error points at `cli.count_frames`, which resolves
+the ambiguity; verified → `--allow-truncated`, which is now an honest answer.
+Offering the override against a false alarm is exactly how §12's warning about
+habitual `--allow-truncated` comes true.
+
+**Measured after, on `GX010047c2`:** the cut runs clean (126 s, all 7 clips at
+11308), and the full-length headless pass exits 0 without the override.
 
 ### Batch L — quiet-tile gating (DEFERRED, design recorded) · `core/tensor_channels.py`
 Wanted, explicitly not now. Recorded so the reasoning is not re-derived. Becomes
@@ -464,12 +504,21 @@ produces either avoidance or silent degradation.
 
 ## 6. Order
 
-**I → J both landed. O is next**, then D/E/F/G/H as day-to-day use demands.
+**I → J → O all landed.** D/E/F/G/H remain, as day-to-day use demands.
 
-O is next because it is what stands between I and actually being usable: the cut
-refuses to run on the primary test video, so the ~25x decode win I exists to
-deliver is currently unavailable on that footage, and J needs `--allow-truncated`
-on it. It is a small batch with one real design question (the source-path half).
+**What O changed about the ordering.** It was justified as unblocking I's ~25x
+decode win on the primary test video. It did unblock the cut — but the win it
+unblocked measured **1.06x end to end** (`FINDINGS.md` §16), so the argument for
+prioritizing further decode work is gone. At scale 1.0 this pipeline is
+math-bound, which points at **Batch L (quiet-tile gating)** as the next real
+throughput lever rather than anything in the I/J decode family. L's own
+prerequisite is unchanged and is cheap: **measure tile occupancy from the
+`change` channel of an ordinary pass** before building anything.
+
+The one decode measurement still worth taking is **clip-backed throughput at
+N=8**, where §14's suspected memory-bandwidth ceiling and 8-way decode contention
+interact. Single-process says 1.06x; the multi-worker case is untested and is the
+configuration that actually runs a corpus.
 
 D/E (interactive polish) sit behind J unless day-to-day use becomes the near-term
 milestone; they live in `gui/explorers/scalogram_explorer.py`, the widget inside
