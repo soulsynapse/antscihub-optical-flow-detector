@@ -25,8 +25,8 @@ to the relevant section rather than restating it.
 | **T14** | All plots should collapse/expand via `[+]`, collapsed by default, and a collapsed plot must not render (saves memory). |
 | **T15** | Replace the positive-detection graph with green bands overlaid on the windowed #-blocks-in-band plot. |
 | **T16** | On a detection, show a `DETECTED` badge (green bg, bold black) bottom-right of the viewer box — must survive the shift-held path. |
-| **T17** | Whole-video processing resets the detection threshold bands when navigating. It should not. **CONFIRMED, cause found — see Batch F.** |
-| **T18** | "Process whole video" computes every channel regardless of the selected one. **CONFIRMED — see Batch F.** |
+| ~~**T17**~~ | ~~Whole-video processing resets the detection threshold bands when navigating.~~ **FIXED** — see Batch F. |
+| ~~**T18**~~ | ~~"Process whole video" computes every channel regardless of the selected one.~~ **FIXED** — see Batch F. |
 | **T20** | Drop the replicate dropdown — redundant with click navigation. |
 | **T21** | Suspected runaway memory issue somewhere on the replicate tab. **Not reproduced by inspection** — `_refresh_list` was the obvious suspect and is clean (14x14 swatch pixmaps, `list.clear()` releases the items). Needs an actual measurement, not more code reading; do not guess at a fix. |
 | **T22** | New **viewer tab** consuming a fully-processed video: detection/no-detection only, full-clip bar plus a ~1 min bar zoomed on the scrubber, and a hand-off back into preprocessing at the paused position *without* auto-triggering a pass. |
@@ -105,6 +105,7 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 8. Calibration | the fiducial cancels; two ownership traps that each bit once |
 | 9. GUI bugs | the Qt exit-9 crash, the silent 20x downsample, the false pass |
 | 10. ROI pre-transcode | the 25x decode win, why lossless saves no storage, and four traps |
+| 11. Per-channel extraction | the measured 1.59x (not the ~4x this plan asserted), and why the placeholder is zero-length |
 
 ---
 
@@ -122,40 +123,48 @@ Replace the separate positive-detection plot with green bands overlaid on the
 windowed-#-blocks-in-band plot. Add a `DETECTED` badge (green bg, bold black) in
 the viewer box's bottom-right that survives the shift-held path.
 
-### Batch F — whole-video correctness (T17, T18) · `scalogram_explorer` + `tensor_channels`
-Both bugs are now **confirmed by inspection**, and the file locality moved — neither
-fix is where this batch originally guessed.
+### Batch F — whole-video correctness (~~T17~~, T18) · `scalogram_explorer` + `tensor_channels`
+T18 remains; **T17 is landed**. The file locality moved — neither fix was where
+this batch originally guessed.
 
-**T17 — the original hypothesis was wrong.** `extract()` captures view state
-unconditionally (`live_scalogram_surface.py:567`) and `_focus_frame` goes through
-`extract()`, so the round trip is *not* dropping the capture. The actual cause is
-that `capture_view_state` (`scalogram_explorer.py:373`) carries `channel`, `frame`,
-`sweep_win`, `centered` and `freq_band` — but **not `value_band` or `count_band`**,
-the two detection threshold bands. `detection_params()` reads all three from live
-widgets, so the state exists; it simply is not in the captured dict, so every
-rebuild reverts those two to defaults. Fix is local: add both to `capture_view_state`
-and restore them in `apply_view_state`. Note `apply_view_state` ends with
-`_on_freq_band_committed()`, so restore the bands *before* that call or the
-recompute runs against defaults.
+**T17 — LANDED.** The original hypothesis was wrong: `extract()` captures view
+state unconditionally and `_focus_frame` goes through `extract()`, so the round
+trip was not dropping the capture. The real cause was that `capture_view_state`
+carried `channel`, `frame`, `sweep_win`, `centered` and `freq_band` — but **not
+the two detection threshold bands**, which `detection_params()` reads off live
+widgets. The state existed; it was simply never in the captured dict, so every
+rebuild reverted both to defaults.
 
-**T18 — confirmed, and bigger than "computes change energy anyway".**
-`extract_channels_live` takes no channel selector at all, so the whole commit pass
-computes `flow_solve`, `appearance` and `texture` for every window regardless of
-`channel_attr`; `live_channel_source` then materializes all of `LIVE_CHANNELS`
-(`channel_source.py:137`). The dependency structure is what makes this worth doing:
+Both now travel, and the per-channel value bands travel **for every channel, not
+just the selected one** — switching channels after a rebuild found the others
+wiped by the same omission. Endpoints are carried **raw**: `None` means "never
+placed" and `set_band_active` seeds it lazily, so collapsing it to ±inf on
+capture would convert "unset" into an explicit unbounded threshold. The restore
+sits *before* `apply_view_state`'s closing `_on_freq_band_committed()`, or the
+recompute would run against the defaults it exists to replace. Round trip is
+covered by `tests/test_view_state.py`, including an old state dict lacking the
+new keys.
 
-| selected channel | needs |
-|---|---|
-| `intensity`, `change` | `tensor_products` only (~7% per `FINDINGS.md` §1) |
-| `tensor_speed` | + `flow_solve` |
-| `appearance` | + `flow_solve`, + residual |
-| `texture` | its own spatial min-eigen |
+**T18 — LANDED.** `channels=` now threads through `extract_channels_live` and
+`live_channel_source`; `_ProcessWorker` passes the single `channel_attr` it is
+about to detect on. The live preview deliberately still computes all four, so a
+channel toggle there stays instant instead of triggering a re-extract — the
+waste this fixes was only ever on the commit pass.
 
-So selecting `change` — the detection default — should skip nearly all the
-downstream math. Thread a channel set through `extract_channels_live` and write a
-defined placeholder for unselected channels rather than omitting keys, so the
-explorer's channel checkboxes still know they exist but are unavailable
-(`_channel_available` already gates on this).
+**The plan's own estimate here was wrong and is corrected in `FINDINGS.md` §11.**
+"Selecting `change` should skip nearly all the downstream math" overstated it:
+`change` is `J[2]`, so it still needs `tensor_products` *and* `tensor_blur`, and
+the blur is the single largest span in a pass (32%). Measured **1.59x**, not the
+implied ~4x — and that on a decode-trivial synthetic, so real footage will show
+less. `intensity` is the outlier at 6.0x, being the only channel that touches no
+tensor at all.
+
+Two things fell out, both recorded in §11: the unselected-channel placeholder is
+**zero-length, not zero-filled** (a zero-filled array is the standing
+false-negative shape, and a full-length one costs ~88 MB/channel/hour for data
+nobody asked for), and `scale_sweep` now takes and records the same `channels`,
+because a cost model fitted across a four-channel and a one-channel sample reads
+the difference as scale.
 
 ### Batch G — replicate tab (T11, T12, T20, T21) · `tab2_replicates` + `video_panel`
 Click-to-select + zoom, drag to reposition, right-click to delete (that tab only),

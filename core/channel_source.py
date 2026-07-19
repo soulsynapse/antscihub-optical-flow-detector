@@ -21,6 +21,7 @@ See docs/expanded_cache_plan.md and the branch plan for the larger restructure.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -152,6 +153,7 @@ def live_channel_source(video_path: str, cfg, replicates: list[dict], *,
                         width: int | None = None, height: int | None = None,
                         fps: float | None = None, frame_count: int | None = None,
                         manifest=None, clip_dir: str | None = None,
+                        channels: Iterable[str] | None = None,
                         progress=None) -> ChannelData:
     """Cacheless windowed source: geometry from ``build_layout``, channels from a
     structure-tensor pass over frames [start, start+n). Video info is read from
@@ -169,6 +171,13 @@ def live_channel_source(video_path: str, cfg, replicates: list[dict], *,
     takes it as an optional third argument; note that nothing passes it yet, so
     this is an obligation on the next caller to cache clip-derived output rather
     than a guarantee already in force.
+
+    ``channels`` restricts the pass to the channels named (default: all of
+    ``LIVE_CHANNELS``). The returned ``ChannelData`` then **carries only those
+    keys** -- an uncomputed channel is absent, not present-and-NaN, so
+    ``ChannelData.available`` and everything gating on it (the explorer's channel
+    checkboxes, ``detect_channel_region``) keep meaning "this is real data".
+    ``meta['channels_computed']`` records the request either way.
     """
     if None in (width, height, fps, frame_count):
         with VideoSource(video_path) as src:
@@ -191,8 +200,13 @@ def live_channel_source(video_path: str, cfg, replicates: list[dict], *,
                      "clip_dir": clip_dir,
                      "clip_quality": manifest.quality,
                      "clip_quality_rms": manifest.quality_rms}
+    want = (set(LIVE_CHANNELS) if channels is None
+            else set(channels) & set(LIVE_CHANNELS))
+    if not want:
+        raise ValueError(f"no live channels requested; pick from {LIVE_CHANNELS}")
     res = extract_channels_live(video_path, full_meta, start=start, n=n,
-                                clip_paths=clip_paths, progress=progress)
+                                clip_paths=clip_paths, channels=want,
+                                progress=progress)
     win = int(res["meta"]["n_frames"])
     wstart = int(res["meta"]["window_start"])
     # The explorer's T axis is the window, so advertise the window length as
@@ -201,14 +215,16 @@ def live_channel_source(video_path: str, cfg, replicates: list[dict], *,
     # only sees a length cannot tell "you asked for a short window" from "the
     # decode ended early and this is less data than you asked for".
     meta = {**full_meta, "n_frames": win, "window_start": wstart,
-            "truncated": bool(res["meta"].get("truncated", False))}
+            "truncated": bool(res["meta"].get("truncated", False)),
+            "channels_computed": sorted(want)}
     # Carried through so the downsample decision tool can price the lever from
     # passes that actually ran on this machine and this footage. Absent when the
     # pass was empty or timing was disabled.
     if res["meta"].get("timing"):
         meta["timing"] = res["meta"]["timing"]
-    channels = {k: np.asarray(res[k], np.float32) for k in LIVE_CHANNELS}
-    return ChannelData(meta=meta, channels=channels, window_start=wstart,
+    arrays = {k: np.asarray(res[k], np.float32) for k in LIVE_CHANNELS
+              if k in want}
+    return ChannelData(meta=meta, channels=arrays, window_start=wstart,
                        approximated=bool(res["meta"].get("approximated", False)))
 
 

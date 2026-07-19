@@ -531,3 +531,74 @@ record per-clip frame counts. **The control refuted it**: healthy clips show
 Run the healthy-path control before attributing an absolute number to the change
 under test — the real defect here was visible only in the *reported window
 length* (40 → 20), never in the zero count.
+
+---
+
+## 11. Per-channel extraction (T18)
+
+The whole-video commit detects on one channel via `detect_channel_region`'s
+single `channel_attr`, but computed all four `LIVE_CHANNELS` regardless. It now
+takes a `channels=` selection; the live preview deliberately does **not** use it,
+because there a channel toggle must stay instant rather than trigger a re-extract.
+
+### What it is worth, measured
+
+Synthetic clip, 7 replicate-sized boxes (~297 px) on 1600x1200, 120 frames,
+scale 1.0, block 64, grid 41x5, ROI decode. **Not the reference footage** —
+`GX010047c2` is not on this machine.
+
+| selection | wall | speedup | stages run |
+|---|---|---|---|
+| all four | 3.34 s | 1.00x | everything |
+| `change` | 2.10 s | **1.59x** | products, blur |
+| `tensor_speed` | 2.64 s | 1.27x | + flow_solve |
+| `appearance` | 2.66 s | 1.26x | + flow_solve, residual |
+| `intensity` | 0.51 s | **6.02x** | preprocess + reduce only |
+
+Full-pass spans: `tensor_blur` 1.06 s (32%), `tensor_products` 0.54 s (16%),
+`flow_solve` 0.49 s (15%), `appearance` 0.38 s (11%), `block_reduce` 0.31 s (9%).
+
+**This refutes the plan's own estimate.** `todo.md` asserted that selecting
+`change` "should skip nearly all the downstream math". It does not: `change` is
+`J[2]`, so it needs `tensor_products` **and** `tensor_blur`, and the blur is the
+largest single span in the pass. What `change` actually skips is `flow_solve`,
+the appearance residual and the min-eigen — real, but 1.59x rather than the ~4x
+the phrasing implied. The dependency table in the plan was right; the summary
+sentence under it was not.
+
+Two cautions on the number. Decode here is ~0% of wall time (synthetic mp4v,
+tiny frames); on real 5.3K footage decode is a large fixed share, so the
+end-to-end win will be **smaller** than 1.59x. And `intensity`'s 6.02x is not a
+general result — it is the only channel that forms no tensor at all.
+
+### The placeholder is zero-LENGTH, not zero-filled
+
+`_stream_channels` still returns every `CHANNELS` key (the dict shape is fixed,
+and `load_or_extract_channels`' sidecar depends on that), but an unselected
+channel's array is `(0, ny, nx)`.
+
+Zero-*filled* was rejected for the reason §10 traps 7 and 8 both turn on: zero is
+a real measurable value on every one of these channels, so a zero-filled array is
+indistinguishable from "measured, and nothing happened". Full-length NaN was the
+first fix and was also rejected — it is honest but costs the memory the selection
+exists to save: ~88 MB per channel per hour of 30 fps footage at a 41x5 grid, so
+~354 MB of placeholder on a one-hour change-only commit. A zero-length array
+cannot be mistaken for data, cannot silently broadcast against a real one, and
+costs nothing.
+
+`meta["channels_computed"]` is the authoritative list. `live_channel_source`
+drops the placeholders entirely, so at the `ChannelData` layer — and only there —
+key presence is equivalent, which is what keeps `ChannelData.available` and the
+explorer's `_channel_available` meaning "this is real data".
+
+### The cost model has to be told which selection it priced
+
+`scale_sweep.measure_scale` took no channel selection, so it priced a
+four-channel pass while the run it models now computes one. Left alone, that
+inflates the fixed term `F` in `t(s) = F + M·s²` by up to 59% and moves the knee
+`s* = √(F/M)` toward "downsampling is free" — the one direction §6 says this
+model must never err in. It now takes `channels=` and `ScalePass` **records**
+them, for the same reason it records `truncated`: wall time depends on a second
+axis that a consumer comparing scales cannot recover from the number alone, and a
+fit mixing a four-channel sample with a one-channel one reads the difference as
+scale.

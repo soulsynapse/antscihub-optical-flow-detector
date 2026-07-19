@@ -24,6 +24,7 @@ as approximated when any of them were configured.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import replace
 
 import cv2
@@ -40,6 +41,22 @@ from core.video import (ClipAtlasSource, ReplicateVideoSource, VideoSource,
 
 CHANNELS = ("intensity", "change", "appearance", "texture", "tensor_speed")
 CHANNEL_VERSION = 3     # bump when the extraction math changes (sidecar key)
+
+# What each channel costs beyond the frame itself, which is what makes selecting
+# one worth doing (FINDINGS.md section 1: tensor_products is ~7% of a pass, the
+# downstream solve the bulk of the rest).
+#
+#   intensity     the preprocessed frame, block-reduced. Free.
+#   change        J[2] -- needs the products and the spatial blur, nothing more.
+#   texture       min-eigen of J. Needs the blur, not the flow solve.
+#   tensor_speed  needs flow_from_tensor on top of the blur.
+#   appearance    needs the residual, and the flow to form it -- the tensor's own
+#                 (so: the solve) unless cached block flow was supplied.
+#
+# So the detection default, ``change``, skips the solve, the residual and the
+# min-eigen entirely.
+_NEEDS_TENSOR = frozenset({"change", "appearance", "texture", "tensor_speed"})
+_NEEDS_FLOW = frozenset({"tensor_speed", "appearance"})
 
 # Shared always-off timer so _reduce can time itself without a per-call branch.
 _NO_TIMER = Timer("", enabled=False)
@@ -180,6 +197,7 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                      cached_uv: tuple[np.ndarray, np.ndarray] | None = None,
                      cached_texture: np.ndarray | None = None,
                      clip_paths: list[str] | None = None,
+                     want: frozenset | None = None,
                      denoise: str | None = None, progress=None) -> dict:
     """Stream a frame window [start, start+n) and return per-block channel arrays.
 
@@ -194,6 +212,23 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
     ``denoise`` overrides the config's temporal-denoise mode (the live/windowed
     path forces it off, since denoise is stateful from frame zero and cannot be
     reproduced starting mid-clip).
+
+    ``want`` restricts which channels are computed; ``None`` means all of them.
+    Every ``CHANNELS`` key is still returned -- this dict's shape is fixed, and
+    ``load_or_extract_channels``' sidecar depends on that -- but an unwanted
+    channel's array is a **zero-length** ``(0, ny, nx)`` placeholder. Length
+    zero, not NaN-filled and not zero-filled: a full-length array of either
+    still costs the memory the selection exists to save (~88 MB per channel per
+    hour of 30 fps footage at a 41x5 grid), and a zero-FILLED one is worse than
+    that, being indistinguishable from "measured, and nothing happened" -- the
+    same silent false negative the truncation trim below exists to prevent.
+    A zero-length array cannot be mistaken for data or silently broadcast
+    against a real one.
+
+    ``meta['channels_computed']`` is the authoritative list of which keys hold
+    measurements; gate on it, not on key presence. (``live_channel_source``
+    hands out a ``ChannelData`` that drops the placeholders entirely, so at THAT
+    layer -- and only there -- key presence is equivalent.)
 
     Returns a dict of the ``CHANNELS`` arrays (length = clamped window n) plus
     ``meta`` describing how they were built.
@@ -219,12 +254,27 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                     base_cfg.bg_subtract != "off" or
                     denoise != base_cfg.denoise)
 
-    out = {k: np.zeros((n, ny, nx), np.float32) for k in CHANNELS}
+    want = frozenset(CHANNELS) if want is None else frozenset(want) & frozenset(CHANNELS)
+    # What the selection actually buys, resolved once. ``appearance`` needs the
+    # flow solve only when no cached block flow was handed in to form the
+    # residual against; with cached_uv it rides the supplied field.
+    need_tensor = bool(want & _NEEDS_TENSOR)
+    # Read _NEEDS_FLOW rather than restating its members here, so adding a
+    # flow-dependent channel to the table above is enough to make it work.
+    # ``appearance`` is the one exception the table cannot express: it needs the
+    # solve only to form its own flow, so a supplied cached field excuses it.
+    need_flow = bool((want & _NEEDS_FLOW) -
+                     ({"appearance"} if cached_uv is not None else set()))
+    need_texture = "texture" in want and cached_texture is None
+
+    out = {k: np.zeros((n if k in want else 0, ny, nx), np.float32)
+           for k in CHANNELS}
     if n == 0:
         out["meta"] = {"fps": fps, "block": block, "grid": (ny, nx),
                        "n_frames": 0, "channel_version": CHANNEL_VERSION,
                        "approximated": approximated, "sigma": sigma,
                        "window_start": start,
+                       "channels_computed": sorted(want),
                        # Present on both exits: an empty window was asked for and
                        # delivered, which is not the same as a decode ending
                        # early, and a consumer reading meta["truncated"] should
@@ -292,12 +342,13 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
 
                 gp = prev_g[rid]
                 if oi >= 0:
-                    out["intensity"][oi, ay0:ay1, ax0:ax1] = _reduce(g, block, th, tw, tm)
-                    if cached_texture is not None:
+                    if "intensity" in want:
+                        out["intensity"][oi, ay0:ay1, ax0:ax1] = \
+                            _reduce(g, block, th, tw, tm)
+                    if "texture" in want and cached_texture is not None:
                         out["texture"][oi, ay0:ay1, ax0:ax1] = \
                             cached_texture[i, ay0:ay1, ax0:ax1]
-                    if gp is not None:
-                        it = g - gp
+                    if gp is not None and need_tensor:
                         # Form and spatially smooth the complete 3-D tensor at a
                         # small scale, solve LK per pixel, then reduce speed to
                         # blocks. Solving once per block would couple the aperture
@@ -307,32 +358,37 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                         with tm.span("tensor_blur"):
                             J = np.stack([cv2.GaussianBlur(prods[k], (0, 0), sigma)
                                           for k in range(6)])
-                        with tm.span("flow_solve"):
-                            uv = flow_from_tensor(J)             # px/frame
-                            tensor_speed = np.hypot(uv[..., 0], uv[..., 1]) * fps
-                        out["tensor_speed"][oi, ay0:ay1, ax0:ax1] = \
-                            _reduce(tensor_speed, block, th, tw, tm)
-                        out["change"][oi, ay0:ay1, ax0:ax1] = \
-                            _reduce(J[2], block, th, tw, tm)
+                        uv = None
+                        if need_flow:
+                            with tm.span("flow_solve"):
+                                uv = flow_from_tensor(J)         # px/frame
+                        if "tensor_speed" in want:
+                            speed = np.hypot(uv[..., 0], uv[..., 1]) * fps
+                            out["tensor_speed"][oi, ay0:ay1, ax0:ax1] = \
+                                _reduce(speed, block, th, tw, tm)
+                        if "change" in want:
+                            out["change"][oi, ay0:ay1, ax0:ax1] = \
+                                _reduce(J[2], block, th, tw, tm)
                         # Appearance residual r = I_t + grad(I).v. Against cached
                         # block flow (px/s -> px/frame, upsampled) when given, else
                         # against the tensor's own per-pixel flow (already px/frame).
-                        with tm.span("appearance"):
-                            if cached_uv is not None:
-                                U, V = cached_uv
-                                ub = cv2.resize(U[i, ay0:ay1, ax0:ax1] / fps,
-                                                (g.shape[1], g.shape[0]),
-                                                interpolation=cv2.INTER_NEAREST)
-                                vb = cv2.resize(V[i, ay0:ay1, ax0:ax1] / fps,
-                                                (g.shape[1], g.shape[0]),
-                                                interpolation=cv2.INTER_NEAREST)
-                            else:
-                                ub, vb = uv[..., 0], uv[..., 1]
-                            iy, ix = np.gradient(g)
-                            r = it + ix * ub + iy * vb
-                        out["appearance"][oi, ay0:ay1, ax0:ax1] = \
-                            _reduce(r * r, block, th, tw, tm)
-                        if cached_texture is None:
+                        if "appearance" in want:
+                            with tm.span("appearance"):
+                                if cached_uv is not None:
+                                    U, V = cached_uv
+                                    ub = cv2.resize(U[i, ay0:ay1, ax0:ax1] / fps,
+                                                    (g.shape[1], g.shape[0]),
+                                                    interpolation=cv2.INTER_NEAREST)
+                                    vb = cv2.resize(V[i, ay0:ay1, ax0:ax1] / fps,
+                                                    (g.shape[1], g.shape[0]),
+                                                    interpolation=cv2.INTER_NEAREST)
+                                else:
+                                    ub, vb = uv[..., 0], uv[..., 1]
+                                iy, ix = np.gradient(g)
+                                r = (g - gp) + ix * ub + iy * vb
+                            out["appearance"][oi, ay0:ay1, ax0:ax1] = \
+                                _reduce(r * r, block, th, tw, tm)
+                        if need_texture:
                             with tm.span("texture"):
                                 mineig = spatial_min_eigen(J)
                             out["texture"][oi, ay0:ay1, ax0:ax1] = \
@@ -386,6 +442,8 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
     out["meta"] = {"fps": fps, "block": block, "grid": (ny, nx), "n_frames": n,
                    "channel_version": CHANNEL_VERSION, "approximated": approximated,
                    "sigma": sigma, "window_start": start, "truncated": short,
+                   # Which arrays hold measurements; the rest are NaN placeholders.
+                   "channels_computed": sorted(want),
                    # The spans are already measured for the log line; returning
                    # them too is what lets the cost model be built from passes
                    # the user actually ran instead of from asserted constants.
@@ -420,6 +478,7 @@ def extract_channels(cache, sigma: float = 2.0, max_frames: int | None = None,
 def extract_channels_live(video_path: str, meta: dict, *, start: int = 0,
                           n: int | None = None, sigma: float = 2.0,
                           clip_paths: list[str] | None = None,
+                          channels: Iterable[str] | None = None,
                           progress=None) -> dict:
     """Cacheless windowed extraction: geometry from ``meta``, appearance against
     the tensor's own flow, temporal denoise forced off (stateful, can't reproduce
@@ -430,10 +489,17 @@ def extract_channels_live(video_path: str, meta: dict, *, start: int = 0,
     untouched -- only where the pixels come from changes. Callers should go
     through ``channel_source.live_channel_source``, which resolves the paths from
     a manifest and verifies the geometry still matches; passing raw paths here
-    skips those checks."""
+    skips those checks.
+
+    ``channels`` restricts the pass to the channels asked for (default: all).
+    The whole-video commit detects on ONE channel, and computing the other four
+    was most of its wall time -- on the detection default ``change`` the skipped
+    work is the flow solve, the appearance residual and the min-eigen. Unwanted
+    channels come back as zero-LENGTH placeholders (never zero-filled ones);
+    read ``meta['channels_computed']``. See ``_stream_channels``."""
     return _stream_channels(video_path, meta, sigma=sigma, start=start, n=n,
                             cached_uv=None, cached_texture=None,
-                            clip_paths=clip_paths, denoise="off",
+                            clip_paths=clip_paths, want=channels, denoise="off",
                             progress=progress)
 
 

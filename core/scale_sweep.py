@@ -66,6 +66,12 @@ class ScalePass:
     # was actually computed. Carried rather than inferred because a consumer
     # comparing scales cannot otherwise tell a cheap scale from a short pass.
     truncated: bool = False
+    # Which channels this pass computed. Recorded for the same reason
+    # ``truncated`` is: it is a second axis the wall time depends on, and one a
+    # consumer comparing scales cannot recover from the number alone. A fit
+    # mixing a four-channel sample with a one-channel one reads the difference as
+    # scale, which is how a cost model acquires a bias nobody put there.
+    channels: tuple[str, ...] = ()
 
     @property
     def seconds_per_frame(self) -> float:
@@ -94,17 +100,25 @@ class ScalePass:
 
 
 def measure_scale(video_path: str, cfg, replicates: list[dict], *, dims,
-                  start: int, n: int, progress=None) -> ScalePass:
+                  start: int, n: int, channels=None, progress=None) -> ScalePass:
     """Extract ``[start, start+n)`` at ``cfg``'s scale and time it.
 
     The block is whatever ``cfg`` resolves it to, which for the ``auto`` default
     tracks the scale. No detector runs: this measures cost, and cost is all it
     claims to measure.
+
+    ``channels`` must be the SAME channel selection the run being priced will
+    use -- pass the detection channel when modelling a whole-video commit, which
+    computes exactly one. A sweep left at the four-channel default prices a pass
+    nobody runs: a change-only pass measured 1.59x faster than the full four on
+    a 7-replicate synthetic clip, so the fit's fixed term F comes out inflated
+    and the knee ``s* = sqrt(F/M)`` moves toward "downsampling is free" -- the
+    one direction ``FINDINGS.md`` section 6 says this model must never err in.
     """
     w, h, fps, fc = dims
     cd = live_channel_source(video_path, cfg, replicates, start=start, n=n,
                              width=w, height=h, fps=fps, frame_count=fc,
-                             progress=progress)
+                             channels=channels, progress=progress)
     t = (cd.meta.get("timing") or {})
     ny, nx = cd.meta["grid"]
     scale = cfg.preprocess.resolve_downsample(w)
@@ -122,7 +136,8 @@ def measure_scale(video_path: str, cfg, replicates: list[dict], *, dims,
         wall=float(t.get("wall", 0.0)),
         spans=dict(t.get("spans") or {}),
         approximated=bool(cd.approximated),
-        truncated=bool(cd.meta.get("truncated", False)))
+        truncated=bool(cd.meta.get("truncated", False)),
+        channels=tuple(cd.meta.get("channels_computed") or ()))
 
 
 def storage_curve(replicates: list[dict], src_width: int, src_height: int,

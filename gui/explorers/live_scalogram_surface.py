@@ -193,9 +193,17 @@ class _ProcessWorker(_StreamWorker):
     def _run(self):
         video_path, cfg, reps, dims, region_index, params = self._args
         w, h, fps, fc = dims
+        # ONLY the channel being detected on. The whole-clip pass used to compute
+        # all four regardless, and the other three were pure waste -- nothing
+        # downstream of here reads them, since detect_channel_region takes a
+        # single channel_attr. On the detection default (``change``) this skips
+        # the flow solve, the appearance residual and the min-eigen; the live
+        # preview deliberately still computes all four, because there a channel
+        # toggle must stay instant instead of triggering a re-extract.
         cd = live_channel_source(
-            video_path, cfg, reps, start=0, n=None,
-            width=w, height=h, fps=fps, frame_count=fc, progress=self._tick)
+            video_path, cfg, reps, start=0, n=None, width=w, height=h,
+            fps=fps, frame_count=fc, channels=[params["channel_attr"]],
+            progress=self._tick)
         # A decode that ended early yields a SHORT track, not a padded one, so
         # the detector below runs over less video than the user asked for and
         # every "no detection here" past the cut point is unexamined rather than

@@ -373,13 +373,26 @@ class ScalogramExplorer(QWidget):
     def capture_view_state(self) -> dict:
         """The tuning context worth preserving when the live surface rebuilds this
         explorer with a fresh ChannelData: which channel, where the cursor and
-        detection window are, and the frequency band you dragged."""
+        detection window are, and the frequency band you dragged.
+
+        The two detection threshold bands travel too: ``detection_params`` reads
+        the value band and the count band off live widgets, so omitting them here
+        silently reverted both to defaults on every rebuild (T17). Endpoints are
+        carried raw -- ``None`` means "never placed", which ``set_band_active``
+        seeds lazily; collapsing it to +/-inf here would turn "unset" into an
+        explicit unbounded threshold and defeat that seeding.
+        """
         return {
             "channel": self.channel,
             "frame": self.frame,
             "sweep_win": self.sweep_win,
             "centered": self.centered,
             "freq_band": (self.scalo_plot.band_lo, self.scalo_plot.band_hi),
+            # Per channel, not just the selected one: switching channels after a
+            # rebuild should not find the others wiped either.
+            "value_bands": {name: (dp.band_lo, dp.band_hi)
+                            for name, dp in self.density_plots.items()},
+            "count_band": (self.count_w_plot.band_lo, self.count_w_plot.band_hi),
         }
 
     def detection_params(self) -> dict:
@@ -416,6 +429,19 @@ class ScalogramExplorer(QWidget):
             self.scalo_plot.band_lo, self.scalo_plot.band_hi = fb
             self.scalo_plot.set_band_active(True)
             self.scalo_plot.update()
+        # Detection thresholds must land BEFORE the _on_freq_band_committed()
+        # below, or the recompute at the end of this method runs against the
+        # defaults these are here to replace.
+        for name, band in (st.get("value_bands") or {}).items():
+            dp = self.density_plots.get(name)
+            if dp is not None:
+                dp.band_lo, dp.band_hi = band
+                dp.update()
+        cb = st.get("count_band")
+        if cb is not None:
+            self.count_w_plot.band_lo, self.count_w_plot.band_hi = cb
+            self.count_w_plot.set_band_active(True)
+            self.count_w_plot.update()
         frame = st.get("frame")
         if frame is not None:
             self._apply_frame(int(frame))
