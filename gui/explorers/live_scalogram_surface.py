@@ -1,23 +1,39 @@
 """The live tuning surface: preprocessing knobs feeding the scalogram directly.
 
 This is the dissolved preprocessing tab. Instead of configuring a flow pass and
-waiting for a cache, you pick a short window of a bare video and watch the
-structure-tensor scalogram / detection stack respond as you drag downsample,
-block size, and normalization. There is no flow solve and no cache write.
+waiting for a cache, you press Play and watch the structure-tensor scalogram /
+detection stack respond as you drag downsample, block size, and normalization.
+There is no flow solve and no cache write.
+
+**There is exactly one pass, and Play runs it.** The surface used to have two:
+a bounded windowed *extract* that decoded a fixed span and returned a result,
+and a *live* pass that runs forward to the end of the clip publishing a moving
+frontier. The extract has been retired. It existed because the live pass did
+not, and once the live pass could build and feed the explorer itself, keeping
+both meant two ways to fill the same widgets, two definitions of "the current
+window", and a seek that silently chose between them. Play (or Space) starts
+and stops the one pass; every other control either replans it or does nothing
+until it is running.
+
+The playhead sits at the MIDDLE of the served window, not at the frontier --
+see ScalogramExplorer.follow_center. The pass runs ahead of the reading
+position by half a window, so every plot shows computed footage on both sides
+of the cursor and the data scrolls under a fixed landmark.
 
 Because ``downsample`` and ``block_size`` change the block *geometry* (not just
-pixels), the cleanest way to apply a knob is to re-extract the window into a
-fresh ChannelData and rebuild the ScalogramExplorer from it -- the explorer's
-constructor already derives every geometry-dependent structure consistently,
-which is far safer than mutating grid/regions/cube-cache in place. The tuning
-context you care about (selected channel, cursor, detection window, frequency
-band) is captured off the old explorer and re-applied to the new one.
+pixels), a knob change replans the pass and rebuilds the ScalogramExplorer from
+a fresh ChannelData -- the explorer's constructor already derives every
+geometry-dependent structure consistently, which is far safer than mutating
+grid/regions/cube-cache in place. The tuning context you care about (selected
+channel, cursor, detection window, frequency band) is captured off the old
+explorer and re-applied to the new one.
 
-Every knob here is genuinely upstream and forces a re-extract -- accepted: the
-window is short, so a pass is seconds. ``normalize`` is a per-frame pixel op
-(z-score is ~invariant for tensor_speed, reshapes change/intensity); ``block_size``
-is a geometry op whose expensive per-pixel tensor solve is actually block-size
-independent (a future optimization, not needed now). See the branch plan.
+``normalize`` is a per-frame pixel op (z-score is ~invariant for tensor_speed,
+reshapes change/intensity); ``block_size`` is a geometry op whose expensive
+per-pixel tensor solve is actually block-size independent. That independence
+used to fund a block=1 pixel cache, so a Block change could re-reduce instead of
+re-extracting; it went with the extract, since a live pass replans rather than
+re-runs a window and there is nothing for such a cache to save.
 """
 from __future__ import annotations
 
@@ -31,9 +47,7 @@ from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel,
                              QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
 from core.channel_source import (LIVE_CHANNELS, ChannelData,
-                                 live_channel_source, reduce_channel_data,
-                                 synth_live_meta)
-from core.cache import human_bytes
+                                 live_channel_source, synth_live_meta)
 from core.config import FlowConfig, PipelineConfig, PreprocessConfig
 from core.cost_model import CostModel, PassSample
 from core.scale_sweep import measure_scale
@@ -70,11 +84,10 @@ _MIN_DS = 0.05
 # and let FlowConfig hold the grid fixed in source pixels.
 _AUTO_BLOCK = 0
 
-# Idle labels for the three action buttons; each becomes "Stop" while its own
+# Idle labels for the two action buttons; each becomes "Stop" while its own
 # pass runs (see _set_busy).
-_EXTRACT_TEXT = "Extract"
 _PROCESS_TEXT = "Process whole video ▶"
-_LIVE_TEXT = "Live ▶"
+_LIVE_TEXT = "Play ▶"
 
 # How often the GUI asks the stream worker for a trailing window.
 #
@@ -139,35 +152,12 @@ _TRACK_BP_CAP = 1024 ** 3
 # while progress looks healthy -- is indistinguishable from a quiet clip.
 _DETECT_DROP_ALARM = 3
 
-# Fraction of free RAM the ring buffer may take, and its floor/cap. Read
-# separately from _PP_BUDGET_* and not shared with it: the per-pixel cache is
-# sized for a peak of ~2x because the extract holds its own copy alongside it,
-# whereas the ring IS the only copy of the streamed channels. Deriving one from
-# the other would silently re-tune the ring the next time that peak argument
-# changes, for a reason that has nothing to do with streaming.
+# Fraction of free RAM the ring buffer may take, and its floor/cap. The ring IS
+# the only copy of the streamed channels, so there is no peak multiplier to
+# allow for here.
 _RING_BUDGET_FRACTION = 0.25
 _RING_BUDGET_FLOOR = 512 * 1024 ** 2
 _RING_BUDGET_CAP = 8 * 1024 ** 3
-
-# "the caller did not say which block regime this pass ran in". Distinct from
-# None, which is a real regime (the block tracked the scale).
-_INFER = object()
-
-# Per-pixel cache budget, sized from free RAM rather than fixed. The old flat
-# 2 GiB covered under a second of 5.3K footage at scale 1.0 with a dozen
-# replicates, so on real clips the cache never built and every Block change paid
-# a full re-extract -- the exact cost this cache exists to avoid. A fraction of
-# what the machine actually has is the honest unit; the floor preserves the old
-# behaviour where free RAM is small or unreadable.
-#
-# The fraction is a quarter because the extract holds its own copy of the
-# channels alongside the cache for the length of the pass, so peak footprint is
-# ~2x the budget -- a quarter of free RAM keeps that peak at half.
-_PP_BUDGET_FRACTION = 0.25
-_PP_BUDGET_FLOOR = 2 * 1024 ** 3
-# Above this, filling the window costs more decode time than anyone waits
-# through interactively; memory stops being the binding constraint.
-_PP_BUDGET_CAP = 16 * 1024 ** 3
 
 # Longest side of the source crop the render strip works from. A replicate box
 # can be the whole frame, and squeezing 5312 px into a ~108 px tile makes every
@@ -182,28 +172,9 @@ class _Busy(Enum):
     """Which pass owns the decoder. Named rather than bare strings because
     _set_busy silently disables both buttons for any value it does not
     recognise, which a mistyped literal would make unrecoverable."""
-    EXTRACT = "extract"
     PROCESS = "process"
     SWEEP = "sweep"
     STREAM = "stream"
-
-
-class _LiveExtractWorker(_StreamWorker):
-    """Run a windowed structure-tensor pass off the GUI thread. A full-resolution
-    window is a real streaming solve (seconds), so blocking here would freeze the
-    knobs mid-drag."""
-
-    def __init__(self, video_path, cfg, replicates, start, n, dims, parent=None):
-        super().__init__(parent)
-        self._args = (video_path, cfg, replicates, start, n, dims)
-
-    def _run(self):
-        video_path, cfg, reps, start, n, dims = self._args
-        w, h, fps, fc = dims
-        cd = live_channel_source(
-            video_path, cfg, reps, start=start, n=n,
-            width=w, height=h, fps=fps, frame_count=fc, progress=self._tick)
-        self.done.emit(cd)
 
 
 class _RenderWorker(_StreamWorker):
@@ -216,9 +187,9 @@ class _RenderWorker(_StreamWorker):
 
     Unlike the streaming passes this does NOT contend for the decoder the others
     hold -- it opens its own ``VideoSource``, reads two frames and closes -- so
-    it is deliberately not gated behind ``_sweep_ready``. Blocking it while an
-    extract runs would leave the strip empty in the ordinary case of opening the
-    window straight after a pass.
+    it is deliberately not gated behind ``_sweep_ready``. Blocking it while a
+    live pass runs would leave the strip empty in the ordinary case of opening
+    the window straight after starting one.
     """
 
     def __init__(self, video_path, box, frame_idx, scales, pre_cfg, parent=None):
@@ -257,7 +228,7 @@ class _ProcessWorker(_StreamWorker):
         # single channel_attr. On the detection default (``change``) this skips
         # the flow solve, the appearance residual and the min-eigen; the live
         # preview deliberately still computes all four, because there a channel
-        # toggle must stay instant instead of triggering a re-extract.
+        # toggle must stay instant instead of triggering a replan.
         cd = live_channel_source(
             video_path, cfg, reps, start=0, n=None, width=w, height=h,
             fps=fps, frame_count=fc, channels=[params["channel_attr"]],
@@ -294,10 +265,10 @@ class _SweepWorker(_StreamWorker):
     """The downsample dialog's sweep: one timed extraction pass per scale.
 
     Each pass is a cost sample taken at the block a production run would use --
-    unlike the live surface's own extracts, which run at ``block_size=1`` so a
-    Block change can re-reduce instead of re-extract, and which therefore price a
-    pass where ``block_reduce`` is 62% of the wall time against ~15% in
-    production (11.0 s against 4.2 s at scale 1.0, measured).
+    a production run reduces to the display block as it goes, so a sweep row is
+    the one place that prices a pass in isolation, where ``block_reduce`` is
+    62% of the wall time against ~15% in production (11.0 s against 4.2 s at
+    scale 1.0, measured).
 
     No detector runs. An earlier version ran the tuned detector at each scale and
     reported events kept and lost, which read as sensitivity evidence but
@@ -366,14 +337,12 @@ class LiveScalogramSurface(QWidget):
         self.frame_count = int(info.frame_count)
 
         self._explorer: ScalogramExplorer | None = None
-        self._worker: _LiveExtractWorker | None = None
         self._proc_worker: _ProcessWorker | None = None
         # Tuning remembered for THIS clip (see gui/tuning_store). Loaded before
-        # the strip is built so the controls come up on it, and seeded into
-        # _pending_state so the first extract's explorer opens on the bands that
-        # were left here -- the same channel the live rebuild path already uses,
-        # so a restored session and a re-extract cannot diverge.
+        # the strip is built so the controls come up on it.
         self._saved = load_tuning(video_path)
+        # Seeded here so the FIRST live pass opens on the bands that were left
+        # here, and consumed by the first _swap_explorer.
         self._pending_state: dict | None = self._saved.get("view") or None
         # Replicate selection travels alongside, not inside, the view state: a
         # rebuild deliberately resets the selection, and only the reopen case
@@ -383,34 +352,14 @@ class LiveScalogramSurface(QWidget):
         # explorer is being rebuilt (there is no live one to read then).
         self._saved_view: dict | None = self._pending_state
         # Progress-readout timing/context, set when each pass starts.
-        self._extract_t0 = 0.0
-        self._extract_ctx = ""
         self._proc_t0 = 0.0
         self._proc_ctx = ""
-        # Pixel-level (block_size=1) channel cache for the current window: a Block
-        # change re-reduces this instead of re-extracting (the per-pixel tensor
-        # solve is block independent). Keyed by everything upstream of the block:
-        # window (start, n), downsample, normalize. None when the per-pixel
-        # footprint would exceed the budget (then Block falls back to re-extract).
-        self._pp: object | None = None
-        self._pp_key: tuple | None = None
-        # Read once per surface, not per check: it feeds a cache-sizing decision,
-        # and re-reading would let the same window flip between fitting and not
-        # as unrelated processes come and go.
-        self._pp_budget = budget_bytes(_PP_BUDGET_FRACTION, _PP_BUDGET_FLOOR,
-                                       _PP_BUDGET_CAP)
-        self._pending_pp = False        # is the running extract building a cache?
-        self._pending_key: tuple | None = None
-        self._pending_cfg: PipelineConfig | None = None
-        # Set when a knob change stops an in-flight extract: the replacement pass
-        # starts from the cancelled handler, once the old thread has unwound.
-        self._restart_extract = False
 
-        # Measured extraction passes, feeding the downsample dialog's cost model.
-        # Keyed by (scale, block) because the two are not interchangeable costs:
-        # an extract that fits the per-pixel budget runs at block=1 and does no
-        # reduction, so mixing those samples with block-reduced ones into one fit
-        # would regress across two variables and attribute both to the scale.
+        # Timed passes, feeding the downsample dialog's cost model. Keyed by
+        # (scale, block) because the two are not interchangeable costs: a pass at
+        # block=1 does no reduction at all, so mixing those samples with
+        # block-reduced ones into one fit would regress across two variables and
+        # attribute both to the scale.
         self._cost_samples: dict[tuple[float, int], PassSample] = {}
         # The regime each sample was taken in, keyed the same way: None when the
         # block tracked the scale, the pinned working block otherwise. Recorded
@@ -422,7 +371,7 @@ class LiveScalogramSurface(QWidget):
         self._last_cost_key: tuple[float, int] | None = None
         # The downsample dialog's empirical sweep, while one is running. Held on
         # the surface rather than in the dialog because it owns the decoder and
-        # must not overlap the extract or the whole-video commit.
+        # must not overlap the live pass or the whole-video commit.
         self._sweep_worker: _SweepWorker | None = None
         self._sweep_block_intent: int | None = None
         # The dialog's render strip. Its own decoder handle, so it does not
@@ -431,7 +380,7 @@ class LiveScalogramSurface(QWidget):
         self._dlg = None
 
         # -- the continuous pass (todo.md Batch Q) ---------------------------
-        # Unlike the extract, this one runs forward to the end of the clip and
+        # This one runs forward to the end of the clip and
         # publishes a frontier instead of returning a result. It owns the decoder
         # for as long as it runs, so it is tracked by _Busy like the others.
         self._stream_worker: LiveStreamWorker | None = None
@@ -485,23 +434,28 @@ class LiveScalogramSurface(QWidget):
         self._detect_timer.setInterval(int(1000 / _DETECT_REQUEST_HZ))
         self._detect_timer.timeout.connect(self._request_detect_window)
 
-        # Coalesce rapid knob edits into a single re-extract on settle. Created
+        # Coalesce rapid knob edits into a single pass restart on settle. Created
         # before the strip because the controls connect to it.
+        #
+        # Every knob here is upstream of the block grid, so there is nothing to
+        # patch in place: the running pass was planned against the old geometry
+        # and has to be replanned. Block used to be the exception -- it could
+        # re-reduce a cached block=1 extract -- but that cache existed only to
+        # avoid a re-extract, and with the extract path gone Block is just
+        # another knob that replans the pass.
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(500)
-        self._debounce.timeout.connect(self.extract)
+        self._debounce.timeout.connect(self._on_knob_settled)
 
-        # Block changes re-reduce the cached per-pixel channels (fast), so they get
-        # their own shorter-settle handler distinct from the re-extract debounce.
         self._block_debounce = QTimer(self)
         self._block_debounce.setSingleShot(True)
         self._block_debounce.setInterval(250)
-        self._block_debounce.timeout.connect(self._on_block_changed)
+        self._block_debounce.timeout.connect(self._on_knob_settled)
 
         # Persist the tuning on settle. Longer than either compute debounce
         # because nothing waits on it: the point is one write per edit rather
-        # than one per keystroke, and a write that lands after the re-extract
+        # than one per keystroke, and a write that lands after the replan
         # has already started costs nothing.
         self._save_debounce = QTimer(self)
         self._save_debounce.setSingleShot(True)
@@ -520,7 +474,8 @@ class LiveScalogramSurface(QWidget):
         self._host_lay = QVBoxLayout(self._host)
         self._host_lay.setContentsMargins(0, 0, 0, 0)
         self._placeholder = QLabel(
-            "Set a window and press Extract to build the live scalogram.")
+            "Press Play ▶ (or Space) to run the live scalogram from the window "
+            "start.")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setStyleSheet("color:#8ab; padding:40px;")
         self._host_lay.addWidget(self._placeholder)
@@ -537,9 +492,11 @@ class LiveScalogramSurface(QWidget):
         self.navigator.scrubbed.connect(self._on_scrubbed)
         self.navigator.seek_committed.connect(self._on_seek_committed)
         root.addWidget(self.navigator)
-
-        # First extract once shown, so the window opens without a blocking pass.
-        QTimer.singleShot(0, self.extract)
+        # Nothing runs on show. The old windowed extract auto-fired here because
+        # it was bounded -- seconds, then done. A live pass runs to the end of
+        # the clip and holds the decoder, so starting one just because a tab
+        # became visible is not the same trade. The strip is a working seeker
+        # from frame zero regardless; Play is what commits the decoder.
 
     # -- config strip --------------------------------------------------------
     def _build_strip(self, cfg: PipelineConfig) -> QWidget:
@@ -618,8 +575,8 @@ class LiveScalogramSurface(QWidget):
         self.block_spin.setToolTip(
             "Working pixels per block. Sets the scalogram grid (and cube "
             "memory); the per-pixel tensor solve is block-size independent, so "
-            "a change here re-reduces the cached pixels instead of "
-            "re-extracting. On auto the block tracks the scale, holding the "
+            "a change here replans the running pass. On auto the block "
+            "tracks the scale, holding the "
             "grid fixed in source pixels so that moving Downsample changes "
             "compute only — not localization.")
         self._commit_on_enter(self.block_spin)
@@ -632,7 +589,7 @@ class LiveScalogramSurface(QWidget):
         self.norm_combo.addItems(["off", "zscore", "clahe"])
         self.norm_combo.setCurrentText(cfg.preprocess.normalize)
         self.norm_combo.setToolTip(
-            "Upstream per-frame pixel op (re-extracts). z-score is ~invariant "
+            "Upstream per-frame pixel op (replans the pass). z-score is ~invariant "
             "for tensor_speed; reshapes change/intensity. CLAHE has a known "
             "replicate-edge artifact.")
         self.norm_combo.currentTextChanged.connect(self._debounce.start)
@@ -641,14 +598,15 @@ class LiveScalogramSurface(QWidget):
         # Everything to its left, plus the detection window and the three
         # threshold bands in the explorer below, back to how this surface opens
         # on a clip it has never seen. Sits at the end of the knob run rather
-        # than with Extract/Process: it is the last member of that group, not a
+        # than with Play/Process: it is the last member of that group, not a
         # third action on the video.
         self.reset_btn = QPushButton("Reset")
         self.reset_btn.setToolTip(
             "Restore the defaults: window, downsample, block and normalize "
             "above, and — in the panel below — the detection window D and all "
             "three detection bands (frequency, channel value, block count). "
-            "Re-extracts once. The selected channel and replicate are kept.")
+            "Replans a running pass once. The selected channel and "
+            "replicate are kept.")
         self.reset_btn.clicked.connect(self.reset_all)
         row.addWidget(self.reset_btn)
 
@@ -666,9 +624,9 @@ class LiveScalogramSurface(QWidget):
             sig.connect(lambda *_: self._save_debounce.start())
 
         # Two stacked, right-aligned status lines sit inline to the left of the
-        # action buttons and take the row's slack: the extract / whole-video
-        # compute on top, and the hosted explorer's graph-compute line just below
-        # it. Darker orange + larger so they read against the light control strip.
+        # action buttons and take the row's slack: the live / whole-video compute
+        # on top, and the hosted explorer's graph-compute line just below it.
+        # Darker orange + larger so they read against the light control strip.
         status_css = ("color:#c2691a; font-family:Consolas; font-size:12px; "
                       "font-weight:600;")
         self.status_lbl = QLabel("")
@@ -685,16 +643,14 @@ class LiveScalogramSurface(QWidget):
         statuscol.addWidget(self.graph_status_lbl)
         row.addLayout(statuscol, 1)
         row.addSpacing(8)
-        self.extract_btn = QPushButton(_EXTRACT_TEXT)
-        self.extract_btn.clicked.connect(self._on_extract_clicked)
-        row.addWidget(self.extract_btn)
         self.live_btn = QPushButton(_LIVE_TEXT)
         self.live_btn.setToolTip(
-            "Process forward continuously from the window start to the end of "
-            "the clip, instead of extracting a fixed window and waiting. The "
-            "readout reports the achieved rate against playback: below 1.0× the "
-            "frontier is falling behind, and the retained history is bounded by "
-            "a ring buffer, so a long run drops its oldest frames.")
+            "Run the surface forward from the window start to the end of the "
+            "clip (Space does the same). The playhead sits half a window behind "
+            "the frontier, so the plots show computed footage on both sides of "
+            "it. The readout reports the achieved rate against playback: below "
+            "1.0× the frontier is falling behind, and the retained history is "
+            "bounded by a ring buffer, so a long run drops its oldest frames.")
         self.live_btn.clicked.connect(self._on_live_clicked)
         row.addWidget(self.live_btn)
         self.process_btn = QPushButton(_PROCESS_TEXT)
@@ -715,7 +671,7 @@ class LiveScalogramSurface(QWidget):
 
         Keyboard tracking off means valueChanged fires once the edit is
         committed (Enter, focus-out, or a step), so typing "0.25" no longer
-        arms three extracts on the way through 0, 0.2, 0.25. On commit the box
+        arms three replans on the way through 0, 0.2, 0.25. On commit the box
         also hands focus back to the surface: while its line edit holds focus
         it eats Space, and Space is the play/pause the user reaches for next.
         """
@@ -745,13 +701,13 @@ class LiveScalogramSurface(QWidget):
         frame = max(self.start_slider.minimum(),
                     min(self.start_slider.maximum(), frame))
         # setValue is a no-op when it matches, so a second press costs nothing;
-        # when it differs, valueChanged carries the re-extract as usual.
+        # when it differs, valueChanged carries the replan as usual.
         self.start_slider.setValue(frame)
 
     def _sync_window_label(self, scrub: int | None = None):
         """The window-start readout. ``scrub`` shows a position being dragged on
         the strip WITHOUT moving the slider: the drag has not committed, and
-        writing it into the slider would fire a re-extract per pixel."""
+        writing it into the slider would replan the pass per pixel of drag."""
         if scrub is not None:
             self.start_lbl.setText(f"{scrub / self.fps:.2f} s ⟵")
             return
@@ -773,7 +729,7 @@ class LiveScalogramSurface(QWidget):
                 "normalize": self.norm_combo.currentText()}
 
     def _apply_strip(self, values: dict) -> None:
-        """Push ``values`` onto the strip without arming a re-extract.
+        """Push ``values`` onto the strip without arming a replan.
 
         Signals are blocked throughout: every setter here is wired to a
         debounce, so applying five of them live would queue five passes to
@@ -812,18 +768,20 @@ class LiveScalogramSurface(QWidget):
 
     def reset_all(self) -> None:
         """Reset button: the strip to its defaults and the explorer's detection
-        tuning with it, then one re-extract.
+        tuning with it, then replan a running pass onto them.
 
-        The explorer is reset FIRST because ``extract`` captures its view state
-        to carry across the rebuild -- reset after, and the pass now in flight
-        would restore the bands this just cleared.
+        The explorer is reset FIRST because a restart captures its view state to
+        carry across the rebuild -- reset after, and the pass now in flight would
+        restore the bands this just cleared.
         """
         if self._explorer is not None:
             self._explorer.reset_tuning()
         self._apply_strip(self._strip_defaults)
         self._save_debounce.start()
-        self.status_lbl.setText("reset to defaults · re-extracting…")
-        self.extract()
+        if self._stream_worker is not None:
+            self.restart_stream("reset to defaults · restarting…")
+        else:
+            self.status_lbl.setText("reset to defaults")
 
     def _save_tuning(self) -> None:
         """Write this clip's tuning sidecar (best-effort; see gui/tuning_store)."""
@@ -858,24 +816,15 @@ class LiveScalogramSurface(QWidget):
 
     # -- button state --------------------------------------------------------
     def _set_busy(self, which: _Busy | None):
-        """Reflect which pass is running in the three action buttons: the running
-        one becomes Stop, the others are disabled (only one streaming pass at a
-        time). ``None`` restores the idle labels."""
-        extracting = which is _Busy.EXTRACT
+        """Reflect which pass is running in the two action buttons: the running
+        one becomes Stop, the other is disabled (only one pass owns the decoder
+        at a time). ``None`` restores the idle labels."""
         processing = which is _Busy.PROCESS
         streaming = which is _Busy.STREAM
-        self.extract_btn.setText("Stop" if extracting else _EXTRACT_TEXT)
         self.process_btn.setText("Stop" if processing else _PROCESS_TEXT)
         self.live_btn.setText("Stop" if streaming else _LIVE_TEXT)
-        self.extract_btn.setEnabled(which is None or extracting)
         self.process_btn.setEnabled(which is None or processing)
         self.live_btn.setEnabled(which is None or streaming)
-
-    def _on_extract_clicked(self):
-        if self._worker is not None:
-            self._request_stop(self._worker, "extract")
-        else:
-            self.extract()
 
     def _on_process_clicked(self):
         if self._proc_worker is not None:
@@ -887,62 +836,33 @@ class LiveScalogramSurface(QWidget):
         """Ask a running pass to unwind. It stops at its next progress tick, so
         both buttons stay disabled until the worker's ``cancelled`` lands."""
         worker.cancel()
-        self.extract_btn.setEnabled(False)
         self.process_btn.setEnabled(False)
         self.live_btn.setEnabled(False)
         self.status_lbl.setText(f"stopping the {what}…")
 
-    # -- extraction ----------------------------------------------------------
-    def extract(self):
-        if (self._proc_worker is not None or self._sweep_worker is not None
-                or self._stream_worker is not None):
-            return                          # another pass owns the decoder
-        if self._worker is not None:
-            # A knob settled mid-extract: that pass is now stale, so supersede it
-            # rather than dropping the edit. The restart runs once it unwinds.
-            self._restart_extract = True
-            self._request_stop(self._worker, "extract")
-            return
-        self._debounce.stop()
-        start, n = self._window()
-        if n < 2:
-            self.status_lbl.setText("window too short at this start position")
-            return
-        cfg = self._build_cfg()
-        if self._explorer is not None:
-            self._pending_state = self._explorer.capture_view_state()
-        # Extract at pixel level (block=1) when the per-pixel footprint fits, so a
-        # later Block change is a cheap re-reduce; over budget, extract directly at
-        # the block (no cache, Block falls back to re-extract).
-        fits = self._perpixel_fits(cfg, n)
-        self._pending_pp = fits
-        self._pending_key = self._pp_signature(cfg, start, n) if fits else None
-        self._pending_cfg = cfg
-        extract_cfg = self._cfg_block1(cfg) if fits else cfg
-        self._set_busy(_Busy.EXTRACT)
-        self._extract_t0 = time.monotonic()
-        self._extract_ctx = (f"block {self._resolved_block(cfg)}, "
-                             f"norm {cfg.preprocess.normalize}")
-        self.status_lbl.setText(
-            f"extracting {n} frames from {start / self.fps:.2f} s "
-            f"({self._extract_ctx})…")
-        self._worker = _LiveExtractWorker(
-            self.video_path, extract_cfg, self.replicates, start, n,
-            self._dims, self)
-        self._worker.done.connect(self._on_extracted)
-        self._worker.failed.connect(self._on_failed)
-        self._worker.cancelled.connect(self._on_extract_cancelled)
-        self._worker.progress.connect(self._on_extract_progress)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.start()
+    def _on_knob_settled(self):
+        """A preprocessing knob settled. Every one of them is upstream of the
+        block grid, so a running pass has to be replanned; with nothing running
+        the new settings are simply what the next Play will use.
 
-    def _on_extract_progress(self, done: int, total: int):
-        if self._worker is None or self._worker.is_cancelled():
-            return          # keep the "stopping…" note; a tick may still be in flight
-        pct = 100.0 * done / max(1, total)
-        self.status_lbl.setText(
-            f"extracting… {done}/{total} frames ({pct:.0f}%) · "
-            f"{self._extract_ctx}{self._eta(done, total, self._extract_t0)}")
+        Both debounces land here. They still differ in settle time -- Block is
+        a single spin step and 250 ms is enough, whereas Downsample is dragged
+        -- but they no longer differ in what they do.
+
+        Both branches SAY which settings are now in force. The idle one is not
+        cosmetic: without it the strip keeps whatever the last pass left there
+        ("live pass stopped"), so a knob moved while stopped gives no feedback
+        at all and reads as a dead control.
+        """
+        self._debounce.stop()
+        self._block_debounce.stop()
+        cfg = self._build_cfg()
+        where = (f"block {self._resolved_block(cfg)}, "
+                 f"norm {cfg.preprocess.normalize}")
+        if self._stream_worker is not None:
+            self.restart_stream(f"settings changed — restarting at {where}…")
+        else:
+            self.status_lbl.setText(f"{where} · press Play ▶ to run from here")
 
     # -- the continuous pass (todo.md Batch Q) -------------------------------
     def _on_live_clicked(self):
@@ -950,6 +870,30 @@ class LiveScalogramSurface(QWidget):
             self.stop_stream()
         else:
             self.start_stream()
+
+    def restart_stream(self, note: str = "") -> None:
+        """Bring a RUNNING pass onto new settings, or onto a new position.
+
+        Two steps, not one, and the second happens in _on_stream_cancelled: the
+        worker owns the decoder until it notices the cancel at its next frame,
+        so starting here would find it still held. ``_restart_stream_at`` is the
+        flag that tells that handler this stop was a move rather than a stop.
+
+        The position always comes from the start slider, which every caller
+        writes first -- there is deliberately no second way to set it.
+
+        ``note`` is written AFTER the stop, not before. ``stop_stream`` ends in
+        ``_request_stop``, which overwrites the status with "stopping the…", so
+        a caller that set its own message first would have it replaced in the
+        same event-loop turn and never seen -- which is what happened to the
+        block/normalize readout this parameter now carries.
+        """
+        if self._stream_worker is None:
+            return
+        self.stop_stream()
+        self._restart_stream_at = int(self.start_slider.value())
+        if note:
+            self.status_lbl.setText(note)
 
     def stop_stream(self):
         """Ask the live pass to unwind. The timer stops HERE rather than in
@@ -970,7 +914,7 @@ class LiveScalogramSurface(QWidget):
         meta = synth_live_meta(self.video_path, cfg, self.replicates,
                                width=w, height=h, fps=fps, frame_count=fc)
         # n=None: forward to the end of the clip. A live pass has no window --
-        # that is the difference between it and extract() -- and the ring, not
+        # that is the point of it -- and the ring, not
         # the plan, is what bounds memory.
         plan = plan_channel_stream(meta, start=start, n=None,
                                    want=frozenset(LIVE_CHANNELS))
@@ -979,8 +923,7 @@ class LiveScalogramSurface(QWidget):
         return meta, plan, capacity
 
     def start_stream(self):
-        if (self._worker is not None or self._proc_worker is not None
-                or self._sweep_worker is not None
+        if (self._proc_worker is not None or self._sweep_worker is not None
                 or self._stream_worker is not None):
             return                          # another pass owns the decoder
         self._debounce.stop()
@@ -991,9 +934,9 @@ class LiveScalogramSurface(QWidget):
         if plan.n < 2:
             self.status_lbl.setText("nothing left to stream from here")
             return
-        # Carry the tuning across exactly as a re-extract does: a live pass
-        # rebuilds the explorer, and without this the bands revert to defaults on
-        # every start (T17, and the reason capture_view_state exists).
+        # Carry the tuning across the rebuild: a live pass rebuilds the explorer,
+        # and without this the bands revert to defaults on every start (T17, and
+        # the reason capture_view_state exists).
         if self._explorer is not None:
             self._pending_state = self._explorer.capture_view_state()
         self._stream_meta = meta
@@ -1019,16 +962,32 @@ class LiveScalogramSurface(QWidget):
         self._stream_timer.start()
         # Stamp the track with what this pass will be computed under BEFORE any
         # window can arrive, so no write can land unstamped or against the
-        # previous pass's settings.
+        # previous pass's settings. On the FIRST pass of a session this cannot
+        # answer yet (no explorer, so no tuned bands); _show_live_window calls
+        # it again the moment it builds one.
+        self._arm_detection()
+
+    def _arm_detection(self) -> None:
+        """Stamp the track for the settings now in force and start the detector.
+
+        Two callers, deliberately: ``start_stream`` runs it before the pass so
+        no window can land against the previous pass's settings, and
+        ``_show_live_window`` runs it again when it builds the explorer, which
+        is the first moment the detector is answerable at all. Idempotent --
+        ``_sync_track`` is a no-op when the stamp has not moved, and restarting
+        a running QTimer only resets its interval.
+        """
         if self._sync_track():
             self.status_lbl.setText(
                 self.status_lbl.text() + " · earlier detection shown gray "
                 "(different settings)")
         if self._track.stamp is None:
             self.status_lbl.setText(
-                self.status_lbl.text() + " · display only — extract and select "
-                "a replicate to accumulate detection")
-        else:
+                self.status_lbl.text() + " · display only — select a "
+                "replicate to accumulate detection")
+        elif self._stream_worker is not None:
+            # Only while a pass is running: the timer parks requests on the
+            # stream worker, so arming it without one would tick against None.
             self._detect_timer.start()
 
     def _request_live_window(self):
@@ -1037,7 +996,7 @@ class LiveScalogramSurface(QWidget):
         Bounded, never the growing island: ``morlet_band_power`` is
         O(F·T log T·B), so re-running it over a 30k-frame island every tick is
         not interactive. The length is the same one the window knob already
-        carries, so the live and extracted views cover comparable spans.
+        carries, so the window knob still means what it says.
         """
         if self._stream_worker is None:
             return
@@ -1152,7 +1111,7 @@ class LiveScalogramSurface(QWidget):
         """``(stamp, region_grid)`` for the settings now in force, or
         ``(None, None)`` when the detector is not yet answerable.
 
-        Not answerable means no explorer (nothing has been extracted, so there
+        Not answerable means no explorer (no pass has run, so there
         are no tuned bands) or no selected replicate. Returning None rather than
         a placeholder stamp is deliberate: a placeholder would let writes land
         against settings nobody chose, and the strip would report coverage for a
@@ -1324,7 +1283,7 @@ class LiveScalogramSurface(QWidget):
                 self.status_lbl.setText(
                     "live detection is producing nothing — the streamed block "
                     "geometry does not match the tuned selection; stop and "
-                    "re-extract before trusting this strip")
+                    "restart before trusting this strip")
             return
         self._detect_drops = 0
         self._repaint_track()
@@ -1333,10 +1292,18 @@ class LiveScalogramSurface(QWidget):
     def _on_scrubbed(self, frame: int):
         """Dragging the strip. Cheap consumers only -- the hosted explorer's
         cursor if that frame is in the span it holds, and the readout. The
-        expensive move waits for the release; a re-extract per pixel of drag
-        would make the seeker unusable."""
+        expensive move waits for the release; a pass restart per pixel of drag
+        would make the seeker unusable.
+
+        The explorer cursor is NOT moved while a pass is running. Under
+        follow_center it cannot hold: every served window re-pins the cursor to
+        the span centre, so a seek placed here survives ~100 ms and the cursor
+        oscillates between the pointer and the centre for the whole drag. The
+        drag position is already shown in the window-start readout, and the
+        release restarts the pass there.
+        """
         self._sync_window_label(scrub=frame)
-        if self._explorer is not None:
+        if self._explorer is not None and self._stream_worker is None:
             self._explorer.seek_absolute(frame)
 
     def _on_seek_committed(self, frame: int):
@@ -1347,6 +1314,12 @@ class LiveScalogramSurface(QWidget):
         redesign records. Skipping around builds up parts of one whole-video
         picture; the per-frame series that carry it are cheap enough that
         abandoning earlier segments buys nothing.
+
+        With nothing running the seek parks the window and SAYS so. It does not
+        start a pass: Play is the only control that commits the decoder, and a
+        drag on a seeker bar is not a request to spend minutes of decode. But it
+        must not be silent either -- the plots still show the last span, so
+        without the readout the strip looks broken rather than parked.
         """
         n = max(2, int(round(self.len_spin.value() * self.fps)))
         start = int(np.clip(frame, 0, max(0, self.frame_count - n)))
@@ -1356,15 +1329,16 @@ class LiveScalogramSurface(QWidget):
         self._sync_window_label()
         self.navigator.set_cursor(frame)
         if self._stream_worker is not None:
-            self.stop_stream()
-            self._restart_stream_at = start
-            return
-        self.extract()
+            self.restart_stream("live pass moving…")
+        else:
+            self.status_lbl.setText(
+                f"parked at {start / self.fps:.2f} s · press Play ▶ to run "
+                f"from here")
 
     def _live_channel_data(self, win: dict) -> ChannelData:
-        """Wrap a served trailing window as the same ChannelData a windowed
-        extract produces, so the explorer and the detector read a live span
-        through the one interface they already have.
+        """Wrap a served trailing window as the ChannelData the explorer and the
+        detector already read, so a live span arrives through the one interface
+        they have.
 
         ``n_frames`` is the WINDOW's length, not the clip's -- the explorer's T
         axis is the span it was handed, exactly as in ``live_channel_source``.
@@ -1414,63 +1388,43 @@ class LiveScalogramSurface(QWidget):
         cd = self._live_channel_data(win)
         if self._explorer is None:
             self._swap_explorer(cd)
-            # Opens on the newest frame, which is also what keeps it following:
-            # see ScalogramExplorer.follow_latest.
-            self._explorer.follow_latest()
+            # Pinned to the MIDDLE of the served window, and it stays there: the
+            # playhead is a fixed landmark with computed footage on both sides
+            # of it, rather than a marker riding the ragged right edge. See
+            # ScalogramExplorer.follow_center.
+            self._explorer.follow_center()
+            # The detector only becomes ANSWERABLE here. start_stream stamps the
+            # track before the pass starts, which is right for every restart --
+            # but on the first pass of a session there is no explorer yet, so
+            # _current_stamp returns None, the track goes unstamped and the
+            # detect timer never starts. The strip then stays empty for the
+            # whole run while progress looks healthy: the exact shape
+            # _DETECT_DROP_ALARM exists to catch, arriving by a route that
+            # produces no drops to count. Stamping here closes it.
+            self._arm_detection()
             return
         self._explorer.set_channel_data(cd, live=not force)
-
-    def _record_cost_sample(self, cd, block_intent: int | None = _INFER):
-        """Keep one timing sample per (scale, block) for the cost model.
-
-        Overwrites rather than averages: the newest pass reflects the current
-        machine state (thermal, other load), and todo.md records run-to-run
-        spread of ~25% at fixed settings, so an average over a long session would
-        blend conditions rather than reduce noise.
-
-        ``block_intent`` is the ``FlowConfig.block_size`` the pass ran under --
-        ``None`` for tracked, a number for pinned -- and it is what the regime
-        grouping uses. It has to be passed rather than derived from the resolved
-        block, because for any pinned block there is a scale at which tracking
-        would have produced the same number, and inferring would then file that
-        one pass in the wrong regime.
-        """
-        t = (getattr(cd, "meta", None) or {}).get("timing")
-        if not t or not t.get("frames") or float(t.get("wall", 0.0)) <= 0.0:
-            return
-        key = (round(float(t["scale"]), 6), int(t["block"]))
-        self._cost_samples[key] = PassSample(
-            scale=float(t["scale"]), frames=int(t["frames"]),
-            wall=float(t["wall"]), spans=dict(t.get("spans") or {}))
-        self._sample_regime[key] = (self._infer_regime(*key)
-                                    if block_intent is _INFER else block_intent)
-        # Tracked explicitly: re-recording an existing key keeps its original
-        # insertion position, so dict order does not identify the newest sample.
-        self._last_cost_key = key
-
-    @staticmethod
-    def _infer_regime(scale: float, block: int) -> int | None:
-        """Best-effort regime for a pass whose config is no longer to hand.
-
-        Only a fallback: it cannot tell a pass pinned to 64 at scale 1.0 from a
-        tracked one, because they are the same pass. Callers that know the config
-        pass the intent instead.
-        """
-        if int(block) == FlowConfig(block_size=None).resolve_block_size(scale):
-            return None
-        return int(block)
+        # The strip's cursor is driven by the explorer's frame_moved, which only
+        # fires when the frame CHANGES. Under follow_center the centre index is
+        # constant while the window slides, so the absolute frame moves without
+        # the index moving -- and the strip would sit still through the whole
+        # pass. Push it explicitly.
+        self.navigator.set_cursor(self._explorer.absolute_frame())
 
     def _cost_model(self) -> tuple[CostModel | None, int | None]:
         """Fit within one regime; returns ``(model, fixed block or None)``.
 
         Samples must not be mixed across regimes -- a block=1 pass does no
-        reduction at all and is much slower than a production pass -- but
-        "newest regime" is the wrong way to pick one: whether a live pass runs at
-        block=1 depends on whether its per-pixel footprint fits the budget, and
-        that footprint scales with the square of the scale, so dragging
-        Downsample to compare scales is itself what splits the samples. Picking
-        the regime with the most distinct scales finds the fit if one exists
+        reduction at all and is much slower than a production pass. Picking the
+        regime with the most distinct scales finds the fit if one exists
         anywhere; ties go to the newest.
+
+        Every sample now comes from the dialog's own sweep (see _on_sweep_row).
+        The surface used to contribute one per windowed extract, so the dialog
+        often opened with a model already fitted; with the extract retired it
+        opens empty until a sweep is run. That is a real loss of convenience and
+        not of correctness -- the sweep's rows were always the better samples,
+        since they resolve the block as production does.
 
         The second element tells the dialog which regime the numbers came from:
         a fixed block (``1`` in particular, which the dialog labels as an upper
@@ -1509,7 +1463,7 @@ class LiveScalogramSurface(QWidget):
             accepted = dlg.exec()
         finally:
             # A sweep still running when the window closes has nowhere to report
-            # to, and it holds the decoder the next extract needs. Unwind it here
+            # to, and it holds the decoder the next pass needs. Unwind it here
             # rather than letting it race the reopened dialog.
             self._stop_sweep(wait=True)
             self._stop_render(wait=True)
@@ -1518,7 +1472,7 @@ class LiveScalogramSurface(QWidget):
             # dialog behind whose Run button is still wired to _start_sweep.
             dlg.deleteLater()
         if accepted and dlg.chosen_scale is not None:
-            # setValue fires valueChanged, which starts the re-extract debounce,
+            # setValue fires valueChanged, which starts the replan debounce,
             # so choosing a scale here applies exactly as dragging the spin does.
             self.ds_spin.setValue(float(dlg.chosen_scale))
 
@@ -1590,7 +1544,7 @@ class LiveScalogramSurface(QWidget):
 
     # -- the dialog's render strip -------------------------------------------
     def _replicate_box(self, index: int):
-        """The source-pixel box of one replicate, as extraction sees it.
+        """The source-pixel box of one replicate, as the pass sees it.
 
         Through ``build_layout`` at scale 1.0 rather than off the replicate dict
         directly, so the strip renders the same box the pass crops -- a box the
@@ -1663,12 +1617,11 @@ class LiveScalogramSurface(QWidget):
     def _sweep_ready(self) -> tuple[bool, str]:
         """Whether a sweep can run, and why not when it cannot.
 
-        Short, because the sweep only times extraction: it needs no tuned
+        Short, because the sweep only times the decode+solve: it needs no tuned
         detector and no selected replicate, so it can run the moment the window
         opens. Only a decoder conflict or a degenerate window can stop it.
         """
-        if (self._worker is not None or self._proc_worker is not None
-                or self._stream_worker is not None):
+        if self._proc_worker is not None or self._stream_worker is not None:
             return False, "Another pass is running; wait for it to finish."
         if self._window()[1] < 2:
             return False, "The window is too short at this start position."
@@ -1763,135 +1716,10 @@ class LiveScalogramSurface(QWidget):
                 "Stopped. The rows that finished are still valid — each is an "
                 "independent timed pass, not a partial result.")
 
-    def _on_extracted(self, cd):
-        self._worker = None
-        self._set_busy(None)
-        cfg = self._pending_cfg or self._build_cfg()
-        # The regime is the block the PASS ran under, which is 1 whenever the
-        # per-pixel cache was built -- not the block cfg asks the display for.
-        self._record_cost_sample(cd, 1 if self._pending_pp
-                                 else cfg.flow.block_size)
-        if self._pending_pp:                         # cd is the block=1 pixel cache
-            self._pp = cd
-            self._pp_key = self._pending_key
-            display = reduce_channel_data(cd, cfg, self.replicates)
-        else:
-            self._pp = None
-            self._pp_key = None
-            display = cd
-        if self._restart_extract:
-            # A knob change asked to supersede this pass, but it finished before
-            # the cancel reached a tick, so `cancelled` never fired. Its channels
-            # are still a valid cache for those settings -- keep them, skip the
-            # now-stale display, and run the pass the user actually asked for.
-            # Leaving the flag set here would also make the next Stop restart.
-            self._restart_extract = False
-            self.extract()
-            return
-        self._show_channel_data(display)
-
-    def _show_channel_data(self, cd):
-        approx = " · approximated" if cd.approximated else ""
-        self.status_lbl.setText(
-            f"window {cd.window_start / self.fps:.2f} s · {cd.n_frames} frames · "
-            f"{cd.meta['grid'][0]}×{cd.meta['grid'][1]} blocks{approx}")
-        self._swap_explorer(cd)
-        # An extract is the first point at which the detector is answerable at
-        # all (it is what produces the tuned bands and the region), so this is
-        # where a track that has been sitting unstamped gets its stamp -- and
-        # where a geometry change makes the previous stamp's coverage stale.
-        self._sync_track()
-        self.navigator.set_cursor(cd.window_start)
-
-    # -- pixel-cache helpers -------------------------------------------------
-    def _pp_signature(self, cfg: PipelineConfig, start: int, n: int) -> tuple:
-        """Everything upstream of the block size: a change here invalidates the
-        cached per-pixel channels, a Block change does not."""
-        scale = cfg.preprocess.resolve_downsample(self._dims[0])
-        return (start, n, round(float(scale), 6), cfg.preprocess.normalize)
-
-    def _perpixel_bytes(self, cfg: PipelineConfig, n: int) -> int:
-        w, h = self._dims[0], self._dims[1]
-        scale = cfg.preprocess.resolve_downsample(w)
-        ny, nx = build_layout(self.replicates, w, h, scale, 1).atlas_grid
-        return n * ny * nx * len(LIVE_CHANNELS) * 4
-
-    def _perpixel_fits(self, cfg: PipelineConfig, n: int) -> bool:
-        return self._perpixel_bytes(cfg, n) <= self._pp_budget
-
-    def _pp_miss_reason(self, cfg: PipelineConfig, n: int) -> str:
-        """Why a Block change had to re-extract, in the numbers the user can act
-        on. A silent fallback here reads as a bug (it did, for a while): the
-        tooltip promises a re-reduce, so the exception has to say what it would
-        take -- shorten the window or drop the scale."""
-        need = self._perpixel_bytes(cfg, n)
-        if need <= self._pp_budget:
-            return "window changed"          # a real miss, not a budget miss
-        secs = self._pp_budget / max(1, need / max(n, 1)) / max(self.fps, 1e-6)
-        return (f"window needs {human_bytes(need)} of pixel cache, "
-                f"budget {human_bytes(self._pp_budget)} "
-                f"(~{secs:.1f} s fits at this scale)")
-
     def _resolved_block(self, cfg: PipelineConfig) -> int:
         """The working block size a pass will actually use (auto tracks scale)."""
         return cfg.flow.resolve_block_size(
             cfg.preprocess.resolve_downsample(self._dims[0]))
-
-    @staticmethod
-    def _cfg_block1(cfg: PipelineConfig) -> PipelineConfig:
-        return replace(cfg, flow=replace(cfg.flow, block_size=1))
-
-    def _on_block_changed(self):
-        """Block changed: re-reduce the cached pixel channels (instant) if they
-        cover this window, else fall back to a full (block=1) extract."""
-        if (self._proc_worker is not None or self._sweep_worker is not None
-                or self._stream_worker is not None):
-            return
-        if self._worker is not None:
-            # Mid-extract: even a cache hit would be overwritten by the pass in
-            # flight, so supersede it with a full re-extract at the new block.
-            self.extract()
-            return
-        self._block_debounce.stop()
-        start, n = self._window()
-        if n < 2:
-            self.status_lbl.setText("window too short at this start position")
-            return
-        cfg = self._build_cfg()
-        if self._pp is not None and self._pp_key == self._pp_signature(cfg, start, n):
-            if self._explorer is not None:
-                self._pending_state = self._explorer.capture_view_state()
-            self.status_lbl.setText(
-                f"re-reducing to block {self._resolved_block(cfg)} — "
-                f"no re-extract…")
-            self.status_lbl.repaint()
-            self._show_channel_data(
-                reduce_channel_data(self._pp, cfg, self.replicates))
-        else:
-            self.status_lbl.setText(
-                f"re-extracting — {self._pp_miss_reason(cfg, n)}…")
-            self.status_lbl.repaint()
-            self.extract()
-
-    def _on_failed(self, msg: str):
-        self._worker = None
-        self._restart_extract = False
-        self._set_busy(None)
-        self.status_lbl.setText(f"extract failed: {msg}")
-
-    def _on_extract_cancelled(self):
-        """The stopped pass produced nothing, so the pixel cache and the pending
-        bookkeeping it would have filled are left as they were."""
-        self._worker = None
-        self._pending_pp = False
-        self._pending_key = None
-        self._pending_cfg = None
-        self._set_busy(None)
-        if self._restart_extract:      # a knob change superseded it; run the new one
-            self._restart_extract = False
-            self.extract()
-            return
-        self.status_lbl.setText("extract stopped")
 
     def _swap_explorer(self, cd):
         if self._placeholder is not None:
@@ -1939,12 +1767,12 @@ class LiveScalogramSurface(QWidget):
 
     # -- whole-video commit --------------------------------------------------
     def process_whole_video(self):
-        if (self._worker is not None or self._proc_worker is not None
-                or self._sweep_worker is not None
+        if (self._proc_worker is not None or self._sweep_worker is not None
                 or self._stream_worker is not None):
             return                                  # a pass is already running
         if self._explorer is None:
-            self.status_lbl.setText("extract a window and tune it first")
+            self.status_lbl.setText(
+                "press Play ▶ and tune the detector first")
             return
         params = self._explorer.detection_params()
         if params["region_index"] < 0:
@@ -2007,7 +1835,7 @@ class LiveScalogramSurface(QWidget):
             self.status_lbl.setText(
                 "whole-video pass finished but its block geometry does not "
                 "match the current selection — nothing was recorded; "
-                "re-extract and process again")
+                "restart the live pass and process again")
             return
         n = len(self._track.detected_intervals())
         if short is not None:
@@ -2052,7 +1880,18 @@ class LiveScalogramSurface(QWidget):
         return f" · ~{remaining / 60:.1f} min left"
 
     def _focus_frame(self, center: int):
-        """A detection was chosen: load a window centered on it for verification."""
+        """A detection was chosen: park the window on it for verification.
+
+        The window STARTS half a length before the event rather than being
+        centred on it, because the playhead now sits at the middle of the served
+        window (see follow_center): a pass starting here reaches the event with
+        it under the cursor, which is what "focus this detection" means.
+
+        Like a plain seek, this parks rather than starting a pass -- but it has
+        to say that outright. "Next strongest" is a verb, and a button that
+        moves a slider the user is not looking at and changes nothing else is
+        indistinguishable from a broken one.
+        """
         n = max(2, int(round(self.len_spin.value() * self.fps)))
         start = int(np.clip(center - n // 2, 0, max(0, self.frame_count - n)))
         self.navigator.set_cursor(center)
@@ -2060,23 +1899,38 @@ class LiveScalogramSurface(QWidget):
         self.start_slider.setValue(start)
         self.start_slider.blockSignals(False)
         self._sync_window_label()
-        self.extract()
+        if self._stream_worker is not None:
+            self.restart_stream(f"moving to the detection at "
+                                f"{center / self.fps:.2f} s…")
+        else:
+            self.status_lbl.setText(
+                f"detection at {center / self.fps:.2f} s · press Play ▶ to "
+                f"run from here")
 
     def toggle_playback(self):
-        """Space handler the main window's focus-walk finds; drives the hosted
-        explorer so the embedded explorer needs no Space shortcut of its own."""
-        if self._explorer is not None:
-            self._explorer.toggle_playback()
+        """Space handler the main window's focus-walk finds.
+
+        Play IS the live pass now. There is no separate notion of playing back
+        an already-extracted window: the surface has one forward-running pass,
+        and Space starts and stops it exactly as the button does.
+        """
+        self._on_live_clicked()
 
     def hideEvent(self, e):
         # Switching tabs is the other way a tuning session ends without a
         # close, and the app can be quit from any tab. Cheap enough (one small
         # JSON write) to take unconditionally rather than track dirtiness.
         self._save_tuning()
-        # A live pass runs to the END OF THE CLIP, so unlike the extract it does
-        # not self-terminate in seconds: left running on a hidden tab it holds
-        # the decoder and a full ring for minutes, and blocks extract/process
-        # when the user comes back. Stopped rather than paused because the ring
+        # Disarm before stopping. A knob or seek that armed a restart moments
+        # ago is still pending, and _on_stream_cancelled consumes that flag
+        # WITHOUT checking visibility -- so the stop below would unwind the
+        # worker and immediately start another full-clip pass on a tab nobody
+        # is looking at, which is the exact thing the stop exists to prevent.
+        self._restart_stream_at = None
+        # A live pass runs to the END OF THE CLIP: left running on a hidden tab
+        # it holds the decoder and a full ring for minutes, and blocks the
+        # whole-video commit when the user comes back. Stopped rather than
+        # paused because the ring
         # is bounded anyway -- resuming would restart the island in most cases.
         self.stop_stream()
         super().hideEvent(e)
@@ -2086,10 +1940,9 @@ class LiveScalogramSurface(QWidget):
         # replicate edit that rebuilds the surface) is the most common way a
         # session ends, and an armed debounce would be dropped with the widget.
         self._save_tuning()
-        self._restart_extract = False
         self._restart_stream_at = None
         # A knob edited just before the close leaves a debounce armed; let it fire
-        # and it re-enters extract() on a surface that is on its way out.
+        # and it restarts a pass on a surface that is on its way out.
         self._debounce.stop()
         self._block_debounce.stop()
         self._retune_debounce.stop()
@@ -2097,12 +1950,12 @@ class LiveScalogramSurface(QWidget):
         # Before the workers: this one parks requests on the stream worker, and a
         # tick between the cancel and the wait would touch a thread on its way out.
         self._stream_timer.stop()
-        for w in (self._worker, self._proc_worker, self._sweep_worker,
+        for w in (self._proc_worker, self._sweep_worker,
                   self._render_worker, self._stream_worker):
             if w is not None:
                 w.cancel()      # unwind at the next tick instead of waiting it out
                 w.wait()
-        self._worker = self._proc_worker = self._sweep_worker = None
+        self._proc_worker = self._sweep_worker = None
         self._render_worker = self._stream_worker = None
         if self._explorer is not None:
             self._explorer.close()

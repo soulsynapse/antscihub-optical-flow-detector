@@ -1,15 +1,16 @@
 """Preprocessing as a live scalogram surface.
 
 This is the dissolved preprocessing tab: instead of configuring a flow pass and
-waiting for a cache, you tune downsample / block size / normalization on a short
-window of the raw video and watch the scalogram and detection stack respond, with
-no flow solve. The old "Preprocessing & Flow" tab is now the optional commit step
-(it still runs the flow pass and writes the cache the Behavior tab consumes).
+waiting for a cache, you press Play and tune downsample / block size /
+normalization while the scalogram and detection stack respond, with no flow
+solve. The old "Preprocessing & Flow" tab is now the optional commit step (it
+still runs the flow pass and writes the cache the Behavior tab consumes).
 
 The heavy LiveScalogramSurface is built lazily -- only when the tab is shown and a
 video plus at least one replicate box exist, and rebuilt only when the video or
-replicate geometry actually changes (a windowed extraction is a real pass, so it
-must not fire on every box edit made on another tab).
+replicate geometry actually changes. A rebuild drops any pass in flight and its
+retained detection track, so it must not fire on every box edit made on another
+tab.
 """
 from __future__ import annotations
 

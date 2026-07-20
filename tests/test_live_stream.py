@@ -101,6 +101,33 @@ class SetChannelDataTests(_QtTestCase):
         ex.set_channel_data(_slid(cd, window_start=90))
         self.assertEqual(ex.frame, ex.T - 1)
 
+    def test_follow_center_pins_the_cursor_to_the_middle_of_every_window(self):
+        """The reading position sits half a window behind the frontier, so the
+        plots carry computed footage on BOTH sides of the playhead. The centre
+        has to be re-asserted per window: the span slides under it, so a cursor
+        merely placed there once would be carried away by absolute index."""
+        ex, cd = self._explorer(T=64)
+        ex.follow_center()
+        mid = (ex.T - 1) // 2
+        self.assertEqual(ex.frame, mid)
+        for start in (40, 90, 250):
+            ex.set_channel_data(_slid(cd, window_start=start))
+            self.assertEqual(ex.frame, (ex.T - 1) // 2)
+
+    def test_follow_center_advances_the_ABSOLUTE_frame_as_the_window_slides(self):
+        """The T-axis index is constant under follow_center, so `frame_moved`
+        never fires -- and the whole-clip strip would sit still for the entire
+        pass if it were the only route. absolute_frame is what actually moves."""
+        ex, cd = self._explorer(T=64)
+        ex.follow_center()
+        seen = []
+        for start in (0, 40, 90, 250):
+            ex.set_channel_data(_slid(cd, window_start=start))
+            seen.append(ex.absolute_frame())
+        self.assertEqual(seen, sorted(seen))
+        self.assertEqual(len(set(seen)), len(seen))     # strictly advancing
+        self.assertEqual(seen[-1], 250 + (ex.T - 1) // 2)
+
     def test_a_parked_cursor_holds_its_ABSOLUTE_frame(self):
         """Scrub away from the frontier and the cursor must stay on the video
         frame it was put on, not on the T-axis index -- those diverge the moment
@@ -386,7 +413,7 @@ class StreamWiringTests(_SurfaceTestCase):
                 end(s)
                 self.assertFalse(s._stream_timer.isActive())
                 self.assertIsNone(s._stream_worker)
-                self.assertTrue(s.extract_btn.isEnabled())
+                self.assertTrue(s.process_btn.isEnabled())
                 self.assertEqual(s.live_btn.text(), lss._LIVE_TEXT)
 
     def test_a_truncated_pass_does_not_read_as_complete(self):

@@ -356,6 +356,11 @@ class ScalogramExplorer(QWidget):
         # Absolute video frame the T axis starts at (0 for full-clip sources);
         # the video overlay adds it back to decode the right frame.
         self.window_start = int(channel_data.window_start)
+        # How the cursor is carried onto a new span: None is the historical
+        # "hold the absolute frame, unless it was riding the newest one";
+        # "latest" and "center" are the two explicit live modes. See
+        # follow_center and set_channel_data.
+        self._follow: str | None = None
         self.fps = float(self.meta["fps"])
         self.dt = 1.0 / max(self.fps, EPS)
         self.ny, self.nx = map(int, self.meta["grid"])
@@ -584,7 +589,26 @@ class ScalogramExplorer(QWidget):
         live view pins to the OLDEST retained frame and stays there, drifting
         further behind the frontier with every update while looking stationary.
         """
+        self._follow = "latest"
         self._update_frame(self.T - 1)
+
+    def follow_center(self) -> None:
+        """Pin the cursor to the MIDDLE of the span and keep it there.
+
+        This is the live surface's reading position. The served window is the
+        trailing ``n`` frames ending at the frontier, so a cursor at its centre
+        sits half a window behind the frontier: the left half of every plot is
+        what has been played, the right half is what the pass has already
+        computed and is about to reach. The playhead is therefore a fixed
+        landmark and the data scrolls under it, rather than the reverse.
+
+        The alternative -- cursor on the frontier -- puts the reading position
+        hard against the right edge of every plot, where a burst is half drawn
+        and there is no lead-in at all. Trailing the frontier costs latency
+        equal to half the window and buys the context to see an event coming.
+        """
+        self._follow = "center"
+        self._update_frame((self.T - 1) // 2)
 
     def set_channel_data(self, channel_data, live: bool = False) -> None:
         """Replace the channels in place, keeping the tuning and the geometry.
@@ -655,10 +679,18 @@ class ScalogramExplorer(QWidget):
         # now places each cube at its true position and hatches the remainder.
         self._density_dirty = set(CHANNELS)
 
-        # A cursor that was riding the newest frame keeps riding it; otherwise
-        # hold the absolute frame the user parked on, and clamp if the window has
-        # slid past it.
-        frame = self.T - 1 if followed else old_abs - self.window_start
+        # Where the cursor lands on the new span. An explicit follow mode wins:
+        # "center" is the live surface's reading position (see follow_center),
+        # and it has to be re-asserted on every window because the span slides
+        # under it. Otherwise the historical rule applies -- a cursor riding the
+        # newest frame keeps riding it, and anything else holds the absolute
+        # frame the user parked on, clamped if the window has slid past it.
+        if self._follow == "center":
+            frame = (self.T - 1) // 2
+        elif self._follow == "latest" or followed:
+            frame = self.T - 1
+        else:
+            frame = old_abs - self.window_start
         self.frame = max(0, min(int(frame), self.T - 1))
         self.sweep_win = max(1, min(max(1, self.T - 1), int(self.sweep_win)))
         self.scrub.blockSignals(True)
@@ -993,6 +1025,19 @@ class ScalogramExplorer(QWidget):
         return [self.trace_plot, self.scalo_plot, *self.density_plots.values(),
                 self.count_plot, self.count_w_plot, self.clump_plot]
 
+    def _value_axis_plots(self):
+        """Every plot whose Y axis is a data VALUE, i.e. everything except the
+        scalogram, whose Y is frequency. These are the ones the sticky axis
+        applies to; see the call in _build_ui."""
+        return [pl for pl in self._all_plots() if pl is not self.scalo_plot]
+
+    def _reset_sticky_ranges(self) -> None:
+        """Drop the accumulated value bounds. Called when the plots change what
+        they MEASURE -- another replicate, another channel -- never when they
+        merely receive the next window of the same thing."""
+        for pl in self._value_axis_plots():
+            pl.reset_sticky_range()
+
     # -- UI ------------------------------------------------------------------
     def _build_ui(self):
         self.resize(1600, 980)
@@ -1241,6 +1286,16 @@ class ScalogramExplorer(QWidget):
         for pl in (self.scalo_plot, self.count_w_plot):
             pl.set_collapsible(False)
             pl.set_collapsed(False)
+        # Sticky value axes on everything whose Y is a VALUE. A live pass
+        # replaces the series ~10x a second, and a per-window autoscale then
+        # rescales every one of these continuously as the trailing window slides
+        # -- so a burst two windows ago silently redefines what "high" means,
+        # and a band handle placed against the axis drifts in pixels while the
+        # threshold behind it has not moved. Accumulating instead means the axis
+        # settles as the run covers the clip's range. The scalogram is excluded:
+        # its Y is log FREQUENCY, fixed by the transform, not a data range.
+        for pl in self._value_axis_plots():
+            pl.set_sticky_range(True)
 
         self._apply_selected_plot_ui()
         self._sync_labels()
@@ -1983,7 +2038,18 @@ class ScalogramExplorer(QWidget):
         # whole-clip strip, whose axis is the video's. Emitting the T-axis index
         # would walk its cursor backwards through the clip every time a live
         # window slid forward, while appearing to sit still.
-        self.frame_moved.emit(self.window_start + self.frame)
+        self.frame_moved.emit(self.absolute_frame())
+
+    def absolute_frame(self) -> int:
+        """Where the cursor sits on the VIDEO's axis, not this span's.
+
+        The counterpart to seek_absolute, for consumers whose axis is the clip.
+        Needed separately from ``frame_moved`` because that signal reports a
+        CHANGE of the T-axis index, and under follow_center the index is
+        constant while the window slides -- so the absolute position moves
+        continuously without the signal ever firing.
+        """
+        return int(self.window_start + self.frame)
 
     def seek_absolute(self, frame: int) -> bool:
         """Move the cursor to an absolute VIDEO frame if this span holds it.
@@ -2088,6 +2154,10 @@ class ScalogramExplorer(QWidget):
         data = self.region_combo.currentData()
         self.active_region_index = int(data) if data is not None else 0
         self._restore_bands(old_index)
+        # A different replicate is a different set of blocks, so the accumulated
+        # axis bounds do not describe it. Carrying them over would put one
+        # replicate's outliers on another's axis.
+        self._reset_sticky_ranges()
         focus = None if self.active_region_index < 0 else \
             self._active_regions()[0]["frac"]
         self.video_view.set_focus_frac(focus)
@@ -2102,6 +2172,9 @@ class ScalogramExplorer(QWidget):
         if not checked:
             return
         self.channel = str(button.property("channel"))
+        # Channels are in different units entirely (energies vs bounded ratios),
+        # so the accumulated bounds are meaningless across a switch.
+        self._reset_sticky_ranges()
         if self.active_region_index < 0:
             return
         self._rebuild_selected_views()

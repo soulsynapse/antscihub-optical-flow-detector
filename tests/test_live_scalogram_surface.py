@@ -10,14 +10,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QHideEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from core.channel_source import live_channel_source
 from gui.explorers import live_scalogram_surface
+from core.scale_sweep import ScalePass
 from gui.explorers.live_scalogram_surface import (_Busy, _Cancelled,
-                                                  _PP_BUDGET_CAP,
-                                                  _PP_BUDGET_FLOOR,
                                                   _StreamWorker,
                                                   LiveScalogramSurface)
 from gui.tuning_store import tuning_path
@@ -34,8 +34,8 @@ class _QtTestCase(unittest.TestCase):
 
 
 class _SurfaceTestCase(_QtTestCase):
-    """Shared fixture: one throwaway clip and a surface whose opening extract and
-    terminal display step are stubbed, so tests drive the control flow only."""
+    """Shared fixture: one throwaway clip and a surface whose live pass is
+    stubbed, so tests drive the control flow only."""
 
     @classmethod
     def setUpClass(cls):
@@ -73,13 +73,11 @@ class _SurfaceTestCase(_QtTestCase):
         self._drop_tuning()
         self.addCleanup(self._drop_tuning)
         reps = [{"id": 0, "label": "all", "frac": (0.0, 0.0, 1.0, 1.0)}]
-        # singleShot is patched out so constructing the surface does not kick off
-        # the opening extract pass.
-        with patch("gui.explorers.live_scalogram_surface.QTimer.singleShot"):
-            surface = LiveScalogramSurface(self.video, reps)
+        surface = LiveScalogramSurface(self.video, reps)
         self.addCleanup(self._destroy, surface)
-        surface._show_channel_data = MagicMock()
-        surface.extract = MagicMock()
+        # Nothing runs on construction any more (Play commits the decoder), but
+        # the restart path would, so it is stubbed out for the same reason.
+        surface.start_stream = MagicMock()
         return surface
 
 
@@ -145,117 +143,166 @@ class TypedKnobCommitTests(_SurfaceTestCase):
         self.assertFalse(surface.hasFocus())
 
 
-class LiveScalogramSurfaceBlockTests(_SurfaceTestCase):
-    """A Block change is block-independent downstream of the per-pixel tensor
-    solve, so it must re-reduce the cached block=1 channels rather than decode
-    and solve the window again."""
+class KnobReplanTests(_SurfaceTestCase):
+    """Every preprocessing knob is upstream of the block grid, so a knob change
+    replans the RUNNING pass and does nothing when none is running.
 
-    def test_block_change_re_reduces_cached_pixel_channels(self):
+    This replaces the old per-pixel-cache behaviour. That cache existed so a
+    Block change could re-reduce cached block=1 channels instead of paying a
+    full re-extract; with the extract retired there is no window to re-run and
+    nothing for it to save.
+    """
+
+    def test_a_knob_change_replans_a_running_pass(self):
         surface = self._surface()
-        start, n = surface._window()
-        cached = object()
-        surface._pp = cached
-        surface._pp_key = surface._pp_signature(surface._build_cfg(), start, n)
+        surface._stream_worker = MagicMock()
+        surface.restart_stream = MagicMock()
+        surface._on_knob_settled()
+        surface.restart_stream.assert_called_once()
+        # The replan names the settings it is restarting under. That readout is
+        # the reason the note travels through restart_stream at all: set before
+        # the stop, _request_stop overwrites it and it is never seen.
+        (note,), _kw = surface.restart_stream.call_args
+        self.assertIn("block", note)
+        surface._stream_worker = None
 
-        reduced = object()
-        with patch("gui.explorers.live_scalogram_surface.reduce_channel_data",
-                   return_value=reduced) as reduce:
-            surface.block_spin.setValue(5)
-            surface._on_block_changed()
-
-        surface.extract.assert_not_called()
-        self.assertIs(reduce.call_args.args[0], cached)
-        self.assertEqual(reduce.call_args.args[1].flow.block_size, 5)
-        surface._show_channel_data.assert_called_once_with(reduced)
-
-    def test_block_change_re_extracts_when_cache_misses_the_window(self):
+    def test_a_knob_change_while_stopped_still_says_what_it_did(self):
+        """Otherwise the strip keeps whatever the last pass left there and a
+        knob moved while stopped reads as a dead control."""
         surface = self._surface()
-        surface._pp = object()
-        surface._pp_key = ("stale",)      # signature from a different window
+        surface.status_lbl.setText("live pass stopped")
+        surface.norm_combo.setCurrentText("zscore")
+        surface._on_knob_settled()
+        self.assertIn("zscore", surface.status_lbl.text())
+        self.assertIn("Play", surface.status_lbl.text())
 
-        surface.block_spin.setValue(5)
-        surface._on_block_changed()
-
-        surface.extract.assert_called_once()
-        surface._show_channel_data.assert_not_called()
-
-    def test_extract_then_block_change_reuses_the_cache_it_just_stored(self):
-        """The round trip the other tests skip: they set ``_pp_key`` by hand, so
-        they pass even when nothing ever POPULATES the cache. That gap hid a real
-        failure -- the budget was a flat 2 GiB, which covers under a second of
-        5.3K footage, so on real clips the cache never built and every Block
-        change silently paid a full re-extract. Drive store and compare together.
-        """
+    def test_a_knob_change_does_nothing_when_no_pass_is_running(self):
         surface = self._surface()
-        start, n = surface._window()
-        cfg = surface._build_cfg()
-        self.assertTrue(surface._perpixel_fits(cfg, n),
-                        "fixture must fit the budget for this to mean anything")
+        surface.restart_stream = MagicMock()
+        surface._on_knob_settled()
+        surface.restart_stream.assert_not_called()
 
-        # Exactly what extract() sets up before handing off to the worker.
-        surface._pending_pp = True
-        surface._pending_key = surface._pp_signature(cfg, start, n)
-        surface._pending_cfg = cfg
-        cd = live_channel_source(
-            self.video, surface._cfg_block1(cfg), surface.replicates,
-            start=start, n=n, width=surface._dims[0], height=surface._dims[1],
-            fps=surface._dims[2], frame_count=surface._dims[3])
-        self.assertEqual(int(cd.meta["block_size"]), 1)
-        surface._on_extracted(cd)
-
-        self.assertIsNotNone(surface._pp, "extract stored no per-pixel cache")
-        surface.block_spin.setValue(8)
-        surface._on_block_changed()
-        surface.extract.assert_not_called()
-
-    def test_budget_is_sized_from_free_ram_not_a_flat_constant(self):
+    def test_both_debounces_land_on_the_one_replan(self):
+        """Block and the rest still settle at different speeds -- Block is a
+        single spin step, Downsample is dragged -- but they no longer differ in
+        what they do, so a Block change must not take a separate path."""
         surface = self._surface()
-        self.assertGreaterEqual(surface._pp_budget, _PP_BUDGET_FLOOR)
-        self.assertLessEqual(surface._pp_budget, _PP_BUDGET_CAP)
+        surface._stream_worker = MagicMock()
+        surface.restart_stream = MagicMock()
+        surface._debounce.timeout.emit()
+        surface._block_debounce.timeout.emit()
+        self.assertEqual(surface.restart_stream.call_count, 2)
+        surface._stream_worker = None
 
-    def test_budget_miss_says_why_it_re_extracted(self):
-        """A silent fallback here reads as a bug, because the tooltip promises a
-        re-reduce. The status must name the budget as the reason."""
+    def test_a_replan_is_refused_while_the_whole_video_pass_owns_the_decoder(self):
         surface = self._surface()
-        surface._pp = None
-        surface._pp_budget = 1          # nothing can fit
-        surface.block_spin.setValue(8)
-        surface._on_block_changed()
-
-        surface.extract.assert_called_once()
-        text = surface.status_lbl.text()
-        self.assertIn("re-extracting", text)
-        self.assertIn("budget", text)
-
-    def test_block_change_is_ignored_during_the_whole_video_pass(self):
-        surface = self._surface()
-        start, n = surface._window()
-        surface._pp = object()
-        surface._pp_key = surface._pp_signature(surface._build_cfg(), start, n)
         surface._proc_worker = MagicMock()
-
-        surface.block_spin.setValue(5)
-        surface._on_block_changed()
-
-        surface.extract.assert_not_called()
-        surface._show_channel_data.assert_not_called()
+        surface.restart_stream = MagicMock()
+        surface._on_knob_settled()
+        surface.restart_stream.assert_not_called()
         surface._proc_worker = None
 
-    def test_block_change_mid_extract_supersedes_the_stale_pass(self):
-        """A cache hit would be overwritten by the extract in flight, so even the
-        cheap re-reduce path has to defer to a superseding extract."""
+
+class DetectionArmingTests(_SurfaceTestCase):
+    """The detector only becomes answerable once an explorer exists, and on the
+    FIRST pass of a session that is after the pass has already started."""
+
+    def test_the_first_pass_arms_detection_when_its_explorer_appears(self):
+        """Regression. start_stream stamps the track before the pass, which is
+        right for a restart but cannot answer on the first Play: there is no
+        explorer, so the stamp stays None and the detect timer never starts.
+        The strip then stays empty for the WHOLE run while the frontier readout
+        looks healthy -- and it produces no dropped windows, so
+        _DETECT_DROP_ALARM never fires either."""
         surface = self._surface()
-        start, n = surface._window()
-        surface._pp = object()
-        surface._pp_key = surface._pp_signature(surface._build_cfg(), start, n)
-        surface._worker = MagicMock()
+        self.assertIsNone(surface._explorer)
 
-        surface.block_spin.setValue(5)
-        surface._on_block_changed()
+        surface._stream_worker = MagicMock()
+        surface._arm_detection()
+        self.assertIsNone(surface._track.stamp)
+        self.assertFalse(surface._detect_timer.isActive())
 
-        surface.extract.assert_called_once()
-        surface._show_channel_data.assert_not_called()
-        surface._worker = None
+        # The first served window builds the explorer; from there the detector
+        # is answerable and must be armed.
+        stamp = MagicMock()
+        surface._current_stamp = lambda: (stamp, (1, 1, 2, 2))
+        surface._explorer = MagicMock()
+        surface._arm_detection()
+        self.assertIsNotNone(surface._track.stamp)
+        self.assertTrue(surface._detect_timer.isActive())
+        surface._detect_timer.stop()
+        surface._stream_worker = None
+
+    def test_arming_without_a_pass_does_not_start_the_request_timer(self):
+        """The timer parks requests on the stream worker, so arming it with no
+        worker would tick against None."""
+        surface = self._surface()
+        stamp = MagicMock()
+        surface._current_stamp = lambda: (stamp, (1, 1, 2, 2))
+        surface._explorer = MagicMock()
+        surface._arm_detection()
+        self.assertFalse(surface._detect_timer.isActive())
+
+
+class ParkedNavigationTests(_SurfaceTestCase):
+    """With no pass running the strip still navigates -- it parks the window and
+    says so. Play stays the only control that commits the decoder, but a control
+    that moves a slider and changes nothing else reads as broken."""
+
+    def test_a_committed_seek_while_stopped_says_it_parked(self):
+        surface = self._surface()
+        # The fixture clip is 40 frames at 20 fps, so the window length has to
+        # leave somewhere to seek TO: at the 1 s default the start clamps to 0
+        # and the move would be untestable rather than absent.
+        surface.len_spin.setValue(0.5)
+        surface._on_seek_committed(20)
+        self.assertEqual(surface.start_slider.value(), 20)
+        self.assertIn("Play", surface.status_lbl.text())
+        surface.start_stream.assert_not_called()
+
+    def test_focusing_a_detection_while_stopped_says_it_parked(self):
+        """'Next strongest' is a verb. Before this it moved the slider and the
+        strip cursor and left the plots on the previous span, with no readout."""
+        surface = self._surface()
+        surface._focus_frame(200)
+        self.assertIn("Play", surface.status_lbl.text())
+        surface.start_stream.assert_not_called()
+
+    def test_scrubbing_does_not_move_the_cursor_during_a_pass(self):
+        """Under follow_center every served window re-pins the cursor to the
+        span centre, so a seek placed by a drag survives ~100 ms and the cursor
+        oscillates between the pointer and the centre for the whole drag."""
+        surface = self._surface()
+        surface._explorer = MagicMock()
+        surface._stream_worker = MagicMock()
+        surface._on_scrubbed(300)
+        surface._explorer.seek_absolute.assert_not_called()
+        surface._stream_worker = None
+        # Stopped, the cursor is the only feedback there is, so it still moves.
+        surface._on_scrubbed(300)
+        surface._explorer.seek_absolute.assert_called_once_with(300)
+
+
+class HiddenTabTests(_SurfaceTestCase):
+    """Switching tabs must not leave a full-clip pass running, including via a
+    restart that was armed moments earlier."""
+
+    def test_hiding_disarms_a_pending_restart(self):
+        """Regression. A knob or seek arms _restart_stream_at; hideEvent stops
+        the worker; _on_stream_cancelled then consumes the flag WITHOUT checking
+        visibility and starts another pass -- holding the decoder and a full
+        ring on a tab nobody is looking at, which is what the stop exists to
+        prevent."""
+        surface = self._surface()
+        surface._stream_worker = MagicMock()
+        surface.restart_stream()
+        self.assertIsNotNone(surface._restart_stream_at)
+
+        surface.hideEvent(QHideEvent())
+        self.assertIsNone(surface._restart_stream_at)
+
+        surface._on_stream_cancelled()
+        surface.start_stream.assert_not_called()
 
 
 class StreamWorkerCancelTests(_QtTestCase):
@@ -302,166 +349,165 @@ class StreamWorkerCancelTests(_QtTestCase):
 
 
 class LiveScalogramSurfaceStopTests(_SurfaceTestCase):
-    """Extract / Process become Stop while their own pass runs (todo 7)."""
+    """Play / Process become Stop while their own pass runs (todo 7)."""
 
     def test_buttons_toggle_to_stop_for_the_running_pass_only(self):
         surface = self._surface()
-        surface._set_busy(_Busy.EXTRACT)
-        self.assertEqual(surface.extract_btn.text(), "Stop")
-        self.assertTrue(surface.extract_btn.isEnabled())
+        surface._set_busy(_Busy.STREAM)
+        self.assertEqual(surface.live_btn.text(), "Stop")
+        self.assertTrue(surface.live_btn.isEnabled())
         self.assertFalse(surface.process_btn.isEnabled())
 
         surface._set_busy(_Busy.PROCESS)
         self.assertEqual(surface.process_btn.text(), "Stop")
         self.assertTrue(surface.process_btn.isEnabled())
-        self.assertFalse(surface.extract_btn.isEnabled())
+        self.assertFalse(surface.live_btn.isEnabled())
 
         surface._set_busy(None)
-        self.assertEqual(surface.extract_btn.text(), "Extract")
+        self.assertEqual(surface.live_btn.text(), live_scalogram_surface._LIVE_TEXT)
         self.assertEqual(surface.process_btn.text(), "Process whole video ▶")
-        self.assertTrue(surface.extract_btn.isEnabled())
+        self.assertTrue(surface.live_btn.isEnabled())
         self.assertTrue(surface.process_btn.isEnabled())
 
     def test_clicking_stop_cancels_instead_of_starting_another_pass(self):
         surface = self._surface()
-        surface._worker = MagicMock()
-        surface._on_extract_clicked()
-        surface._worker.cancel.assert_called_once()
-        surface.extract.assert_not_called()
+        surface._stream_worker = MagicMock()
+        surface._on_live_clicked()
+        surface._stream_worker.cancel.assert_called_once()
+        surface.start_stream.assert_not_called()
         # Both stay disabled until the worker's `cancelled` actually lands.
-        self.assertFalse(surface.extract_btn.isEnabled())
+        self.assertFalse(surface.live_btn.isEnabled())
         self.assertFalse(surface.process_btn.isEnabled())
-        surface._worker = None
+        surface._stream_worker = None
 
-    def test_knob_change_mid_extract_supersedes_rather_than_dropping_the_edit(self):
+    def test_space_starts_and_stops_the_live_pass(self):
+        """Play IS the live pass: there is no separate playback of an already
+        extracted window for Space to drive."""
         surface = self._surface()
-        del surface.extract              # exercise the real supersede path
+        surface.toggle_playback()
+        surface.start_stream.assert_called_once()
+
+        surface._stream_worker = MagicMock()
+        surface.toggle_playback()
+        surface._stream_worker.cancel.assert_called_once()
+        surface._stream_worker = None
+
+    def test_a_restart_only_starts_once_the_stopped_pass_has_unwound(self):
+        """The worker owns the decoder until it notices the cancel at its next
+        frame, so a restart that started here would find it still held."""
+        surface = self._surface()
         worker = MagicMock()
-        surface._worker = worker
+        surface._stream_worker = worker
 
-        surface.extract()
+        surface.restart_stream()
         worker.cancel.assert_called_once()
-        self.assertTrue(surface._restart_extract)
+        surface.start_stream.assert_not_called()
+        self.assertIsNotNone(surface._restart_stream_at)
 
-        # The replacement only starts once the stopped pass has unwound.
-        surface.extract = MagicMock()
-        surface._on_extract_cancelled()
-        surface.extract.assert_called_once()
-        self.assertFalse(surface._restart_extract)
-        self.assertIsNone(surface._worker)
+        surface._on_stream_cancelled()
+        surface.start_stream.assert_called_once()
+        self.assertIsNone(surface._restart_stream_at)
 
-    def test_pass_finishing_before_the_cancel_lands_still_honours_the_supersede(self):
-        """A cancel set after the worker's last tick never reaches `cancelled` --
-        `done` arrives instead. If that path did not consume _restart_extract the
-        knob edit would be silently dropped AND the stale flag would make the
-        next Stop restart the pass instead of stopping it."""
+    def test_a_real_stop_does_not_arm_a_restart(self):
         surface = self._surface()
-        del surface.extract
-        surface._worker = MagicMock()
-        surface.extract()                       # knob change arms the supersede
-        self.assertTrue(surface._restart_extract)
-
-        surface.extract = MagicMock()
-        surface._pending_pp = False
-        surface._pending_cfg = surface._build_cfg()
-        surface._on_extracted(object())         # the race: done, not cancelled
-
-        surface.extract.assert_called_once()    # the edit is honoured
-        self.assertFalse(surface._restart_extract)
-        # The superseded result must not be shown -- a newer pass is on its way.
-        surface._show_channel_data.assert_not_called()
-
-    def test_cancelled_extract_leaves_the_pixel_cache_bookkeeping_clean(self):
-        surface = self._surface()
-        surface._worker = MagicMock()
-        surface._pending_pp = True
-        surface._pending_key = ("k",)
-        surface._pending_cfg = object()
-
-        surface._on_extract_cancelled()
-
-        self.assertFalse(surface._pending_pp)
-        self.assertIsNone(surface._pending_key)
-        self.assertIsNone(surface._pending_cfg)
-        self.assertEqual(surface.extract_btn.text(), "Extract")
+        surface._stream_worker = MagicMock()
+        surface.stop_stream()
+        surface._on_stream_cancelled()
+        surface.start_stream.assert_not_called()
         self.assertIn("stopped", surface.status_lbl.text())
 
-    def test_extract_is_refused_while_the_whole_video_pass_owns_the_decoder(self):
+    def test_a_pass_is_refused_while_the_whole_video_pass_owns_the_decoder(self):
         surface = self._surface()
-        del surface.extract
+        del surface.start_stream                 # exercise the real guard
         surface._proc_worker = MagicMock()
 
-        surface.extract()
+        surface.start_stream()
 
-        surface._proc_worker.cancel.assert_not_called()
-        self.assertFalse(surface._restart_extract)
+        self.assertIsNone(surface._stream_worker)
         surface._proc_worker = None
 
 
 class CostSampleTests(_SurfaceTestCase):
     """Timing carried off a completed pass is what lets the downsample dialog
-    price the lever from measurement instead of assertion."""
+    price the lever from measurement instead of assertion.
+
+    Every sample now arrives through the dialog's sweep. The surface used to
+    contribute one per windowed extract and infer its regime from the resolved
+    block; both went with the extract, so these drive `_on_sweep_row`, which
+    states the regime outright from what the sweep was asked to run.
+    """
 
     @staticmethod
-    def _cd(scale, block, wall, frames=100, spans=None):
-        cd = MagicMock()
-        cd.meta = {"timing": {"scale": scale, "block": block, "wall": wall,
-                              "frames": frames, "spans": spans or {}}}
-        return cd
+    def _row(scale, block, wall, frames=100, spans=None, truncated=False):
+        return ScalePass(scale=scale, block=block, grid=(4, 4), frames=frames,
+                         wall=wall, spans=spans or {}, truncated=truncated)
+
+    def _record(self, surface, scale, block, wall, regime=..., **kw):
+        """One sweep row at a stated regime. ``regime`` defaults to "tracked"
+        (None), which is what the `auto` block means and what production does."""
+        surface._sweep_block_intent = None if regime is ... else regime
+        surface._on_sweep_row(self._row(scale, block, wall, **kw))
 
     def test_sample_is_recorded_per_scale_and_block(self):
         surface = self._surface()
-        surface._record_cost_sample(self._cd(1.0, 64, 4.0))
-        surface._record_cost_sample(self._cd(0.5, 32, 2.0))
+        self._record(surface, 1.0, 64, 4.0)
+        self._record(surface, 0.5, 32, 2.0)
         self.assertEqual(set(surface._cost_samples), {(1.0, 64), (0.5, 32)})
 
-    def test_a_pass_without_timing_is_ignored(self):
+    def test_a_pass_with_no_measured_wall_is_not_a_sample(self):
+        # A zero-cost point drags the fitted decode floor toward zero, which is
+        # what puts the knee where aggressive downsampling looks free.
         surface = self._surface()
-        cd = MagicMock()
-        cd.meta = {}
-        surface._record_cost_sample(cd)
-        surface._record_cost_sample(self._cd(1.0, 64, 4.0, frames=0))
+        self._record(surface, 1.0, 64, 0.0)
+        self._record(surface, 0.5, 32, 2.0, frames=0)
         self.assertEqual(surface._cost_samples, {})
         self.assertEqual(surface._cost_model(), (None, None))
+
+    def test_a_truncated_pass_is_not_a_sample(self):
+        """Its wall covers the frames it managed, so admitting it with the
+        requested count understates seconds-per-frame -- the same direction of
+        error as a zero-cost point."""
+        surface = self._surface()
+        self._record(surface, 1.0, 64, 4.0, truncated=True)
+        self.assertEqual(surface._cost_samples, {})
 
     def test_re_recording_a_key_still_identifies_the_newest_regime(self):
         # dict order keeps a re-recorded key at its ORIGINAL position, so the
         # newest sample cannot be read off insertion order.
         surface = self._surface()
-        surface._record_cost_sample(self._cd(1.0, 32, 4.0))
-        surface._record_cost_sample(self._cd(1.0, 32, 4.1))
-        surface._record_cost_sample(self._cd(0.5, 16, 2.0))
+        self._record(surface, 1.0, 32, 4.0, regime=32)
+        self._record(surface, 1.0, 32, 4.1, regime=32)
+        self._record(surface, 0.5, 16, 2.0, regime=16)
         self.assertEqual(surface._last_cost_key, (0.5, 16))
-        # Both are pinned (tracked would be 64 and 32), but to DIFFERENT blocks,
-        # so they are two regimes of one sample each and neither can be fitted.
+        # Both are pinned, but to DIFFERENT blocks, so they are two regimes of
+        # one sample each and neither can be fitted.
         model, _block = surface._cost_model()
         self.assertTrue(model.provisional)
 
     def test_model_stays_provisional_while_only_one_scale_is_measured(self):
         surface = self._surface()
-        surface._record_cost_sample(self._cd(1.0, 64, 4.0, spans={"decode": 0.01}))
+        self._record(surface, 1.0, 64, 4.0, spans={"decode": 0.01})
         model, block = surface._cost_model()
         self.assertTrue(model.provisional)
         # ...and therefore declines to place a knee, which is the whole point:
-        # one prefetched pass cannot see the decode floor.
+        # one pass cannot see the decode floor.
         self.assertIsNone(model.knee_scale())
 
     def test_samples_at_different_blocks_are_not_fitted_together(self):
         surface = self._surface()
-        surface._record_cost_sample(self._cd(0.5, 1, 9.0))    # block=1 pixel cache
-        surface._record_cost_sample(self._cd(1.0, 64, 4.0))
+        self._record(surface, 0.5, 1, 9.0, regime=1)
+        self._record(surface, 1.0, 64, 4.0)
         model, block = surface._cost_model()
         self.assertTrue(model.provisional)      # neither regime has two scales
 
     def test_fit_uses_the_regime_with_the_most_scales_not_the_newest(self):
-        """Whether a pass runs at block=1 depends on whether its per-pixel
-        footprint fits the budget, which scales with the square of the scale --
-        so dragging Downsample naturally splits samples across regimes. Taking
-        only the newest regime would leave the model provisional forever."""
+        """Sweeps run at different pinned blocks accumulate across a session, so
+        taking only the newest regime would leave the model provisional forever
+        whenever the last sweep was a short one."""
         surface = self._surface()
-        surface._record_cost_sample(self._cd(1.0, 1, 8.0))
-        surface._record_cost_sample(self._cd(0.5, 1, 3.0))
-        surface._record_cost_sample(self._cd(0.25, 64, 1.5))   # newest, alone
+        self._record(surface, 1.0, 1, 8.0, regime=1)
+        self._record(surface, 0.5, 1, 3.0, regime=1)
+        self._record(surface, 0.25, 64, 1.5, regime=64)   # newest, alone
         self.assertEqual(surface._last_cost_key, (0.25, 64))
         model, block = surface._cost_model()
         self.assertFalse(model.provisional)
@@ -473,18 +519,18 @@ class CostSampleTests(_SurfaceTestCase):
         pass, so the dialog has to be told which regime the numbers came from
         rather than presenting them as a batch-run projection."""
         surface = self._surface()
-        surface._record_cost_sample(self._cd(1.0, 1, 8.0))
-        surface._record_cost_sample(self._cd(0.5, 1, 3.0))
+        self._record(surface, 1.0, 1, 8.0, regime=1)
+        self._record(surface, 0.5, 1, 3.0, regime=1)
         model, block = surface._cost_model()
         self.assertEqual(block, 1)
         self.assertFalse(model.provisional)
 
     def test_ties_between_regimes_go_to_the_newest(self):
         surface = self._surface()
-        surface._record_cost_sample(self._cd(1.0, 1, 8.0))     # pinned block 1
-        surface._record_cost_sample(self._cd(0.5, 1, 3.0))
-        surface._record_cost_sample(self._cd(1.0, 64, 6.0))    # tracked (64·1.0)
-        surface._record_cost_sample(self._cd(0.5, 32, 2.5))    # tracked (64·0.5)
+        self._record(surface, 1.0, 1, 8.0, regime=1)     # pinned block 1
+        self._record(surface, 0.5, 1, 3.0, regime=1)
+        self._record(surface, 1.0, 64, 6.0)              # tracked (64x1.0)
+        self._record(surface, 0.5, 32, 2.5)              # tracked (64x0.5)
         model, block = surface._cost_model()
         self.assertEqual(model.n_samples, 2)
         # The tracked pair is newest, so its (cheaper) wall times drive the fit.
@@ -499,7 +545,7 @@ class CostSampleTests(_SurfaceTestCase):
         surface = self._surface()
         for scale, block, wall in ((1.0, 64, 6.0), (0.5, 32, 2.5),
                                    (0.25, 16, 1.6)):
-            surface._record_cost_sample(self._cd(scale, block, wall))
+            self._record(surface, scale, block, wall)
         model, block = surface._cost_model()
         self.assertFalse(model.provisional)
         self.assertEqual(model.n_samples, 3)
@@ -510,29 +556,23 @@ class CostSampleTests(_SurfaceTestCase):
 
     def test_a_pinned_block_sweep_reports_that_block(self):
         surface = self._surface()
-        surface._record_cost_sample(self._cd(1.0, 16, 5.0), 16)
-        surface._record_cost_sample(self._cd(0.5, 16, 2.0), 16)
+        self._record(surface, 1.0, 16, 5.0, regime=16)
+        self._record(surface, 0.5, 16, 2.0, regime=16)
         _model, block = surface._cost_model()
         self.assertEqual(block, 16)
 
     def test_a_pass_pinned_to_the_block_tracking_would_pick_stays_pinned(self):
         """The regime cannot be read off the resolved block. Pin Block to 64 and
-        sweep: at scale 1.0 tracking would ALSO have chosen 64, so inferring
-        would file the reference row as tracked, split the sweep into two groups
-        and drop the widest, highest-leverage point from the fit."""
+        sweep: at scale 1.0 tracking would ALSO have chosen 64, so reading the
+        regime back off the block would file the reference row as tracked, split
+        the sweep into two groups and drop the widest, highest-leverage point
+        from the fit. The sweep therefore states its intent."""
         surface = self._surface()
         for scale, wall in ((1.0, 6.0), (0.5, 3.0), (0.25, 2.0)):
-            surface._record_cost_sample(self._cd(scale, 64, wall), 64)
+            self._record(surface, scale, 64, wall, regime=64)
         model, block = surface._cost_model()
         self.assertEqual(block, 64)
         self.assertEqual(model.n_samples, 3)        # not 2
-
-    def test_a_pass_with_no_measured_wall_is_not_a_sample(self):
-        # A zero-cost point drags the fitted decode floor toward zero, which is
-        # what puts the knee where aggressive downsampling looks free.
-        surface = self._surface()
-        surface._record_cost_sample(self._cd(1.0, 64, 0.0))
-        self.assertEqual(surface._cost_samples, {})
 
 
 class SweepPanelTests(_QtTestCase):
@@ -710,13 +750,15 @@ class SweepTests(_SurfaceTestCase):
         ok, why = surface._sweep_ready()
         self.assertTrue(ok, why)
 
-    def test_the_sweep_is_what_moves_the_model_out_of_the_block_1_regime(self):
-        """Before the sweep the only samples come from the live block=1 pixel
-        cache, which overstates a batch run; after it, the model is fitted in the
-        tracked (production) regime."""
+    def test_the_sweep_moves_the_model_out_of_a_pinned_regime(self):
+        """A session can carry samples from an earlier sweep pinned to block 1,
+        which overstates a batch run because it does no reduction. Running a
+        tracked sweep must refit in the production regime rather than leaving
+        the pinned numbers in force."""
         surface = self._surface()
-        surface._record_cost_sample(CostSampleTests._cd(1.0, 1, 9.0))
-        surface._record_cost_sample(CostSampleTests._cd(0.5, 1, 4.0))
+        rec = CostSampleTests()._record
+        rec(surface, 1.0, 1, 9.0, regime=1)
+        rec(surface, 0.5, 1, 4.0, regime=1)
         self.assertEqual(surface._cost_model()[1], 1)
         surface._dlg = MagicMock()
         self._sweep(surface, [1.0, 0.5])
@@ -754,13 +796,16 @@ class SweepTests(_SurfaceTestCase):
             self.assertNotEqual(cells[3].text(), "—", f"row {label}")
 
     def test_a_sweep_owns_the_decoder(self):
+        """A sweep runs its own timed passes, so neither the live pass nor the
+        whole-video commit may start underneath it."""
         surface = self._surface()
         surface._sweep_worker = MagicMock()
-        surface.extract = LiveScalogramSurface.extract.__get__(surface)
-        with patch("gui.explorers.live_scalogram_surface._LiveExtractWorker") as W:
-            surface.extract()
+        del surface.start_stream            # exercise the real guard
+        with patch("gui.explorers.live_scalogram_surface.LiveStreamWorker") as W:
+            surface.start_stream()
             surface.process_whole_video()
         W.assert_not_called()
+        self.assertIsNone(surface._stream_worker)
         self.assertIsNone(surface._proc_worker)
         surface._sweep_worker = None
 

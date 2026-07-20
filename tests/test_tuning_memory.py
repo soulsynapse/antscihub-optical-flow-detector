@@ -198,13 +198,11 @@ class _SurfaceTestCase(_QtTestCase):
     def _surface(self) -> LiveScalogramSurface:
         self.addCleanup(self._drop_tuning)
         reps = [{"id": 0, "label": "all", "frac": (0.0, 0.0, 1.0, 1.0)}]
-        # singleShot patched out: constructing the surface must not kick off the
-        # opening extract pass.
-        with patch("gui.explorers.live_scalogram_surface.QTimer.singleShot"):
-            surface = LiveScalogramSurface(self.video, reps)
+        surface = LiveScalogramSurface(self.video, reps)
         self.addCleanup(self._destroy, surface)
-        surface._show_channel_data = MagicMock()
-        surface.extract = MagicMock()
+        # Nothing runs on construction (Play commits the decoder), but the
+        # restart path would, so it is stubbed for the same reason.
+        surface.restart_stream = MagicMock()
         return surface
 
     def _destroy(self, surface):
@@ -302,32 +300,44 @@ class SurfaceResetTests(_SurfaceTestCase):
 
         self.assertEqual(surface._strip_values(), defaults)
 
-    def test_reset_runs_exactly_one_pass(self):
+    def test_reset_replans_a_running_pass_exactly_once(self):
         surface = self._surface()
+        surface._stream_worker = MagicMock()
         surface.ds_spin.setValue(0.25)
         surface.norm_combo.setCurrentText("clahe")
-        surface.extract.reset_mock()
+        surface.restart_stream.reset_mock()
 
         surface.reset_all()
 
-        self.assertEqual(surface.extract.call_count, 1)
+        self.assertEqual(surface.restart_stream.call_count, 1)
+        surface._stream_worker = None
+
+    def test_reset_does_not_start_a_pass_that_was_not_running(self):
+        """Reset restores knobs; it is not a play button. Starting a pass here
+        would commit the decoder from a control that says nothing about it."""
+        surface = self._surface()
+        surface.reset_all()
+        surface.restart_stream.assert_not_called()
 
     def test_reset_clears_the_explorer_before_the_pass_captures_it(self):
-        """extract() carries the explorer's view state across the rebuild, so a
-        reset that landed after it would be undone by its own re-extract."""
+        """A restart carries the explorer's view state across the rebuild, so a
+        reset that landed after it would be undone by its own replan."""
         surface = self._surface()
+        surface._stream_worker = MagicMock()
         order = []
         surface._explorer = MagicMock()
         surface._explorer.reset_tuning.side_effect = lambda: order.append("reset")
-        surface.extract.side_effect = lambda: order.append("extract")
+        surface.restart_stream.side_effect = (
+            lambda *a, **k: order.append("restart"))
 
         surface.reset_all()
 
-        self.assertEqual(order, ["reset", "extract"])
+        self.assertEqual(order, ["reset", "restart"])
+        surface._stream_worker = None
 
     def test_reset_without_an_explorer_still_resets_the_strip(self):
         """The button is live from the moment the surface opens, before the
-        first extract has produced anything to reset."""
+        first pass has produced anything to reset."""
         surface = self._surface()
         surface._explorer = None
         surface.ds_spin.setValue(0.25)

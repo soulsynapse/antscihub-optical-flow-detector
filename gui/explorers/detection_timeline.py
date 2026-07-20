@@ -136,7 +136,14 @@ class _Strip(QWidget):
         rgb[:top][:, seg_seen] = _SEEN_BG
         cmax = max(1e-6, float(self._clump[self._covered].max())
                    if self._covered.any() else 1e-6)
-        frac = np.clip(seg_c / cmax, 0.0, 1.0)
+        # LOG height, matching the value axes above it (DensityPlot's log1p) and
+        # the scalogram's log frequency. The clump series is a block count with a
+        # heavy tail: one large event sets cmax, and against a linear axis every
+        # ordinary event below it is then drawn one or two pixels tall -- i.e.
+        # indistinguishable from examined-and-quiet, which is precisely the
+        # collapse this strip's whole design exists to prevent. log1p, not log,
+        # so a genuine zero stays a zero-height bar rather than going to -inf.
+        frac = np.clip(np.log1p(seg_c) / np.log1p(cmax), 0.0, 1.0)
         bars = (frac * max(0, top - 2)).astype(int)
         for x in np.flatnonzero(seg_seen):
             n = int(bars[x])
@@ -254,7 +261,7 @@ class DetectionNavigator(QWidget):
         self.legend = QLabel()
         self.legend.setStyleSheet("color:#8a8a96; font-size:10px;")
         self.legend.setText("▁ lit = examined · gray = other settings · "
-                            "dark = not examined")
+                            "dark = not examined · bar height log")
         row.addWidget(self.legend)
         lay.addLayout(row)
 

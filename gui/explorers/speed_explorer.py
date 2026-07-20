@@ -269,6 +269,19 @@ class MiniPlot(QWidget):
         # the series. A picture of a quantity computed elsewhere -- this widget
         # never derives it, so a collapsed plot cannot disarm the detector.
         self._detect_mask: np.ndarray | None = None
+        # Sticky value axis. Off by default, so every existing caller keeps the
+        # per-series autoscale it had. On, the axis only ever WIDENS: the bounds
+        # are a running union over every series this plot has been shown, and
+        # they are what paintEvent, the band handles and the drag arithmetic all
+        # read. This exists because a live pass hands the plot a new trailing
+        # window ~10x a second, and a per-window autoscale makes the axis --
+        # and therefore the pixel position of a band the user placed against it
+        # -- move continuously under them while the underlying threshold has not
+        # changed. Reset is explicit (see reset_sticky_range), because the only
+        # things that invalidate the accumulated bounds are a change of what is
+        # being measured, not a change in the data.
+        self._sticky = False
+        self._sticky_range: tuple[float, float] | None = None
         self.band_active = False
         self.band_lo: float | None = None
         self.band_hi: float | None = None
@@ -443,7 +456,48 @@ class MiniPlot(QWidget):
         self._env_memo = None
         self._poly_memo = None
 
+    # -- value axis ----------------------------------------------------------
+
+    def set_sticky_range(self, on: bool) -> None:
+        """Accumulate the value axis instead of autoscaling per series."""
+        if bool(on) == self._sticky:
+            return
+        self._sticky = bool(on)
+        self._sticky_range = None
+        self._bump_series_version()          # the drawn geometry depends on it
+        self._repaint_unless_collapsed()
+
+    def reset_sticky_range(self) -> None:
+        """Forget the accumulated bounds and re-seed from the current series.
+
+        Called when the plot changes what it is MEASURING -- another replicate,
+        another channel -- not when it merely receives new data. Widening across
+        a scope change would carry one replicate's outliers onto another's axis,
+        which is the same category of error as showing stale data as current.
+        """
+        self._sticky_range = None
+        self._bump_series_version()
+        self._repaint_unless_collapsed()
+
     def _data_range(self) -> tuple[float, float]:
+        """The drawn value bounds: the raw per-series range, or its running
+        union when sticky. Subclasses override :meth:`_raw_data_range`, so the
+        sticky layer applies to every plot kind without being reimplemented."""
+        lo, hi = self._raw_data_range()
+        if not self._sticky:
+            return lo, hi
+        if self._is_empty():
+            # An empty plot's raw range is the 0..1 placeholder, not a
+            # measurement. Folding it in would permanently pull the accumulated
+            # floor to 0 the first time a window arrives short.
+            return self._sticky_range if self._sticky_range else (lo, hi)
+        if self._sticky_range is not None:
+            slo, shi = self._sticky_range
+            lo, hi = min(lo, slo), max(hi, shi)
+        self._sticky_range = (lo, hi)
+        return self._sticky_range
+
+    def _raw_data_range(self) -> tuple[float, float]:
         if self._range_memo is not None:
             return self._range_memo
         n = self.y.size
@@ -835,7 +889,7 @@ class DensityPlot(MiniPlot):
         self._refresh_auto_collapse()
         self._repaint_unless_collapsed()
 
-    def _data_range(self) -> tuple[float, float]:
+    def _raw_data_range(self) -> tuple[float, float]:
         if self._range is not None:
             return self._range
         m = self.matrix
@@ -1006,7 +1060,7 @@ class PixelBarPlot(MiniPlot):
 
     BASE_H = MiniPlot.BASE_H * 2
 
-    def _data_range(self) -> tuple[float, float]:
+    def _raw_data_range(self) -> tuple[float, float]:
         if self._range_memo is not None:
             return self._range_memo
         n = self.y.size

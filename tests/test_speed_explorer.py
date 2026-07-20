@@ -503,5 +503,84 @@ class DensityPlotDataRangeTests(unittest.TestCase):
                         f"{small:.2f} ms -> {large:.2f} ms")
 
 
+class StickyRangeTests(unittest.TestCase):
+    """A live pass replaces the series ~10x a second. Autoscaling per series then
+    rescales the axis continuously, which moves a placed band's pixel position
+    while the threshold behind it has not changed, and lets a burst two windows
+    ago silently redefine what "high" means."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Every plot here is a QWidget; without this the class passes only when
+        # some earlier class in the file happened to create the application.
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_off_by_default_so_existing_callers_keep_autoscaling(self):
+        pl = MiniPlot("x")
+        pl.set_series(np.array([0.0, 10.0], np.float32))
+        self.assertEqual(pl._data_range(), (0.0, 10.0))
+        pl.set_series(np.array([0.0, 2.0], np.float32))
+        self.assertEqual(pl._data_range(), (0.0, 2.0))
+
+    def test_the_axis_only_ever_widens(self):
+        pl = MiniPlot("x")
+        pl.set_sticky_range(True)
+        pl.set_series(np.array([1.0, 5.0], np.float32))
+        self.assertEqual(pl._data_range(), (1.0, 5.0))
+        pl.set_series(np.array([2.0, 3.0], np.float32))      # narrower
+        self.assertEqual(pl._data_range(), (1.0, 5.0))       # held
+        pl.set_series(np.array([-4.0, 9.0], np.float32))     # wider both ways
+        self.assertEqual(pl._data_range(), (-4.0, 9.0))
+        pl.set_series(np.array([0.0, 1.0], np.float32))
+        self.assertEqual(pl._data_range(), (-4.0, 9.0))
+
+    def test_an_empty_series_does_not_pollute_the_accumulated_bounds(self):
+        """An empty plot's raw range is the 0..1 placeholder, not a measurement.
+        Folding it in would drag the floor to 0 the first time a window arrives
+        short -- and it never recovers, because the range only widens."""
+        pl = MiniPlot("x")
+        pl.set_sticky_range(True)
+        pl.set_series(np.array([5.0, 9.0], np.float32))
+        self.assertEqual(pl._data_range(), (5.0, 9.0))
+        pl.set_series(np.zeros(0, np.float32))
+        self.assertEqual(pl._data_range(), (5.0, 9.0))
+
+    def test_reset_re_seeds_from_the_current_series(self):
+        """Called when the plot changes what it MEASURES -- another replicate,
+        another channel -- so one scope's outliers cannot land on another's
+        axis."""
+        pl = MiniPlot("x")
+        pl.set_sticky_range(True)
+        pl.set_series(np.array([0.0, 100.0], np.float32))
+        self.assertEqual(pl._data_range(), (0.0, 100.0))
+        pl.set_series(np.array([1.0, 3.0], np.float32))
+        pl.reset_sticky_range()
+        self.assertEqual(pl._data_range(), (1.0, 3.0))
+
+    def test_it_applies_to_the_heatmap_and_the_bar_plot_too(self):
+        """Both override the raw range; the sticky layer wraps them rather than
+        being reimplemented per subclass."""
+        dp = DensityPlot("x")
+        dp.set_sticky_range(True)
+        dp.set_matrix(np.array([[1.0, 8.0]], np.float32))
+        self.assertEqual(dp._data_range(), (1.0, 8.0))
+        dp.set_matrix(np.array([[2.0, 3.0]], np.float32))
+        self.assertEqual(dp._data_range(), (1.0, 8.0))
+
+    def test_a_held_axis_holds_a_band_handle_still(self):
+        """The point of the whole thing: the band is stored in data units, so a
+        rescaling axis silently moves where it is DRAWN. Same threshold, same
+        pixel."""
+        pl = MiniPlot("x")
+        pl.resize(300, MiniPlot.BASE_H)
+        pl.set_sticky_range(True)
+        pl.set_band_active(True)
+        pl.set_series(np.array([0.0, 100.0], np.float32))
+        pl.band_lo, pl.band_hi = 20.0, 80.0
+        before = pl._line_ys()[:2]
+        pl.set_series(np.array([0.0, 10.0], np.float32))     # would rescale 10x
+        self.assertEqual(pl._line_ys()[:2], before)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -34,7 +34,7 @@ to the relevant section rather than restating it.
 | ~~**T22**~~ | ~~New **viewer tab** consuming a fully-processed video.~~ **DROPPED** (2026-07-19) — scope, not value. A convenience shell over a `DetectionResult` that nothing else depends on; never started. Re-open only if day-to-day review actually stalls without it. |
 | ~~**T23**~~ | ~~**ROI pre-transcode**: cut each source once into per-replicate clips + manifest.~~ **DONE** — see Batch I. Works, and **the premise it was justified on turned out false**: the 25x isolated decode win is **1.06x end to end** (`FINDINGS.md` §16). Not the lever that moves the floor at scale 1.0. |
 | ~~**T24**~~ | ~~**Headless batch driver**: no-GUI entry point, file-level partitioning, N-worker throughput.~~ **DONE** — all three slices landed; throughput measured in `FINDINGS.md` §14 (**~130 fps / 5.4x realtime, ceiling at 8 workers**). |
-| **T29** | **Streaming live surface** — display immediately, process forward continuously, plots fill as frames arrive, instead of extract-a-window-then-block. Architecture decided 2026-07-20; see Batches P/Q. Foundations landed in `e11a4cb` (`core/stream_buffer.py`); **Batch P landed** (`stream_channel_planes` + `ChannelPlan`, `FINDINGS.md` §22, cost measured at nil). **Batch Q slices 1 and 2 landed** (`LiveStreamWorker`; the `Live ▶` surface + `set_channel_data`, §23). **Slices 3 (COI) and 4 (the whole-video rebuild: `core/live_track.py`, coverage mask, per-frame staleness, the strip as the clip's seeker, detection moved onto the worker thread) have landed too — slice 4 uncommitted.** T35 closed by slice 4. **What remains is the continuous-plots design call, written up in the Batch Q slice 4 section.** |
+| ~~**T29**~~ | ~~**Streaming live surface** — display immediately, process forward continuously, plots fill as frames arrive, instead of extract-a-window-then-block.~~ **DONE — Batches P and Q are both closed (2026-07-20).** Foundations `e11a4cb` (`core/stream_buffer.py`); Batch P `73ac827` (`stream_channel_planes` + `ChannelPlan`, §22, cost measured at nil); Batch Q slices 1–5 `aefa8cc` → `249fce1` → `8f2d198` → `d944cad` → `c7634c1` (§23, §24). T35 closed by slice 4. Suite 655 passing on a clean run. |
 | **T30** | **The mark corpus is not a corpus.** `marks.json` holds **one** 0.39 s span, and **no animal-absent spans at all** — so occupancy's whole claim (present-but-still ≠ empty) cannot be tested, and neither can any supervised channel comparison. Needs flying / still-with-animal / animal-absent / wingbeat, several each, across replicates. `rep6-no-flying` is a ready-made negative control. **This blocks T31 and T32, and no amount of channel-building substitutes for it.** |
 | **T31** | **Validate occupancy and the ratio channels against marked footage**, using the **tail statistic, not region means** (`FINDINGS.md` §20 — this was got wrong once already). Gates Batch S. |
 | **T32** | **Supervised signature fitting.** With a real corpus, fit LDA / L1-logistic per labelled behaviour over the (channel × spatial scale × temporal scale) grid. The weight vector *is* an interpretable, tunable signature and drops into a template detector with the existing `DetectionResult` shape. Cheap, and it tells you which channels earn their place before the unsupervised map is built around them. |
@@ -128,6 +128,8 @@ was deleted with the `_test_cache_suffix` it covered. Don't fix anything in
 | N (item 2) | count-band re-denomination + the three permanent controls | `1d1f958` |
 | G (part) | replicate direct manipulation (T11, T12) — **T20, T21 still open** | — |
 | — | occupancy + conjunction channels, live stream ring buffer | `e11a4cb` |
+| P | streaming extraction generator (`stream_channel_planes`, `ChannelPlan`) | `73ac827` |
+| Q | continuous live surface, all five slices (T29, T35) — **closed** | `aefa8cc`…`c7634c1` |
 
 **Closed batch specs live in `docs/archive/closed-batches.md`** (D, E, F, I, J, O
 archived 2026-07-20). Their durable output is `FINDINGS.md`; the specs are kept
@@ -563,12 +565,16 @@ produces either avoidance or silent degradation.
 ---
 ## 6. Order
 
-**I → J → O → D → E → F closed (specs archived). N item 2 landed. G is half done:
-T11 and T12 landed, T20 left the batch, T21 is untouched.**
+**I → J → O → D → E → F closed (specs archived). N item 2 landed. P and Q closed
+(2026-07-20) — T29 and T35 with them. G is half done: T11 and T12 landed, T20
+left the batch, T21 is untouched.**
+
+**Next: Batch R + T30** — marking rehomed onto the streaming surface, and an
+actual corpus laid down. Then T31 → T32.
 
 ---
 
-### Batch Q slice 4 — the whole-video rebuild. LANDED 2026-07-20 (uncommitted)
+### Batch Q slice 4 — the whole-video rebuild. LANDED 2026-07-20 · `d944cad`
 
 **What it is.** The live axis became the whole video. The strip at the bottom is
 now the clip's SEEKER and is always visible; it fills as detection runs, and it
@@ -626,7 +632,7 @@ because the strip is a seeker and nothing emitted an ABSOLUTE cursor).
 
 ---
 
-### Batch Q slice 5 — continuous plots. LANDED 2026-07-20 (uncommitted)
+### Batch Q slice 5 — continuous plots. LANDED 2026-07-20 · `c7634c1`
 
 **Full write-up in `FINDINGS.md` §24.** The design call slice 4 deferred is
 settled and built. Three things this section exists to stop being re-derived:
@@ -697,7 +703,9 @@ makes it much easier to hit.
 is an aggressive university endpoint blocker; re-running gets through. An attempt
 to confirm it on a clean tree was INVALID (the `git stash push -u` failed on
 `.claude/` permissions and left the tree modified) — so it is unconfirmed, not
-proven environmental. Suite is 649 passing on a clean run.
+proven environmental. **It did NOT fire on the 2026-07-20 closing run** (655
+passed, 57 subtests, 40.6 s, clean tree at `c7634c1`), which is consistent with
+the intermittent story and still does not confirm the cause.
 
 ---
 
@@ -707,13 +715,13 @@ This is what the last session was actually about, and it supersedes the throughp
 thread below as the near-term order.
 
 1. ~~**Batch P** — streaming generator in `tensor_channels`.~~ **DONE**, §22.
-2. **Batch Q** — continuous live surface on `core/stream_buffer.py`. **Slices 1
-   (worker), 2 (surface + `set_channel_data`), 3 (COI) and 4 (the whole-video
-   rebuild — `core/live_track.py`, coverage, staleness, the strip as seeker)
-   have all landed, and so has **slice 5 (continuous plots — the split, the
-   axis registration, the 10 Hz rate)**. Slice 5 is UNCOMMITTED as of this
-   writing; see its section above and `FINDINGS.md` §24. **Batch Q is now
-   closed.** Next is Batch R + T30.
+2. ~~**Batch Q** — continuous live surface on `core/stream_buffer.py`.~~
+   **CLOSED 2026-07-20, all five slices committed:** 1 (worker, `aefa8cc`),
+   2 (surface + `set_channel_data`, `249fce1`), 3 (COI, `8f2d198`), 4 (the
+   whole-video rebuild — `core/live_track.py`, coverage, staleness, the strip
+   as seeker, `d944cad`), 5 (continuous plots — the axis registration and the
+   10 Hz rate, `c7634c1`). See `FINDINGS.md` §23 and §24. **Next is Batch R +
+   T30.**
 3. **Batch R + T30** — marking rehomed, and **an actual corpus laid down**. The
    widget without the corpus unblocks nothing.
 4. **T31** — validate occupancy/ratios against that corpus, on the tail statistic.
@@ -774,13 +782,14 @@ measurements, not builds, and are recorded in L: **tile occupancy from the
 `change` channel**, and **clip-backed throughput at N=8** (inherited from I).
 Take both before building anything.
 
-**The file-locality hazard has now fired FOUR times — treat the "· file"
-annotations as guesses.** Batch Q slice 2 is the fourth: specced as file-local to
-`live_scalogram_surface.py`, it needed `set_channel_data` on `ScalogramExplorer`
-as well, because that class derives its whole time axis at construction. §23
-records the cheap tell that generalizes: **if a slice has no observable
-behaviour, the boundary is in the wrong place** — noticing that is cheaper than
-re-deriving the file list up front.
+**The file-locality hazard has now fired FIVE times — treat the "· file"
+annotations as guesses.** Batch Q slice 2 was the fourth: specced as file-local
+to `live_scalogram_surface.py`, it needed `set_channel_data` on
+`ScalogramExplorer` as well, because that class derives its whole time axis at
+construction. Slice 4 was the fifth and needed three extra files (see its
+section). §23 records the cheap tell that generalizes: **if a slice has no
+observable behaviour, the boundary is in the wrong place** — noticing that is
+cheaper than re-deriving the file list up front.
  D's stated locality was wrong (`MiniPlot` lived in a
 file the spec did not name). E only escaped because D had already moved it. G
 made it three: **T20's dropdown is not on the replicate tab at all**, and worse
