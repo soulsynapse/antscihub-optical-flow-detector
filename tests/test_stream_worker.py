@@ -25,6 +25,8 @@ from PyQt6.QtCore import QCoreApplication, QEventLoop, QTimer
 
 from core.channel_source import live_channel_source
 from core.config import PipelineConfig
+from core.detection import region_blocks_and_grid
+from core.wavelet import band_indices, default_freqs, morlet_band_power
 from core.stream_buffer import MIN_CAPACITY, capacity_for_budget
 from core.tensor_channels import extract_channels_live, plan_channel_stream
 from gui.stream_worker import LiveStreamWorker
@@ -83,6 +85,8 @@ class LiveStreamWorkerTest(unittest.TestCase):
             seen["advanced"].append((s, f, r)),
             on_advanced(worker, s, f) if on_advanced else None))
         worker.window_ready.connect(seen["windows"].append)
+        seen["detected"] = []
+        worker.detected.connect(seen["detected"].append)
         worker.failed.connect(lambda m: seen.__setitem__("failed", m))
         worker.cancelled.connect(lambda: seen.__setitem__("cancelled", True))
         worker.finished.connect(loop.quit)
@@ -212,6 +216,78 @@ class LiveStreamWorkerTest(unittest.TestCase):
         again = LiveStreamWorker(self.video, self._plan(start=0, n=6),
                                  capacity=64)
         self.assertEqual(self._run_worker(again)["advanced"][-1][1], 6)
+
+    # -- detection runs on the worker thread ---------------------------------
+    def _detect(self, worker, n=32, band=(0.5, 8.0)):
+        worker.request_detect(n, "change", self.meta, 0,
+                              default_freqs(float(self.meta["fps"])), band,
+                              token="d")
+
+    def test_a_detection_request_returns_band_power_over_region_columns(self):
+        plan = self._plan(start=0, n=N_FRAMES)
+        w = LiveStreamWorker(self.video, plan, capacity=64)
+        self._detect(w)
+        seen = self._run_worker(w)
+        self.assertTrue(seen["detected"])
+        msg = seen["detected"][-1]
+        # (T, B) over the region's block columns, with an ABSOLUTE first index --
+        # the accumulator places it on the video's axis, not the ring's.
+        self.assertEqual(msg["band_power"].ndim, 2)
+        ny, nx = (int(v) for v in self.meta["grid"])
+        self.assertEqual(msg["band_power"].shape[1], ny * nx)
+        self.assertEqual(msg["token"], "d")
+        self.assertGreaterEqual(msg["first"], 0)
+        self.assertLessEqual(msg["first"] + msg["band_power"].shape[0],
+                             msg["frontier"])
+
+    def test_the_transform_matches_the_committed_detector_exactly(self):
+        # The property the whole surface rests on: navigate to a detection the
+        # live pass found, re-run the committed path over the same frames, and
+        # get the same numbers. If these drifted, verifying a detection would
+        # disprove it.
+        plan = self._plan(start=0, n=N_FRAMES)
+        w = LiveStreamWorker(self.video, plan, capacity=N_FRAMES + 8)
+        self._detect(w, n=N_FRAMES)
+        msg = self._run_worker(w)["detected"][-1]
+        cd = live_channel_source(self.video, self.cfg, _full_frame_replicate(),
+                                 start=0, n=N_FRAMES)
+        fps = float(self.meta["fps"])
+        blocks, _grid = region_blocks_and_grid(
+            cd.meta, np.asarray(cd.channels["change"], np.float32), 0)
+        i, j = band_indices(default_freqs(fps), 0.5, 8.0)
+        want = morlet_band_power(blocks, fps, default_freqs(fps), i, j)
+        got = msg["band_power"]
+        n = min(len(want), len(got))
+        np.testing.assert_allclose(got[-n:], want[-n:], rtol=1e-4, atol=1e-4)
+
+    def test_a_one_frame_window_is_not_transformed(self):
+        # A single sample is not a time series; transforming it would return a
+        # padding response that the accumulator would then record as examined.
+        plan = self._plan(start=0, n=N_FRAMES)
+        w = LiveStreamWorker(self.video, plan, capacity=64)
+        self._detect(w, n=1)
+        for msg in self._run_worker(w)["detected"]:
+            self.assertGreaterEqual(msg["band_power"].shape[0], 2)
+
+    def test_the_tail_is_examined_after_the_decode_loop_ends(self):
+        # Without the final serve, the last frames of every pass would stay
+        # unexamined purely because of where the request timer last fired.
+        plan = self._plan(start=0, n=N_FRAMES)
+        w = LiveStreamWorker(self.video, plan, capacity=N_FRAMES + 8)
+        self._detect(w, n=16)
+        seen = self._run_worker(w)
+        last = seen["detected"][-1]
+        self.assertEqual(last["frontier"], N_FRAMES)
+        self.assertEqual(last["first"] + last["band_power"].shape[0], N_FRAMES)
+
+    def test_an_unknown_channel_is_dropped_rather_than_raising(self):
+        plan = self._plan(start=0, n=N_FRAMES)
+        w = LiveStreamWorker(self.video, plan, capacity=64)
+        w.request_detect(16, "not_a_channel", self.meta, 0,
+                         default_freqs(float(self.meta["fps"])), (0.5, 8.0))
+        seen = self._run_worker(w)
+        self.assertEqual(seen["detected"], [])
+        self.assertIsNone(seen["failed"])
 
 
 if __name__ == "__main__":

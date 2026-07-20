@@ -25,6 +25,17 @@ the transform rather than on the read.
 a backlog of stale windows is strictly worse than a dropped one: every entry in
 it would be redrawn and immediately superseded, and the plot would lag further
 behind the further behind it already was.
+
+**The DETECTOR runs here too, not on the GUI thread.** ``request_detect`` parks a
+detection request the same way, and the transform runs between decoded frames.
+Two reasons, and the second is the load-bearing one. The transform is
+O(F.T log T.B), so running it in a signal handler would stutter the UI at exactly
+the rate the live view updates. More importantly the display path DROPS windows
+while the explorer is still transforming the previous one -- correct for a
+display, fatal for an accumulator, because the whole-video track would then be
+left with holes wherever the GUI happened to be busy, and a hole is indis-
+tinguishable from a stretch the detector examined and found quiet. Detection
+coverage must not depend on how the display is keeping up.
 """
 from __future__ import annotations
 
@@ -32,10 +43,13 @@ import contextlib
 import math
 import time
 
+import numpy as np
 from PyQt6.QtCore import QMutex, QMutexLocker, QThread, pyqtSignal
 
+from core.detection import region_blocks_and_grid
 from core.stream_buffer import StreamBuffer
 from core.tensor_channels import stream_channel_planes
+from core.wavelet import band_indices, morlet_band_power
 
 # How often the frontier is published, at most. Per-frame emission would post ~80
 # queued events a second to paint a number that is only legible at a few hertz.
@@ -122,6 +136,13 @@ class LiveStreamWorker(StreamWorker):
     # {"first": absolute index of row 0, "channels": {name: (T, ny, nx)},
     #  "frontier": int, "token": whatever the requester passed}
     window_ready = pyqtSignal(object)
+    # {"first": absolute index of row 0, "band_power": (T, B), "frontier": int,
+    #  "token": ...}. The transform only -- the value/count bands and the
+    #  detection window are NOT applied here, because those re-derive from
+    #  retained band power without a fresh pass and belong wherever that
+    #  retention lives (core.live_track). Emitting a finished gate would bake a
+    #  threshold into the accumulator and force a re-stream to change it.
+    detected = pyqtSignal(object)
 
     def __init__(self, video_path: str, plan, capacity: int, *,
                  clip_paths=None, publish_hz: float = _PUBLISH_HZ, parent=None):
@@ -133,6 +154,10 @@ class LiveStreamWorker(StreamWorker):
         self._min_publish_dt = 1.0 / max(publish_hz, 1e-6)
         self._lock = QMutex()
         self._pending = None            # the one outstanding window request
+        self._pending_detect = None     # the one outstanding detection request
+        # Kept so the post-loop detection can re-run the last request's
+        # parameters; see _serve_detect(final=True).
+        self._last_detect = None
         self._rate = 0.0
         # Written on the worker thread before the final signal, read by the GUI
         # after it. Carries `truncated`, which is the difference between "the
@@ -151,6 +176,26 @@ class LiveStreamWorker(StreamWorker):
         """
         with QMutexLocker(self._lock):
             self._pending = (int(n), tuple(channels), token)
+
+    def request_detect(self, n: int, channel: str, meta: dict, region_index: int,
+                       freqs, freq_band_hz, token=None) -> None:
+        """Ask for Morlet band power over the trailing ``n`` frames of one
+        channel's region columns, served on the worker thread.
+
+        Parked rather than queued, exactly like :meth:`request_latest`: a
+        backlog of transforms would be work done on spans the frontier has
+        already left behind, while the newest span went unexamined.
+
+        ``n`` should overlap the previous request by at least twice the cone of
+        influence. Consecutive non-overlapping windows would leave a
+        permanently-unexamined seam at every join, because the accumulator drops
+        each window's contaminated edges -- and a seam that no later window
+        covers is a gap the strip is obliged to paint as unexamined forever.
+        """
+        with QMutexLocker(self._lock):
+            self._pending_detect = (int(n), str(channel), meta,
+                                    int(region_index), np.asarray(freqs, float),
+                                    tuple(freq_band_hz), token)
 
     # -- worker thread -------------------------------------------------------
     def _run(self):
@@ -190,6 +235,7 @@ class LiveStreamWorker(StreamWorker):
                     last_publish = now
                     self._publish(buf)
                 self._serve_pending(buf)
+                self._serve_detect(buf)
 
         # Always publish the final state, whatever the throttle last allowed:
         # the difference between "processing" and "done" is this emission, and
@@ -197,6 +243,10 @@ class LiveStreamWorker(StreamWorker):
         # where the pass actually reached.
         self._publish(buf)
         self._serve_pending(buf)
+        # And always run one last detection over the tail. Without it the final
+        # seconds of every pass stay unexamined: the last request was serviced
+        # some frames back, and its trailing cone was trimmed off on the way in.
+        self._serve_detect(buf, final=True)
         self.done.emit(self.pass_meta)
 
     def _publish(self, buf: StreamBuffer) -> None:
@@ -228,3 +278,33 @@ class LiveStreamWorker(StreamWorker):
             return
         self.window_ready.emit({"first": first, "channels": out,
                                 "frontier": buf.frontier, "token": token})
+
+    def _serve_detect(self, buf: StreamBuffer, final: bool = False) -> None:
+        """Transform the trailing detection window, on this thread.
+
+        ``final`` re-uses the last request's parameters after the decode loop has
+        ended, so the tail of the pass is examined rather than left as a gap
+        whose only cause was where the timer happened to last fire.
+        """
+        with QMutexLocker(self._lock):
+            req = self._pending_detect
+            self._pending_detect = None
+            if req is None and final:
+                req = self._last_detect
+            if req is not None:
+                self._last_detect = req
+        if req is None:
+            return
+        n, channel, meta, region_index, freqs, band, token = req
+        if channel not in buf.channels:
+            return
+        planes, first = buf.latest(n, channel)
+        if planes.shape[0] < 2:
+            # One frame is not a time series. Transforming it would return a
+            # padding response and the accumulator would record it as examined.
+            return
+        blocks, _grid = region_blocks_and_grid(meta, planes, region_index)
+        i, j = band_indices(freqs, band[0], band[1])
+        bp = morlet_band_power(blocks, float(meta["fps"]), freqs, i, j)
+        self.detected.emit({"first": int(first), "band_power": bp,
+                            "frontier": buf.frontier, "token": token})

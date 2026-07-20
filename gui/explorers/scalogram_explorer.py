@@ -305,6 +305,10 @@ class ScalogramExplorer(QWidget):
     # committed changes (band RELEASE, not every drag frame) -- a signal per
     # mouse-move would drive a sidecar write per pixel of drag.
     tuning_changed = pyqtSignal()
+    # Absolute video frame the cursor sits on. Emitted on every frame change --
+    # including playback -- so the whole-clip strip tracks the position rather
+    # than only updating when a pass lands.
+    frame_moved = pyqtSignal(int)
 
     def __init__(self, cache=None, video_path: str | None = None, *,
                  state=None, sidecar_path: str | None = None,
@@ -1841,6 +1845,26 @@ class ScalogramExplorer(QWidget):
         self.time_lbl.setText(f"{self.frame/self.fps:.2f} s  (#{self.frame})")
         if self.isVisible():
             self._redraw_video()
+        # Absolute, because the only consumer outside this widget is the
+        # whole-clip strip, whose axis is the video's. Emitting the T-axis index
+        # would walk its cursor backwards through the clip every time a live
+        # window slid forward, while appearing to sit still.
+        self.frame_moved.emit(self.window_start + self.frame)
+
+    def seek_absolute(self, frame: int) -> bool:
+        """Move the cursor to an absolute VIDEO frame if this span holds it.
+
+        Returns whether it landed. False is the ordinary answer while streaming
+        -- the span is a trailing window and the user is dragging the strip
+        somewhere else entirely -- and the caller treats it as "this seek needs
+        a pass", not as an error. Clamping into the span instead would park the
+        cursor at a window edge and report a position nobody asked for.
+        """
+        rel = int(frame) - self.window_start
+        if rel < 0 or rel >= self.T:
+            return False
+        self._update_frame(rel)
+        return True
 
     def _stash_bands(self, index: int) -> None:
         """Freeze the outgoing scope's bands so revisiting it restores them.

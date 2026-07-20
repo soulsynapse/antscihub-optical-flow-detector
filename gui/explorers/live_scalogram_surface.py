@@ -43,7 +43,9 @@ from core.replicates import build_layout, in_tile_order
 # these change (the tab keys it on a geometry hash), so refreshing metadata must
 # never copy them across -- see refresh_replicate_metadata.
 _GEOMETRY_KEYS = frozenset({"frac", "id"})
-from core.detection import detect_channel_region
+from core.detection import detect_channel_region, region_grid_from_meta
+from core.live_track import (TrackStamp, WholeVideoTrack, band_power_bytes,
+                             coi_trim)
 from core.stream_buffer import MIN_CAPACITY, capacity_for_budget
 from core.sysmem import budget_bytes
 from core.tensor_channels import plan_channel_stream
@@ -96,6 +98,35 @@ _WINDOW_REQUEST_HZ = 1.0
 # than this is a deliberately short window, and refusing to draw it at all would
 # be worse than drawing it late.
 _MIN_LIVE_FRAMES = MIN_CAPACITY
+
+# How often a detection window is requested from the stream worker. Slower than
+# the display tick because the transform is the expensive half and runs on the
+# decode thread: asking faster does not fill the track faster, it just steals
+# frames from the frontier.
+_DETECT_REQUEST_HZ = 0.5
+
+# How much a detection window must overlap the previous one, as a multiple of
+# the cone of influence trimmed off each end. The accumulator discards `coi`
+# frames at both edges of every window, so consecutive requests that only just
+# touch would leave a 2*coi seam unexamined at every join -- a permanent gap
+# whose only cause is the request cadence. Two cones of overlap means each seam
+# lands in the interior of the next window.
+_DETECT_OVERLAP_COI = 2.5
+
+# Whole-clip band power is retained so a threshold re-tune is instant rather than
+# a re-stream (todo.md: the value/count bands and the detection window are
+# deliberately NOT part of a TrackStamp). It is ~45 MB at 30k frames and 377
+# blocks, which is nothing -- but a region pointed at a whole 5.3K frame at a
+# fine block runs to gigabytes, so it is priced against this cap and declined
+# rather than attempted.
+_TRACK_BP_CAP = 1024 ** 3
+
+# Consecutive dropped detection windows before the surface stops treating them
+# as incidental and says the pass is producing nothing. One drop is ordinary (a
+# geometry change races a request in flight); a run of them means the stream and
+# the tuned selection disagree, and the symptom -- a strip that never fills
+# while progress looks healthy -- is indistinguishable from a quiet clip.
+_DETECT_DROP_ALARM = 3
 
 # Fraction of free RAM the ring buffer may take, and its floor/cap. Read
 # separately from _PP_BUDGET_* and not shared with it: the per-pixel cache is
@@ -411,11 +442,37 @@ class LiveScalogramSurface(QWidget):
         self._stream_token = 0
         self._stream_plan_obj = None
         self._stream_meta: dict | None = None
+        # Where a live pass should resume after a seek stopped it. Consumed by
+        # _on_stream_cancelled; None means the stop was a real stop.
+        self._restart_stream_at: int | None = None
+        # Consecutive detection windows refused for a geometry mismatch; see
+        # _DETECT_DROP_ALARM. Reset by any write that lands.
+        self._detect_drops = 0
         # Drives request_latest. Started with the pass and stopped with it, so a
         # request is never parked on a worker that is on its way out.
         self._stream_timer = QTimer(self)
         self._stream_timer.setInterval(int(1000 / _WINDOW_REQUEST_HZ))
         self._stream_timer.timeout.connect(self._request_live_window)
+
+        # -- the whole-video detection track ---------------------------------
+        # The live axis is the WHOLE VIDEO, not the trailing window: navigating
+        # around the clip accumulates parts of one picture. Created here rather
+        # than on the first pass so the strip is a working seeker the moment the
+        # tab opens, and so a stamp change never has to reconcile "no track yet"
+        # with "a track under other settings".
+        self._track = WholeVideoTrack(n_frames=self.frame_count, fps=self.fps)
+        self._track_grid = None          # (dy, dx, gy, gx) for the clump pass
+        # Coalesces value-band drags. Unlike the count band, a value-band change
+        # re-runs the per-frame connected-components loop over every retained
+        # row -- the one part of a re-tune that is not free at clip length.
+        self._retune_debounce = QTimer(self)
+        self._retune_debounce.setSingleShot(True)
+        self._retune_debounce.setInterval(200)
+        self._retune_debounce.timeout.connect(self._on_retune_settled)
+        # Drives request_detect, separately from the display tick.
+        self._detect_timer = QTimer(self)
+        self._detect_timer.setInterval(int(1000 / _DETECT_REQUEST_HZ))
+        self._detect_timer.timeout.connect(self._request_detect_window)
 
         # Coalesce rapid knob edits into a single re-extract on settle. Created
         # before the strip because the controls connect to it.
@@ -458,10 +515,16 @@ class LiveScalogramSurface(QWidget):
         self._host_lay.addWidget(self._placeholder)
         root.addWidget(self._host, 1)
 
-        # Whole-clip detection navigator (hidden until a commit pass lands).
+        # The whole-clip strip. ALWAYS visible: it is this tab's position
+        # control, not a report of a finished pass, so hiding it until a commit
+        # lands would leave the clip with no seeker for the whole tuning
+        # session. It carries the clip's length from the start and fills in as
+        # detection reaches each part.
         self.navigator = DetectionNavigator()
+        self.navigator.set_span(self.frame_count, self.fps)
         self.navigator.focus_requested.connect(self._focus_frame)
-        self.navigator.setVisible(False)
+        self.navigator.scrubbed.connect(self._on_scrubbed)
+        self.navigator.seek_committed.connect(self._on_seek_committed)
         root.addWidget(self.navigator)
 
         # First extract once shown, so the window opens without a blocking pass.
@@ -674,7 +737,13 @@ class LiveScalogramSurface(QWidget):
         # when it differs, valueChanged carries the re-extract as usual.
         self.start_slider.setValue(frame)
 
-    def _sync_window_label(self):
+    def _sync_window_label(self, scrub: int | None = None):
+        """The window-start readout. ``scrub`` shows a position being dragged on
+        the strip WITHOUT moving the slider: the drag has not committed, and
+        writing it into the slider would fire a re-extract per pixel."""
+        if scrub is not None:
+            self.start_lbl.setText(f"{scrub / self.fps:.2f} s ⟵")
+            return
         self.start_lbl.setText(f"{self.start_slider.value() / self.fps:.2f} s")
 
     def _sync_block_auto_text(self):
@@ -930,12 +999,26 @@ class LiveScalogramSurface(QWidget):
             self.video_path, plan, capacity, parent=self)
         self._stream_worker.advanced.connect(self._on_advanced)
         self._stream_worker.window_ready.connect(self._on_window_ready)
+        self._stream_worker.detected.connect(self._on_detected)
         self._stream_worker.done.connect(self._on_stream_done)
         self._stream_worker.failed.connect(self._on_stream_failed)
         self._stream_worker.cancelled.connect(self._on_stream_cancelled)
         self._stream_worker.finished.connect(self._stream_worker.deleteLater)
         self._stream_worker.start()
         self._stream_timer.start()
+        # Stamp the track with what this pass will be computed under BEFORE any
+        # window can arrive, so no write can land unstamped or against the
+        # previous pass's settings.
+        if self._sync_track():
+            self.status_lbl.setText(
+                self.status_lbl.text() + " · earlier detection shown gray "
+                "(different settings)")
+        if self._track.stamp is None:
+            self.status_lbl.setText(
+                self.status_lbl.text() + " · display only — extract and select "
+                "a replicate to accumulate detection")
+        else:
+            self._detect_timer.start()
 
     def _request_live_window(self):
         """Ask for the trailing window the scalogram is recomputed over.
@@ -1025,18 +1108,247 @@ class LiveScalogramSurface(QWidget):
 
     def _on_stream_failed(self, msg: str):
         self._end_stream()
+        # A pending seek dies with the pass. Only _on_stream_cancelled consumes
+        # the flag, so leaving it set here would arm a restart that fires at the
+        # NEXT stop -- at a position the user chose minutes earlier, against a
+        # pass they deliberately ended.
+        self._restart_stream_at = None
         self.status_lbl.setText(f"live pass failed: {msg}")
 
     def _on_stream_cancelled(self):
         self._end_stream()
+        # A seek during a live pass stops the island and starts another where the
+        # user landed. Resumed HERE rather than at the seek, because the worker
+        # only notices the cancel at its next frame and a start before that would
+        # find the decoder still held.
+        if self._restart_stream_at is not None:
+            self._restart_stream_at = None
+            self.status_lbl.setText("live pass moved — restarting here")
+            self.start_stream()
+            return
         self.status_lbl.setText("live pass stopped")
 
     def _end_stream(self):
         """One place the three terminal signals converge, so the timer cannot
         outlive the worker it parks requests on."""
         self._stream_timer.stop()
+        self._detect_timer.stop()
         self._stream_worker = None
         self._set_busy(None)
+
+    # -- the whole-video detection track -------------------------------------
+    def _current_stamp(self) -> tuple[TrackStamp | None, tuple | None]:
+        """``(stamp, region_grid)`` for the settings now in force, or
+        ``(None, None)`` when the detector is not yet answerable.
+
+        Not answerable means no explorer (nothing has been extracted, so there
+        are no tuned bands) or no selected replicate. Returning None rather than
+        a placeholder stamp is deliberate: a placeholder would let writes land
+        against settings nobody chose, and the strip would report coverage for a
+        detector that was never configured.
+        """
+        if self._explorer is None:
+            return None, None
+        params = self._explorer.detection_params()
+        idx = int(params["region_index"])
+        if idx < 0:
+            return None, None
+        meta = self._explorer.meta
+        n_blocks, grid = region_grid_from_meta(meta, idx)
+        cfg = self._build_cfg()
+        stamp = TrackStamp(
+            channel=params["channel_attr"],
+            freq_band_hz=params["freq_band_hz"],
+            grid=tuple(int(v) for v in meta["grid"]),
+            region_index=idx,
+            region_blocks=n_blocks,
+            downsample=cfg.preprocess.downsample,
+            block_size=cfg.flow.block_size)
+        return stamp, grid
+
+    def _sync_track(self, repaint: bool = True) -> bool:
+        """Push the current settings onto the track.
+
+        Returns whether the STAMP moved -- i.e. whether everything already
+        computed just became stale. The caller reports that; this does not,
+        because the same call is made from a knob handler (where the user needs
+        telling) and from the start of a pass (where they do not).
+        """
+        stamp, grid = self._current_stamp()
+        if stamp is None:
+            return False
+        moved = self._track.set_stamp(stamp, region_grid=grid)
+        if moved:
+            # Retention is priced per stamp because B moves with the grid and
+            # the region: a band the surface could afford to retain at block 64
+            # is a different object at block 16.
+            fits = band_power_bytes(self.frame_count,
+                                    stamp.region_blocks) <= _TRACK_BP_CAP
+            self._track.retain_band_power = fits
+            self._track_grid = grid
+        self._sync_track_detector(repaint=False)
+        if repaint:
+            self._repaint_track()
+        return moved
+
+    def _sync_track_detector(self, repaint: bool = True) -> None:
+        """Re-derive the track from the threshold knobs, without a fresh pass.
+
+        This is the half of the redesign that makes tuning usable at clip
+        length: the value band, the count band and the detection window are NOT
+        part of the stamp, so moving one re-derives every frame already covered
+        instead of graying the clip out and demanding a re-stream.
+        """
+        if self._explorer is None or self._track.stamp is None:
+            return
+        p = self._explorer.detection_params()
+        self._track.set_detector(
+            value_band=p["value_band"], count_band=p["count_band"],
+            detect_window=p["detect_window"], centered=p["centered"])
+        if repaint:
+            self._repaint_track()
+
+    def on_tuning_changed(self) -> None:
+        """A detection knob moved. Debounced because the value band's half of the
+        re-derive is a per-frame connected-components loop over every retained
+        row -- cheap per frame, not cheap across 30k of them at drag rate."""
+        self._retune_debounce.start()
+
+    def _on_retune_settled(self) -> None:
+        """Apply a settled tuning change, and SAY SO when it invalidated work.
+
+        A knob that quietly grays out ten minutes of processing is the same
+        class of surprise as one that quietly changes a threshold's meaning
+        (T17, and the count-band re-denomination note): correct behaviour still
+        has to be visible. Threshold moves take the other branch and say
+        nothing, because nothing was lost -- they re-derived.
+        """
+        moved = self._sync_track()
+        if not moved:
+            return
+        stale = int(self._track.stale.sum())
+        if stale:
+            self.status_lbl.setText(
+                f"settings changed — {stale / max(self.fps, 1e-6):.0f} s of "
+                f"earlier detection is now shown gray (computed under the "
+                f"previous channel/band/geometry) and needs another pass")
+
+    def _repaint_track(self) -> None:
+        self.navigator.set_track(self._track)
+
+    def _track_write(self, first: int, band_power, **trim) -> bool:
+        """Write into the track, refusing a geometry that does not match.
+
+        The one place both producers -- the live pass and the commit -- go
+        through, because both can be handed band power whose block count belongs
+        to a different grid: the commit builds its own ChannelData, and a live
+        transform can be serviced after the geometry moved. ``write`` raises on
+        that, which in a Qt signal handler is a hard crash rather than an error,
+        so the mismatch is turned into a reported False here instead.
+
+        Returns whether anything was recorded. Callers MUST say so when it is
+        False: no coverage and no detections look the same on the strip, and
+        that is exactly the confusion the coverage mask exists to prevent.
+        """
+        if self._track.stamp is None:
+            return False
+        bp = np.asarray(band_power, np.float32)
+        if bp.ndim != 2 or bp.shape[1] != self._track.n_blocks:
+            return False
+        a, b = self._track.write(int(first), bp, **trim)
+        return b > a
+
+    def _request_detect_window(self):
+        """Park a detection request on the stream worker.
+
+        The window is the display window widened by the overlap the accumulator
+        needs: every write loses a cone of influence at each end, so requests
+        that merely abut would leave an unexamined seam at every join. Widening
+        the request is the cheapest place to fix that -- the alternative is a
+        gap list and a backfill worker for gaps this surface created itself.
+        """
+        if self._stream_worker is None or self._explorer is None:
+            return
+        stamp = self._track.stamp
+        if stamp is None:
+            return
+        base = max(2, int(round(self.len_spin.value() * self.fps)))
+        coi = coi_trim(stamp.freq_band_hz, self.fps)
+        n = base + int(_DETECT_OVERLAP_COI * 2 * coi)
+        self._stream_worker.request_detect(
+            n, stamp.channel, self._stream_meta, stamp.region_index,
+            default_freqs(self.fps), stamp.freq_band_hz, self._stream_token)
+
+    def _on_detected(self, msg: dict):
+        """Band power for a trailing window came back. Write it COI-trimmed.
+
+        The token check is the same guard ``_on_window_ready`` needs and for a
+        sharper reason: a transform parked before a restart is serviced against
+        the OLD island, so writing it would record coverage under the current
+        stamp for frames computed under different knobs -- stale data laundered
+        into current, which is worse than either showing it stale or not at all.
+        """
+        if self._stream_worker is None or msg.get("token") != self._stream_token:
+            return
+        stamp = self._track.stamp
+        if stamp is None:
+            return
+        bp = msg["band_power"]
+        first = int(msg["first"])
+        coi = coi_trim(stamp.freq_band_hz, self.fps)
+        # The clip's true ends are edges of the DATA, not of an arbitrary cut,
+        # so the transform is as trustworthy there as it can ever be and the
+        # frames are kept. Trimming them anyway would leave the first and last
+        # ~1.4 s of every clip permanently unexaminable.
+        head = 0 if first <= 0 else coi
+        tail = 0 if first + bp.shape[0] >= self.frame_count else coi
+        if not self._track_write(first, bp, trim_head=head, trim_tail=tail):
+            # A single drop is ordinary -- the geometry moved between the
+            # request and its service, and there is no correct reshape. A
+            # SUSTAINED run of them is not: it means the stream's meta and the
+            # explorer's disagree about the grid, and the symptom is a strip
+            # that simply never fills while the pass reports healthy progress.
+            self._detect_drops += 1
+            if self._detect_drops == _DETECT_DROP_ALARM:
+                self.status_lbl.setText(
+                    "live detection is producing nothing — the streamed block "
+                    "geometry does not match the tuned selection; stop and "
+                    "re-extract before trusting this strip")
+            return
+        self._detect_drops = 0
+        self._repaint_track()
+
+    # -- the strip as the clip's seeker --------------------------------------
+    def _on_scrubbed(self, frame: int):
+        """Dragging the strip. Cheap consumers only -- the hosted explorer's
+        cursor if that frame is in the span it holds, and the readout. The
+        expensive move waits for the release; a re-extract per pixel of drag
+        would make the seeker unusable."""
+        self._sync_window_label(scrub=frame)
+        if self._explorer is not None:
+            self._explorer.seek_absolute(frame)
+
+    def _on_seek_committed(self, frame: int):
+        """Released the strip somewhere with no detection under it: go there.
+
+        A live pass RESTARTS at the new position rather than continuing, and the
+        track keeps everything it already holds -- which is the reversal the
+        redesign records. Skipping around builds up parts of one whole-video
+        picture; the per-frame series that carry it are cheap enough that
+        abandoning earlier segments buys nothing.
+        """
+        n = max(2, int(round(self.len_spin.value() * self.fps)))
+        start = int(np.clip(frame, 0, max(0, self.frame_count - n)))
+        self.start_slider.blockSignals(True)
+        self.start_slider.setValue(start)
+        self.start_slider.blockSignals(False)
+        self._sync_window_label()
+        self.navigator.set_cursor(frame)
+        if self._stream_worker is not None:
+            self.stop_stream()
+            self._restart_stream_at = start
+            return
+        self.extract()
 
     def _live_channel_data(self, win: dict) -> ChannelData:
         """Wrap a served trailing window as the same ChannelData a windowed
@@ -1471,6 +1783,12 @@ class LiveScalogramSurface(QWidget):
             f"window {cd.window_start / self.fps:.2f} s · {cd.n_frames} frames · "
             f"{cd.meta['grid'][0]}×{cd.meta['grid'][1]} blocks{approx}")
         self._swap_explorer(cd)
+        # An extract is the first point at which the detector is answerable at
+        # all (it is what produces the tuned bands and the region), so this is
+        # where a track that has been sitting unstamped gets its stamp -- and
+        # where a geometry change makes the previous stamp's coverage stale.
+        self._sync_track()
+        self.navigator.set_cursor(cd.window_start)
 
     # -- pixel-cache helpers -------------------------------------------------
     def _pp_signature(self, cfg: PipelineConfig, start: int, n: int) -> tuple:
@@ -1578,6 +1896,13 @@ class LiveScalogramSurface(QWidget):
         # explorer can force a synchronous repaint of it before blocking work.
         new.set_status_relay(self.graph_status_lbl)
         new.tuning_changed.connect(self._save_debounce.start)
+        # The track follows the tuning: threshold moves re-derive over retained
+        # coverage, and a channel/band/region move re-stamps it so earlier work
+        # goes visibly stale instead of being silently reused or blanked.
+        new.tuning_changed.connect(self.on_tuning_changed)
+        # The strip is the clip's seeker, so its cursor follows playback and
+        # scrubbing in the hosted explorer, not only pass results.
+        new.frame_moved.connect(self.navigator.set_cursor)
         if self._pending_region is not None:
             # Reopening the clip: put the selection back before the bands land,
             # so the count band's re-denomination measures against the replicate
@@ -1651,9 +1976,27 @@ class LiveScalogramSurface(QWidget):
         short = getattr(self._proc_worker, "short", None)
         self._proc_worker = None
         self._set_busy(None)
-        self.navigator.set_result(res, self.fps)
-        self.navigator.setVisible(True)
-        n = len(res.detected_intervals())
+        # Into the SAME accumulator the live pass fills, not a parallel result
+        # object: one data structure with one coverage mask, so a commit and the
+        # live passes around it compose instead of overwriting each other. The
+        # commit's band power spans the whole clip and its edges are the clip's
+        # own, so nothing is trimmed -- there is no arbitrary cut to protect
+        # against here.
+        self._sync_track(repaint=False)
+        wrote = self._track_write(int(getattr(res, "window_start", 0)),
+                                  res.band_power, trim=0)
+        self._repaint_track()
+        if not wrote:
+            # The pass succeeded but its geometry does not match what the strip
+            # is stamped with, so nothing was recorded. Said out loud: a commit
+            # that silently produced no coverage would look identical to a clip
+            # with no detections in it.
+            self.status_lbl.setText(
+                "whole-video pass finished but its block geometry does not "
+                "match the current selection — nothing was recorded; "
+                "re-extract and process again")
+            return
+        n = len(self._track.detected_intervals())
         if short is not None:
             # Never call this a whole-video pass. Past the cut point there is no
             # evidence either way, and a detection count presented without that
@@ -1731,10 +2074,13 @@ class LiveScalogramSurface(QWidget):
         # session ends, and an armed debounce would be dropped with the widget.
         self._save_tuning()
         self._restart_extract = False
+        self._restart_stream_at = None
         # A knob edited just before the close leaves a debounce armed; let it fire
         # and it re-enters extract() on a surface that is on its way out.
         self._debounce.stop()
         self._block_debounce.stop()
+        self._retune_debounce.stop()
+        self._detect_timer.stop()
         # Before the workers: this one parks requests on the stream worker, and a
         # tick between the cancel and the wait would touch a thread on its way out.
         self._stream_timer.stop()

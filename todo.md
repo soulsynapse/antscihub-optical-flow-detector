@@ -34,7 +34,7 @@ to the relevant section rather than restating it.
 | ~~**T22**~~ | ~~New **viewer tab** consuming a fully-processed video.~~ **DROPPED** (2026-07-19) — scope, not value. A convenience shell over a `DetectionResult` that nothing else depends on; never started. Re-open only if day-to-day review actually stalls without it. |
 | ~~**T23**~~ | ~~**ROI pre-transcode**: cut each source once into per-replicate clips + manifest.~~ **DONE** — see Batch I. Works, and **the premise it was justified on turned out false**: the 25x isolated decode win is **1.06x end to end** (`FINDINGS.md` §16). Not the lever that moves the floor at scale 1.0. |
 | ~~**T24**~~ | ~~**Headless batch driver**: no-GUI entry point, file-level partitioning, N-worker throughput.~~ **DONE** — all three slices landed; throughput measured in `FINDINGS.md` §14 (**~130 fps / 5.4x realtime, ceiling at 8 workers**). |
-| **T29** | **Streaming live surface** — display immediately, process forward continuously, plots fill as frames arrive, instead of extract-a-window-then-block. Architecture decided 2026-07-20; see Batches P/Q. Foundations landed in `e11a4cb` (`core/stream_buffer.py`); **Batch P landed** (`stream_channel_planes` + `ChannelPlan`, `FINDINGS.md` §22, cost measured at nil). **Batch Q slices 1 and 2 landed** (`LiveStreamWorker`; the `Live ▶` surface + `set_channel_data`, §23). **Slice 3 — the CWT with the cone of influence — is what remains.** |
+| **T29** | **Streaming live surface** — display immediately, process forward continuously, plots fill as frames arrive, instead of extract-a-window-then-block. Architecture decided 2026-07-20; see Batches P/Q. Foundations landed in `e11a4cb` (`core/stream_buffer.py`); **Batch P landed** (`stream_channel_planes` + `ChannelPlan`, `FINDINGS.md` §22, cost measured at nil). **Batch Q slices 1 and 2 landed** (`LiveStreamWorker`; the `Live ▶` surface + `set_channel_data`, §23). **Slices 3 (COI) and 4 (the whole-video rebuild: `core/live_track.py`, coverage mask, per-frame staleness, the strip as the clip's seeker, detection moved onto the worker thread) have landed too — slice 4 uncommitted.** T35 closed by slice 4. **What remains is the continuous-plots design call, written up in the Batch Q slice 4 section.** |
 | **T30** | **The mark corpus is not a corpus.** `marks.json` holds **one** 0.39 s span, and **no animal-absent spans at all** — so occupancy's whole claim (present-but-still ≠ empty) cannot be tested, and neither can any supervised channel comparison. Needs flying / still-with-animal / animal-absent / wingbeat, several each, across replicates. `rep6-no-flying` is a ready-made negative control. **This blocks T31 and T32, and no amount of channel-building substitutes for it.** |
 | **T31** | **Validate occupancy and the ratio channels against marked footage**, using the **tail statistic, not region means** (`FINDINGS.md` §20 — this was got wrong once already). Gates Batch S. |
 | **T32** | **Supervised signature fitting.** With a real corpus, fit LDA / L1-logistic per labelled behaviour over the (channel × spatial scale × temporal scale) grid. The weight vector *is* an interpretable, tunable signature and drops into a template detector with the existing `DetectionResult` shape. Cheap, and it tells you which channels earn their place before the unsupervised map is built around them. |
@@ -274,6 +274,19 @@ the plot background at both ends. Two things worth not re-deriving:
   stretched them over the full width, showing ~5% of a whole-clip cube while the
   cursor mapped over all `T`. A transposition of `DensityPlot`'s scatter, which
   divides correctly. It hid precisely the newest edge the COI is about.
+
+**T35 — CLOSED 2026-07-20 by the whole-video rebuild below**, in the cheap way
+this section predicted: `core.live_track.coi_trim` derives the trim from
+`coi_efolding_s` at the BAND'S LOWEST frequency, and `WholeVideoTrack.write`
+simply does not write the contaminated edge frames. A later overlapping window,
+for which those frames are interior, supplies them. The detector never produces
+the frontier-transient numbers, so there is nothing to mask. `trim_head` /
+`trim_tail` overrides keep the clip's true ends, which are edges of the DATA
+rather than of an arbitrary cut. **No detector-side mask was added**, as this
+section instructed.
+
+**The original statement of T35, kept because it is the clearest description of
+the failure class:**
 
 **T35 — the DETECTOR still consumes the cone it now fades. OPEN, and the most
 important thing slice 3 did not close.** `detect_channel_region` →
@@ -554,6 +567,87 @@ T11 and T12 landed, T20 left the batch, T21 is untouched.**
 
 ---
 
+### Batch Q slice 4 — the whole-video rebuild. LANDED 2026-07-20 (uncommitted)
+
+**What it is.** The live axis became the whole video. The strip at the bottom is
+now the clip's SEEKER and is always visible; it fills as detection runs, and it
+paints three states that used to be two.
+
+**New: `core/live_track.py` (`WholeVideoTrack`, `TrackStamp`, `coi_trim`).**
+Clip-length `count`/`clump`/`gate` plus a per-frame `stamp_id`. Read the module
+docstring before touching it; the four properties it exists to hold are stated
+there. Tests: `tests/test_live_track.py` (23).
+
+**The stamp split, decided with the user and NOT to be re-litigated silently.**
+A `TrackStamp` holds only what invalidates the retained BAND POWER — channel,
+frequency band, grid, region, downsample, block size. The value band, count band
+and detection window are deliberately OUT, because whole-clip `(T, B)` band
+power is retained (~45 MB at 30k x 377, capped at `_TRACK_BP_CAP` = 1 GiB) and
+those three re-derive over existing coverage instead. **A count-band nudge must
+never gray out the clip.**
+
+**Coverage is the first piece, and it is honest.** Three painted states:
+unexamined (bare trough, no baseline rule), examined-and-quiet (baseline rule
+LIT), examined-under-other-settings (desaturated). The baseline rule is what
+keeps "nobody looked" out of "nothing happened" — §10 traps 7/8. Not decoration.
+
+**A stale region's gate is FROZEN** (`_derive_gate` runs over `current`, not
+`covered`). Found in review: re-gating stale frames combines a `count` computed
+under one value band with a count band chosen later, and made the gray bars move
+while tuning knobs that provably do not apply to them.
+
+**Detection runs on the WORKER thread** (`LiveStreamWorker.request_detect` /
+`detected`, `_serve_detect`). Not a performance choice: the DISPLAY path drops
+windows while the explorer is transforming, which is right for a display and
+fatal for an accumulator — coverage would get holes wherever the GUI was busy,
+and a hole is indistinguishable from examined-and-quiet. There is also a final
+post-loop serve, or the tail of every pass stays unexamined.
+
+**Requests overlap by `_DETECT_OVERLAP_COI` (2.5) cones.** Windows that merely
+abut leave a 2*coi seam unexamined at every join — a permanent gap created
+purely by the request cadence.
+
+**Both producers go through `_track_write`.** The commit pass now fills the SAME
+accumulator (decided with the user) rather than a parallel `DetectionResult`.
+`write` RAISES on a block-count mismatch, which in a Qt signal handler is a
+crash, so the guard converts it to a reported False; `_DETECT_DROP_ALARM`
+escalates a sustained run of drops, because a strip that never fills while
+progress looks healthy reads exactly like a quiet clip.
+
+**The file-locality hazard fired a FIFTH time, as predicted.** Specced as
+`live_scalogram_surface.py` + a new core module; it also needed
+`gui/stream_worker.py` (detection on the worker thread), `core/detection.py`
+(`region_grid_from_meta` — the clump grid without the data) and
+`gui/explorers/scalogram_explorer.py` (`seek_absolute` + a `frame_moved` signal,
+because the strip is a seeker and nothing emitted an ABSOLUTE cursor).
+
+**STILL OPEN — the continuous-plots half of the user's ask.** The scalogram, the
+selected channel trace and the detection sweep all refresh together at ~1 Hz via
+`set_channel_data`, gated on `explorer.is_building()`. The user asked for the
+scalogram at ~1 Hz (fine as-is) but the OTHER TWO CONTINUOUS. They cannot simply
+be ungated: `_show_live_window`'s gate is what stops every cube arriving stale
+(§23 trap 3). The real shape is to split `set_channel_data` into a cheap path
+(channels + per-frame plots, ~10 Hz) and the cube rebuild (its own slower
+cadence) — **which puts a scalogram from an older span beside traces from a
+newer one, and that must be visibly marked or it is precisely the
+stale-shown-as-current failure this surface exists to prevent.** Decide that
+before building it; it is not a rendering detail.
+
+**Also open, found in review and deliberately not fixed:** dragging the strip
+runs `seek_absolute` -> `_apply_frame` -> `_redraw_video`, i.e. a video decode
+per mouse-move. Pre-existing scrub behaviour, not introduced here, but the strip
+makes it much easier to hit.
+
+**Environment note, so the next session does not chase it:** this machine throws
+`Windows fatal exception: access violation` in `_serve_pending` during
+`tests/test_stream_worker.py` on roughly half of full-suite runs. User reports it
+is an aggressive university endpoint blocker; re-running gets through. An attempt
+to confirm it on a clean tree was INVALID (the `git stash push -u` failed on
+`.claude/` permissions and left the tree modified) — so it is unconfirmed, not
+proven environmental. Suite is 649 passing on a clean run.
+
+---
+
 ### The current thread (2026-07-20): live streaming, then a corpus, then signatures
 
 This is what the last session was actually about, and it supersedes the throughput
@@ -561,8 +655,11 @@ thread below as the near-term order.
 
 1. ~~**Batch P** — streaming generator in `tensor_channels`.~~ **DONE**, §22.
 2. **Batch Q** — continuous live surface on `core/stream_buffer.py`. **Slices 1
-   (the worker) and 2 (the surface + `set_channel_data`) landed; slice 3 (CWT +
-   cone of influence) is next.**
+   (worker), 2 (surface + `set_channel_data`), 3 (COI) and 4 (the whole-video
+   rebuild — `core/live_track.py`, coverage, staleness, the strip as seeker)
+   have all landed. Slice 4 is UNCOMMITTED as of this writing. What remains of
+   Q is the continuous-plots decision written up in the slice 4 section
+   above** — it is a design call, not a build.
 3. **Batch R + T30** — marking rehomed, and **an actual corpus laid down**. The
    widget without the corpus unblocks nothing.
 4. **T31** — validate occupancy/ratios against that corpus, on the tail statistic.

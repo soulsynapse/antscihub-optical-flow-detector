@@ -22,22 +22,40 @@ from core.timing import Timer
 from core.wavelet import band_indices, default_freqs, morlet_band_power
 
 
+def region_bbox(meta: dict, region_index: int) -> tuple[int, int, int, int]:
+    """A region's ``(y0, x0, y1, x1)`` block bounding box from a cache-shaped
+    meta. One region covering the whole grid when there are no replicate tiles."""
+    tiles = meta.get("replicate_tiles")
+    if tiles:
+        return tuple(int(v) for v in tiles[region_index]["atlas_bbox"])
+    ny, nx = (int(v) for v in meta["grid"])
+    return 0, 0, ny, nx
+
+
+def region_grid_from_meta(meta: dict, region_index: int):
+    """``(n_blocks, (dy, dx, gy, gx))`` for a region, WITHOUT the data.
+
+    Split out so a caller that needs the clump grid and the block count before
+    any frames exist -- the live accumulator, which must stamp a span with what
+    its count band is denominated in -- does not have to fabricate an array to
+    ask. :func:`region_blocks_and_grid` is the same derivation with the slice.
+    """
+    y0, x0, y1, x1 = region_bbox(meta, region_index)
+    dy, dx = y1 - y0, x1 - x0
+    gy, gx = np.mgrid[0:dy, 0:dx]
+    return dy * dx, (dy, dx, gy.ravel(), gx.ravel())
+
+
 def region_blocks_and_grid(meta: dict, channel_arr: np.ndarray,
                            region_index: int):
     """A region's (T, B) block columns plus its (dy, dx, gy, gx) clump grid, from
     a cache-shaped meta. Column order and 0-based grid match the explorer's
     _scope_blocks / _make_snap, so a whole-clip pass indexes blocks identically."""
     T = channel_arr.shape[0]
-    tiles = meta.get("replicate_tiles")
-    if tiles:
-        y0, x0, y1, x1 = (int(v) for v in tiles[region_index]["atlas_bbox"])
-    else:
-        ny, nx = (int(v) for v in meta["grid"])
-        y0, x0, y1, x1 = 0, 0, ny, nx
+    y0, x0, y1, x1 = region_bbox(meta, region_index)
     blocks = channel_arr[:, y0:y1, x0:x1].reshape(T, -1)
-    dy, dx = y1 - y0, x1 - x0
-    gy, gx = np.mgrid[0:dy, 0:dx]
-    return blocks, (dy, dx, gy.ravel(), gx.ravel())
+    _n, grid = region_grid_from_meta(meta, region_index)
+    return blocks, grid
 
 
 def inband_count(m: np.ndarray, lo: float, hi: float) -> np.ndarray:
