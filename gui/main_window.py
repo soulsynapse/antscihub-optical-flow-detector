@@ -46,9 +46,20 @@ class MainWindow(QMainWindow):
         self.state.status.connect(self.status.setText)
         self.state.video_loaded.connect(self._on_video_loaded)
         self.state.request_tab.connect(self.tabs.setCurrentIndex)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self._menu()
         self._shortcuts()
+
+    def _on_tab_changed(self, index: int):
+        # Leaving the Replicates tab latches its boxes as processed. This is the
+        # only route to the surfaces that consume the layout, so it strictly
+        # precedes any pass -- latching on the pass as well would be redundant.
+        # Moving a latched box is still allowed; it just has to be acknowledged
+        # (Tab2Replicates._confirm_move), because the measurements behind it are
+        # discarded rather than converted.
+        if index != 0:
+            self.tab2.mark_replicates_processed()
 
     def _menu(self):
         f = self.menuBar().addMenu("File")

@@ -32,12 +32,24 @@ from gui.video_panel import VideoPanel
 _PALETTE = ["#ff5a5a", "#4ac6ff", "#ffd24a", "#6ee06e", "#c78bff", "#ff9d3a",
             "#00d0b0", "#ff6ec7"]
 
+# The exact words the user has to click to move a box that downstream work has
+# already consumed. Spelled out rather than "OK" because that is the whole point
+# of the gate: the cost is not the drag, it is that everything measured against
+# the old rectangle silently stops describing the new one. Same hazard class as
+# T17 and the count-band re-denomination -- state that quietly stops meaning what
+# it meant -- but unlike those it cannot be converted, only discarded.
+_MOVE_ANYWAY = "I recognize the existing replicate data will be lost"
+
 
 class Tab2Replicates(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
-        # Each replicate: {"id", "label", "frac": (x0,y0,x1,y1), "color"}.
+        # Each replicate: {"id", "label", "frac": (x0,y0,x1,y1), "color",
+        # "processed"}. `processed` means downstream work has consumed this box,
+        # so moving it is gated (_confirm_move). It is always present on a box
+        # this session created, but readers must still use .get -- sidecars
+        # written before the field existed do not carry it.
         self.replicates: list[dict] = []
         self._next_id = 1
 
@@ -89,7 +101,9 @@ class Tab2Replicates(QWidget):
             "empty space to place more of the same size. Click a box to select "
             "and zoom to it, drag it to reposition, press Delete to remove it, "
             "right-click to zoom out. "
-            "The stamp is always the SELECTED box's size.")
+            "The stamp is always the SELECTED box's size. "
+            "A 🔒 box has been processed — moving it asks first, because its "
+            "existing measurements are discarded rather than re-aimed.")
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color:#333; font-size:11px;")
         ll.addWidget(self.hint)
@@ -265,6 +279,7 @@ class Tab2Replicates(QWidget):
             "label": f"rep{self._next_id}",
             "frac": (x0, y0, x1, y1),
             "color": _PALETTE[(self._next_id - 1) % len(_PALETTE)],
+            "processed": False,
         }
         self._next_id += 1
         self.replicates.append(rep)
@@ -355,14 +370,83 @@ class Tab2Replicates(QWidget):
                       x1: float, y1: float):
         if not (0 <= idx < len(self.replicates)):
             return
-        self.replicates[idx]["frac"] = (x0, y0, x1, y1)
+        rep = self.replicates[idx]
+        if rep.get("processed") and not self._confirm_move(rep, (x0, y0)):
+            # Declined: snap the box back to where it still is. self.replicates
+            # was never written, so redrawing from it IS the revert -- there is
+            # no saved-position copy to restore and therefore none to get wrong.
+            self._redraw_boxes()
+            return
+        rep["frac"] = (x0, y0, x1, y1)
+        # Moving it makes it fresh again: whatever had been processed against
+        # the old rectangle is exactly what the user just agreed to lose, so
+        # leaving the flag set would warn a second time about data that is
+        # already gone.
+        rep["processed"] = False
         # A moved box is new geometry, so the ROIs and every series computed
         # against them are stale -- same path as drawing one.
         self._rebuild_rois()
+        self._sync_lock_badges()
         self._redraw_boxes()
         self._autosave()
         # No _sync_stamp_label: the release clamps the ORIGIN and keeps the
         # size, so a reposition cannot change what the stamp reports.
+
+    def _confirm_move(self, rep: dict, to_origin: tuple[float, float]) -> bool:
+        """Gate a drag of an already-processed replicate behind an explicit
+        acknowledgement.
+
+        Deliberately NOT a hard freeze. Freezing would force a delete-and-redraw
+        for what is often a small correction, and redrawing loses the label, the
+        colour and the standardization settings along with the geometry -- so the
+        safe-looking option would cost the user more state than the dangerous one.
+
+        ``to_origin`` is stated in the text because the box on screen is still
+        drawn where it STARTED: FrameView clears the drag ghost before emitting
+        box_moved, so by the time this dialog opens there is nothing showing the
+        destination. Approving a destructive move with no indication of where it
+        lands is exactly the blind confirmation this gate exists to avoid.
+        """
+        x0, y0 = rep["frac"][:2]
+        nx, ny = to_origin
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Move a processed replicate?")
+        box.setText(f"<b>{rep['label']}</b> has already been processed.")
+        box.setInformativeText(
+            "Moving it changes the region every existing measurement was "
+            "computed over. Those results describe the old rectangle and "
+            "cannot be re-aimed at the new one — they are discarded, not "
+            "converted.<br><br>"
+            f"Top-left would move from <b>{x0:.1%}, {y0:.1%}</b> to "
+            f"<b>{nx:.1%}, {ny:.1%}</b> of the frame."
+            "<br><br>The box keeps its name, colour and settings.")
+        go = box.addButton(_MOVE_ANYWAY, QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("Leave it where it is",
+                             QMessageBox.ButtonRole.RejectRole)
+        # Default AND escape route both land on the harmless option, so a
+        # reflexive Enter or Esc on a dialog the user did not expect cannot
+        # destroy anything.
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        return box.clickedButton() is go
+
+    def mark_replicates_processed(self) -> None:
+        """Latch every current box as processed.
+
+        Called when the user leaves this tab, which is the only route to the
+        surfaces that consume the layout -- so it strictly precedes any pass and
+        a second trigger on the pass itself would be redundant. Boxes drawn after
+        this are fresh again until the next time the user leaves.
+        """
+        fresh = [r for r in self.replicates if not r.get("processed")]
+        if not fresh:
+            return
+        for r in fresh:
+            r["processed"] = True
+        self._sync_lock_badges()
+        self._autosave()
 
     def _redraw_boxes(self):
         # This 1:1, in-order mapping IS the contract behind the index carried by
@@ -417,11 +501,41 @@ class Tab2Replicates(QWidget):
 
     # -- list ----------------------------------------------------------------
 
+    @staticmethod
+    def _row_text(r: dict) -> str:
+        # The lock marks a box whose drag is gated. Shown on the row rather than
+        # only in the dialog, so the state is legible BEFORE the user commits to
+        # a gesture -- a warning that only appears once the drag is finished
+        # teaches nothing about which boxes are safe to nudge.
+        return f"  {r['label']}{'  🔒' if r.get('processed') else ''}"
+
+    @staticmethod
+    def _row_tip(r: dict) -> str:
+        if not r.get("processed"):
+            return ""
+        return ("Processed. Moving this box discards the measurements "
+                "computed over it.")
+
+    def _sync_lock_badges(self):
+        """Update the 🔒 markers in place.
+
+        Deliberately NOT _refresh_list: that clears the list, and the selection
+        with it -- and ``stamp_size`` is derived from the selection (T11), so a
+        rebuild here would silently empty the stamp on every move. Editing the
+        rows relies on the same 1:1 ordering _redraw_boxes documents.
+        """
+        for i, r in enumerate(self.replicates):
+            it = self.list.item(i)
+            if it is not None:
+                it.setText(self._row_text(r))
+                it.setToolTip(self._row_tip(r))
+
     def _refresh_list(self):
         self.list.blockSignals(True)
         self.list.clear()
         for r in self.replicates:
-            it = QListWidgetItem(f"  {r['label']}")
+            it = QListWidgetItem(self._row_text(r))
+            it.setToolTip(self._row_tip(r))
             it.setData(Qt.ItemDataRole.UserRole, r["id"])
             # A colour SWATCH icon plus default (theme) text -- not coloured text,
             # which was invisible for light box colours on the light list. The
@@ -673,8 +787,15 @@ class Tab2Replicates(QWidget):
             return
         with open(path) as f:
             data = json.load(f)
+        # `processed` is scoped to the clip it was measured on, so an IMPORTED
+        # layout arrives fresh however locked it was in its source video --
+        # otherwise a plate layout reused on a new clip would warn about
+        # measurements that clip never had, which is the same ghosting-across-
+        # videos failure _load_sidecar exists to prevent. (_load_sidecar itself
+        # keeps the flag: that IS this video's own layout.)
         self.replicates = [
-            {**r, "frac": tuple(r["frac"])} for r in data.get("replicates", [])]
+            {**r, "frac": tuple(r["frac"]), "processed": False}
+            for r in data.get("replicates", [])]
         self._next_id = max([r["id"] for r in self.replicates], default=0) + 1
         self._rebuild_rois()
         self._refresh_list()

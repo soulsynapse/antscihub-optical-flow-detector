@@ -511,5 +511,151 @@ class DeleteKeyTest(unittest.TestCase):
         self.assertEqual(len(tab.replicates), 2)
 
 
+class ProcessedBoxesAreGatedTest(unittest.TestCase):
+    """Moving a box that downstream work has already consumed must be an
+    acknowledged act, not a silent one.
+
+    The gate is a confirmation rather than a freeze on purpose (see
+    ``_confirm_move``), which puts the burden on the DECLINE path: a dialog the
+    user dismisses has to leave the model exactly as it was. That is the same
+    silent-write class Batch G already fired twice on, so it is tested from the
+    model side -- what ``self.replicates`` holds afterwards -- rather than by
+    trusting that no writer was reached.
+    """
+
+    def _tab(self, *, answer=None):
+        from unittest.mock import patch
+
+        from gui.state import AppState
+        from gui.tab2_replicates import Tab2Replicates
+        tab = Tab2Replicates(AppState())
+        tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)     # rep1
+        tab._on_box_drawn(0.50, 0.50, 0.70, 0.70)     # rep2
+        if answer is not None:
+            # Patched rather than driven: QMessageBox.exec spins a nested event
+            # loop and would hang the suite headless.
+            p = patch.object(type(tab), "_confirm_move",
+                             lambda self, rep, to_origin: answer)
+            p.start()
+            self.addCleanup(p.stop)
+        return tab
+
+    # -- the latch -----------------------------------------------------------
+    def test_a_fresh_box_moves_without_asking(self):
+        tab = self._tab(answer=False)      # would refuse if it were consulted
+        tab._on_box_moved(0, 0.50, 0.50, 0.70, 0.70)
+        self.assertEqual(tab.replicates[0]["frac"], (0.50, 0.50, 0.70, 0.70))
+
+    def test_leaving_the_tab_latches_every_box(self):
+        tab = self._tab()
+        self.assertFalse(any(r.get("processed") for r in tab.replicates))
+        tab.mark_replicates_processed()
+        self.assertTrue(all(r["processed"] for r in tab.replicates))
+
+    def test_a_box_drawn_after_the_latch_is_still_fresh(self):
+        # Per the decision: the flag is per replicate, not per tab. Drawing a
+        # box and immediately being unable to nudge it would be the worst case.
+        tab = self._tab()
+        tab.mark_replicates_processed()
+        tab._on_box_drawn(0.01, 0.01, 0.05, 0.05)
+        self.assertFalse(tab.replicates[-1].get("processed"))
+        self.assertTrue(tab.replicates[0]["processed"])
+
+    # -- the gate ------------------------------------------------------------
+    def test_declining_leaves_the_box_exactly_where_it_was(self):
+        tab = self._tab(answer=False)
+        tab.mark_replicates_processed()
+        before = tab.replicates[0]["frac"]
+        tab._on_box_moved(0, 0.80, 0.80, 0.95, 0.95)
+        self.assertEqual(tab.replicates[0]["frac"], before)
+        self.assertTrue(tab.replicates[0]["processed"],
+                        "a declined move must not clear the latch")
+
+    def test_declining_does_not_write_the_sidecar(self):
+        # The decline path's real hazard: a no-op that still persists and still
+        # invalidates downstream state, which is invisible from the geometry.
+        from unittest.mock import patch
+        tab = self._tab(answer=False)
+        tab.mark_replicates_processed()
+        with patch.object(tab, "_autosave") as save, \
+                patch.object(tab, "_rebuild_rois") as rebuild:
+            tab._on_box_moved(0, 0.80, 0.80, 0.95, 0.95)
+        save.assert_not_called()
+        rebuild.assert_not_called()
+
+    def test_accepting_moves_the_box_and_makes_it_fresh_again(self):
+        tab = self._tab(answer=True)
+        tab.mark_replicates_processed()
+        tab._on_box_moved(0, 0.80, 0.80, 0.95, 0.95)
+        self.assertEqual(tab.replicates[0]["frac"], (0.80, 0.80, 0.95, 0.95))
+        self.assertFalse(tab.replicates[0]["processed"],
+                         "the data it warned about is gone; do not warn twice")
+        self.assertTrue(tab.replicates[1]["processed"],
+                        "moving one box must not unlatch its neighbours")
+
+    def test_the_gate_is_per_box_not_per_tab(self):
+        tab = self._tab(answer=False)
+        tab.mark_replicates_processed()
+        tab._on_box_drawn(0.01, 0.01, 0.05, 0.05)     # fresh rep3
+        tab._on_box_moved(2, 0.20, 0.20, 0.24, 0.24)  # moves, unasked
+        self.assertEqual(tab.replicates[2]["frac"], (0.20, 0.20, 0.24, 0.24))
+        tab._on_box_moved(0, 0.80, 0.80, 0.95, 0.95)  # refused
+        self.assertNotEqual(tab.replicates[0]["frac"], (0.80, 0.80, 0.95, 0.95))
+
+    # -- persistence ---------------------------------------------------------
+    def test_the_latch_survives_a_sidecar_round_trip(self):
+        import json
+        import tempfile
+        from unittest.mock import patch
+        tab = self._tab()
+        tab.mark_replicates_processed()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "clip.rois.json")
+            with patch.object(tab.state, "video_sidecar", return_value=path):
+                tab._autosave()
+                with open(path) as f:
+                    self.assertTrue(
+                        all(r["processed"] for r in json.load(f)["replicates"]))
+                tab._load_sidecar()
+        self.assertTrue(all(r["processed"] for r in tab.replicates))
+
+    def test_a_legacy_sidecar_without_the_field_loads_as_fresh(self):
+        # Boxes drawn before this field existed have no claim either way, and
+        # locking them on sight would be a warning nobody could act on.
+        import json
+        import tempfile
+        from unittest.mock import patch
+        tab = self._tab()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "clip.rois.json")
+            with open(path, "w") as f:
+                json.dump({"replicates": [
+                    {"id": 1, "label": "rep1", "frac": [0.1, 0.1, 0.2, 0.2],
+                     "color": "#ff5a5a"}]}, f)
+            with patch.object(tab.state, "video_sidecar", return_value=path):
+                tab._load_sidecar()
+        self.assertFalse(tab.replicates[0].get("processed"))
+
+    def test_an_imported_layout_arrives_fresh(self):
+        # A plate layout reused on another clip has not been processed against
+        # THIS video, so carrying the flag would warn about measurements this
+        # clip never had -- the ghosting _load_sidecar exists to prevent.
+        import json
+        import tempfile
+        from unittest.mock import patch
+        tab = self._tab()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "layout.json")
+            with open(path, "w") as f:
+                json.dump({"replicates": [
+                    {"id": 1, "label": "rep1", "frac": [0.1, 0.1, 0.2, 0.2],
+                     "color": "#ff5a5a", "processed": True}]}, f)
+            with patch("gui.tab2_replicates.QFileDialog.getOpenFileName",
+                       return_value=(path, "")), \
+                    patch.object(tab.state, "video_sidecar", return_value=None):
+                tab._load()
+        self.assertFalse(tab.replicates[0]["processed"])
+
+
 if __name__ == "__main__":
     unittest.main()
