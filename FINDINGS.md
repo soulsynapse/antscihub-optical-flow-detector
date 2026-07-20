@@ -1474,3 +1474,93 @@ unreachable `else lo` branch intended. Everything else is asserted bit-identical
 against the original loop kept verbatim as an oracle, including that a
 single-frame burst in 1200 frames still survives decimation to 460 columns as
 the peak, which is the whole reason the envelope is a max and not a mean.
+
+---
+
+## 20. Extraction: the tensor was computing five components nobody read
+
+Measured on the reference footage (`GX010047c2_02_17_26.MP4`, 5312x2988, 11
+replicate tiles of ~349x321 at scale 1.0, block 64, grid 76x6, ROI decode),
+300-frame window = 10 s of footage, best of 3.
+
+| channel | before | after | speedup |
+|---|---|---|---|
+| `change` (**the detection default**) | 9.91 s | **2.83 s** | **3.50x** |
+| `tensor_speed` | 12.21 s | 9.39 s | 1.30x |
+| `appearance` | 18.80 s | 13.59 s | 1.38x |
+| `intensity` | 2.85 s | 3.08 s | ~1x (noise; it touches none of this) |
+
+The change-only pass went from **0.8x realtime to 3.5x realtime** — from slower
+than the footage to faster than it.
+
+### The win, and why it was invisible
+
+`_stream_channels` built all six tensor components and ran **six full-resolution
+Gaussian blurs** per tile per frame regardless of selection. `change` is `tt`
+alone: one squared temporal difference. Five of six products and five of six
+blurs were computed and discarded every frame — and `tt` is the one component
+needing no spatial gradient, so `np.gradient` was pure waste too.
+
+Section 11 measured the channel selection and reported 1.59x for `change`,
+correctly noting the blur is the largest span. What it did not spot is that the
+blur was *itself* mostly waste. The span table said `tensor_blur 32%` and that
+was read as "the blur is expensive", when it meant "the blur is being run six
+times for one answer". **A span table names the stage, not the necessity of the
+work inside it** — the same trap section 1 records for `block_reduce`.
+
+`tensor_products` now takes a component selection and returns unrequested planes
+as **`None`**, not zeros — a partial tensor reaching `flow_from_tensor` or
+`spatial_min_eigen` raises instead of silently solving on zeros. Same reasoning
+as the zero-length placeholder of section 11.
+
+Spans for `change` after: `preprocess` 33%, `tensor_blur` 23%, `block_reduce`
+12%, `tensor_products` 11%, `decode` 5%. Decode is fully hidden by prefetch and
+is **no longer the floor** — `intensity`, which does no tensor work at all, is
+now only ~10% faster than `change`.
+
+### Two smaller wins, and their exact numerical cost
+
+* **Ragged block-mean as slabs, not cells.** A 349x321 tile at block 64 has 25
+  regular cells and **11** ragged ones, so `_block_mean` ran 11 tiny `mean`
+  calls per tile per frame — 24 200 in a 200-frame pass, most of its cost.
+  Ceiling division guarantees at most one short row and one short column, so the
+  edge is three slabs (bottom strip, right strip, corner), not a loop. 1.7-3x.
+* **Fused z-score.** Two numpy traversals for mean/std plus four temporaries
+  became one `cv2.meanStdDev` and one fused `g*a + b`. 2.3-3x on `_normalize`.
+  The trailing `astype(np.float32)` in `Preprocessor.apply` was copying a full
+  plane per replicate per frame to change nothing; now `asarray`.
+
+**Attributed by reverting each file in isolation against real footage:**
+
+| change | end-to-end result |
+|---|---|
+| tensor component selection | **bit-identical** on every channel |
+| slab block-mean + fused z-score | max abs delta **1.5e-5** (one float32 ULP at 128) |
+
+The tensor selection — the 3.5x — costs *nothing* numerically; it only stops
+computing discarded values. The ULP-level drift comes only from reassociating
+two sums, and its direction is toward more accuracy, not less: `cv2.meanStdDev`
+accumulates in float64 where `ndarray.std()` accumulated in float32.
+
+One caveat worth carrying: on `tensor_speed` that 1.5e-5 input perturbation
+comes out as **3e-3 relative** on the channel. That is not a bug, it is the LK
+solve's conditioning — it divides by a spatial determinant that is near zero
+exactly where the aperture problem bites. Any future change to preprocessing
+should expect the same amplification on flow-derived channels, and it is a
+reason to re-check a tuned `tensor_speed` threshold after touching preprocess.
+
+### REJECTED: dropping the blur for `change`, with the measurement
+
+Tempting, and wrong. `change` is `blockmean(gauss(it^2, sigma=2))`, and the
+64x64 block mean looks like it should swamp a 6-px Gaussian — the blur is 23% of
+the remaining pass, so this is the obvious next cut.
+
+Measured over 47 124 block-samples of real footage: median relative difference
+1.2%, but **p95 34.9% and max 327%**, Spearman rank correlation 0.992.
+
+The a-priori argument fails because change energy is spatially **sparse** — a
+moving edge is a thin high-value ridge, not a smooth field — so the blur moves a
+large fraction of a block's total energy across its boundary. The tail is where
+detection happens, so a p95 of 35% is disqualifying however good the median and
+the correlation look. **Do not remove this blur**, and do not trust a
+correlation coefficient to license a change to a thresholded channel.
