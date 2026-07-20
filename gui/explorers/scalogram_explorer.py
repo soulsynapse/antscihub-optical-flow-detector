@@ -325,6 +325,16 @@ class ScalogramExplorer(QWidget):
         # Only a real [+] click belongs here (set_collapsed emits no signal).
         self._density_user_open: set[str] = set()
 
+        # Per-scope band memory, keyed by region index. A replicate switch used
+        # to wipe every band to None; that made a threshold un-comparable across
+        # replicates by construction -- you cannot check whether one value
+        # separates behaviour in rep 25 and rep 26 if looking at rep 26 discards
+        # it. Revisiting a scope restores exactly what was left there; a scope
+        # seen for the first time inherits the band you were just using (see
+        # _restore_bands for why the two kinds of band inherit differently).
+        self._value_band_cache: dict[tuple[int, str], tuple] = {}
+        self._count_band_cache: dict[int, tuple] = {}
+
         self.source = None
         self._owns_source = False
         if state is None and video_path and os.path.exists(video_path):
@@ -808,6 +818,17 @@ class ScalogramExplorer(QWidget):
         self.count_w_plot.band_changed.connect(self._recompute_detect)
         self.count_w_plot.band_committed.connect(self._recompute_detect)
         col.addWidget(self.count_w_plot)
+        # A band that carried over from another replicate can be correct and
+        # still land nowhere near this replicate's data, which reads as "the
+        # detector broke" rather than "your threshold is off-scale here". Same
+        # class of surprise _converted_count_band exists to prevent, so it gets
+        # the same treatment: say it out loud. Empty (and hidden) when nothing
+        # is wrong, so it never becomes furniture the eye learns to skip.
+        self.band_note = QLabel("")
+        self.band_note.setWordWrap(True)
+        self.band_note.setStyleSheet("color:#d0a050; font-size:11px;")
+        self.band_note.setVisible(False)
+        col.addWidget(self.band_note)
         self.clump_plot = PixelBarPlot("largest connected clump in band",
                                        unit="blocks", color=SWEEP_C)
         self.clump_plot.seek_requested.connect(self._seek)
@@ -935,6 +956,7 @@ class ScalogramExplorer(QWidget):
         its density heatmap; blank the channels whose cube isn't built (or was
         evicted) so the display never shows stale band power."""
         if self.active_region_index < 0:
+            self.band_note.setVisible(False)
             return
         i, j = self._band_indices()
         # The sum is O(F*T*B) per cube and is the expensive half of this
@@ -967,6 +989,12 @@ class ScalogramExplorer(QWidget):
                 continue
             cube = self._sg_cache.get((self.active_region_index, name))
             dp.set_matrix(cube[i:j].sum(axis=0) if cube is not None else empty)
+        # The off-range check needs a MATRIX, and cubes arrive asynchronously --
+        # at region-change time every matrix is still (0,0), so checking there
+        # silently never fires. This is the one funnel every matrix lands in
+        # (region switch, channel toggle, cube ready, plot expand, frequency
+        # band), so the warning tracks the data instead of racing it.
+        self._sync_band_note()
 
     # -- scalogram computation ----------------------------------------------
     def _rebuild_selected_views(self):
@@ -1414,23 +1442,100 @@ class ScalogramExplorer(QWidget):
         if self.isVisible():
             self._redraw_video()
 
+    def _stash_bands(self, index: int) -> None:
+        """Freeze the outgoing scope's bands so revisiting it restores them.
+
+        Only placed bands are stashed: an unset endpoint pair means "never
+        tuned here", and recording that would overwrite a real earlier tuning
+        with a blank on a scope the user merely passed through."""
+        for name, dp in self.density_plots.items():
+            if dp.band_lo is not None and dp.band_hi is not None:
+                self._value_band_cache[index, name] = (dp.band_lo, dp.band_hi)
+        cw = self.count_w_plot
+        if cw.band_lo is not None and cw.band_hi is not None:
+            self._count_band_cache[index] = (cw.band_lo, cw.band_hi)
+
+    def _restore_bands(self, old_index: int) -> None:
+        """Seed the incoming scope's bands. Cache first, carry-forward second.
+
+        The two kinds of band inherit differently because they are denominated
+        differently:
+
+        * A channel value band is an ABSOLUTE per-block quantity -- a
+          coherence of 0.3 is 0.3 in every replicate -- so it carries over
+          verbatim. (Log-energies drift with ROI size and illumination, but the
+          fix for that is normalising the channel, not silently discarding a
+          threshold the user placed.)
+        * The count band is a RAW BLOCK COUNT, and replicate tiles are not
+          uniform -- build_layout sizes each from its own frac box -- so it is
+          meaningless on the new scope until re-denominated by the block-count
+          ratio. That is the same conversion apply_view_state performs across a
+          rebuild; it belongs here for the same reason.
+
+        A cached band always wins over carry-forward: returning to a scope
+        should show what you left there, not what you were last touching
+        somewhere else."""
+        idx = self.active_region_index
+        for name, dp in self.density_plots.items():
+            cached = self._value_band_cache.get((idx, name))
+            if cached is not None:
+                dp.band_lo, dp.band_hi = cached
+            # else: leave the live band alone -- that IS the carry-forward.
+
+        cw = self.count_w_plot
+        cached = self._count_band_cache.get(idx)
+        if cached is not None:
+            cw.band_lo, cw.band_hi = cached
+        elif cw.band_lo is not None and cw.band_hi is not None:
+            old_blocks = self._region_block_count(old_index)
+            new_blocks = self._region_block_count(idx)
+            if old_blocks > 0 and new_blocks > 0:
+                cw.band_lo, cw.band_hi = rescale_count_band(
+                    (cw.band_lo, cw.band_hi), old_blocks, new_blocks)
+            else:
+                # No comparable denominator: an unconverted raw count would be
+                # wrong by an unknown factor and look authoritative. Drop back
+                # to unseeded so set_band_active re-opens it wide, which at
+                # least fails toward "detects everything" rather than toward a
+                # silent, arbitrary gate.
+                cw.band_lo = cw.band_hi = None
+        self.count_w_plot.set_band_active(True)
+
+    def _sync_band_note(self) -> None:
+        """Warn when the selected channel's band has no overlap with this
+        replicate's data -- a carried threshold that is off-scale here detects
+        nothing, and looks like a broken detector rather than a tuning miss."""
+        dp = self._selected_density()
+        self.band_note.setVisible(False)
+        if dp is None or dp.matrix.size == 0:
+            return
+        lo, hi = dp.band()
+        if not (np.isfinite(lo) or np.isfinite(hi)):
+            return
+        dlo = float(np.nanmin(dp.matrix))
+        dhi = float(np.nanmax(dp.matrix))
+        if not (np.isfinite(dlo) and np.isfinite(dhi)):
+            return
+        if lo > dhi or hi < dlo:
+            self.band_note.setText(
+                f"The {self.channel} band [{lo:.3g}, {hi:.3g}] carried over "
+                f"from the previous replicate lies outside this one's range "
+                f"[{dlo:.3g}, {dhi:.3g}] — it will select no blocks here. "
+                f"Re-drag it, or widen it, to tune against this replicate.")
+            self.band_note.setVisible(True)
+
     def _on_region_changed(self, _index):
+        old_index = self.active_region_index
+        self._stash_bands(old_index)
         data = self.region_combo.currentData()
         self.active_region_index = int(data) if data is not None else 0
-        # Each replicate lives on its own value scale, so a value band frozen
-        # from the previous replicate would sit off this one's plots. Re-seed
-        # every channel's value band (and the count gate, whose block count just
-        # changed) wide open; the selected plot re-seeds via _apply_selected_ui.
-        for dp in self.density_plots.values():
-            dp.band_lo = dp.band_hi = None
-        self.count_w_plot.band_lo = self.count_w_plot.band_hi = None
-        self.count_w_plot.set_band_active(True)
+        self._restore_bands(old_index)
         focus = None if self.active_region_index < 0 else \
             self._active_regions()[0]["frac"]
         self.video_view.set_focus_frac(focus)
         self._sync_video_boxes()
         self._sync_window_title()
-        self._rebuild_scalograms()
+        self._rebuild_scalograms()   # _refresh_densities syncs the off-range note
         self._redraw_video()
 
     def _on_channel_toggled(self, button, checked: bool):
@@ -1443,7 +1548,7 @@ class ScalogramExplorer(QWidget):
             return
         self._rebuild_selected_views()
         self._apply_selected_plot_ui()
-        self._refresh_densities()
+        self._refresh_densities()   # re-syncs the off-range note for this channel
         self._recompute_sweep()
         self._redraw_video()
         self._request_cube()      # build the newly-selected channel if needed
@@ -1459,6 +1564,7 @@ class ScalogramExplorer(QWidget):
             return
         self._sweep_debounce.stop()
         self._recompute_sweep()
+        self._sync_band_note()   # a re-drag is how the off-range warning clears
         self._redraw_video()
 
     def _on_sweep_window(self, v):

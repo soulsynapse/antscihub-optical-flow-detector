@@ -17,7 +17,7 @@ import json
 import os
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QIcon, QPixmap
+from PyQt6.QtGui import QColor, QIcon, QKeyEvent, QPixmap
 from PyQt6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                              QGroupBox, QHBoxLayout, QInputDialog, QLabel,
                              QListWidget, QListWidgetItem, QMessageBox,
@@ -63,7 +63,9 @@ class Tab2Replicates(QWidget):
         # refused deliberately, because T12 also introduces the zoom that makes
         # this tab NEED an un-zoom gesture, and a tab where the same button means
         # "go back" in one place and "destroy a replicate" in another is a
-        # misfire away from silent data loss. Delete stays on the button.
+        # misfire away from silent data loss. Deletion is the button and the
+        # Delete key (see keyPressEvent), neither of which can be hit by
+        # reaching for "go back".
         self.video.view.back_requested.connect(self.video.clear_focus)
         ll.addWidget(self.video, 1)
 
@@ -85,7 +87,8 @@ class Tab2Replicates(QWidget):
         self.hint = QLabel(
             "Drag out the first replicate box (e.g. one per tube), then CLICK "
             "empty space to place more of the same size. Click a box to select "
-            "and zoom to it, drag it to reposition, right-click to zoom out. "
+            "and zoom to it, drag it to reposition, press Delete to remove it, "
+            "right-click to zoom out. "
             "The stamp is always the SELECTED box's size.")
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color:#333; font-size:11px;")
@@ -579,6 +582,25 @@ class Tab2Replicates(QWidget):
         self._refresh_list()
         self._redraw_boxes()
         self._autosave()
+
+    def keyPressEvent(self, ev: QKeyEvent):
+        """Delete/Backspace removes the selected replicate.
+
+        Only reached when no text field holds focus: a QLineEdit or spin box
+        consumes Delete for its own editing, and Qt stops propagating there, so
+        deleting a digit in "source pixels / mm" can never destroy the box. The
+        list and the frame view both ignore the key, which is exactly where the
+        gesture is meant to work.
+
+        Backspace too, because "in a replicate" here usually means zoomed into
+        one with the frame view focused, and the Mac habit is Backspace.
+        """
+        if ev.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) \
+                and self._selected_rep() is not None:
+            self._delete()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
 
     def _clear(self):
         if not self.replicates:

@@ -8,6 +8,7 @@ being lost.
 from __future__ import annotations
 
 import os
+import time
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -242,6 +243,138 @@ class ViewStateRoundTripTest(unittest.TestCase):
                             "region_blocks": 0},
         })
         self.assertIsNone(note)
+
+
+class ReplicateSwitchBandsTest(unittest.TestCase):
+    """Switching replicates used to wipe every band to None, which made a
+    threshold un-comparable across replicates by construction: you cannot ask
+    whether one value separates behaviour in rep 25 and rep 26 if looking at
+    rep 26 discards it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _explorer(self):
+        ex = ScalogramExplorer.from_channel_data(
+            _uneven_channel_data(scale=1), video_path=None,
+            own_shortcuts=False, own_status=False)
+        self.addCleanup(self._destroy, ex)
+        return ex
+
+    def _destroy(self, ex):
+        ex.close()
+        ex.deleteLater()
+        self.app.processEvents()
+
+    def _select(self, ex, idx):
+        for i in range(ex.region_combo.count()):
+            if ex.region_combo.itemData(i) == idx:
+                ex.region_combo.setCurrentIndex(i)
+                return
+        self.fail(f"no combo entry for region {idx}")
+
+    def _await_matrix(self, ex, timeout=10.0):
+        """Cubes build on a worker; spin the loop until the selected channel's
+        matrix lands. A fixed pump count sits right on the edge of the build
+        and makes these tests flaky."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            dp = ex._selected_density()
+            if dp is not None and dp.matrix.size:
+                return dp
+        self.fail("cube never built within the timeout")
+
+    def test_value_band_carries_to_an_unvisited_replicate(self):
+        """A channel value band is an absolute per-block quantity -- 0.3 is 0.3
+        in every replicate -- so it must survive the switch verbatim."""
+        ex = self._explorer()
+        ch = ex.channel
+        self._select(ex, 0)
+        ex.density_plots[ch].band_lo = 0.25
+        ex.density_plots[ch].band_hi = 0.75
+
+        self._select(ex, 1)
+        self.assertEqual(ex.density_plots[ch].band(), (0.25, 0.75))
+
+    def test_count_band_is_redenominated_by_the_block_count_ratio(self):
+        """The count band is a RAW BLOCK COUNT and replicate tiles are not
+        uniform, so carrying it verbatim would gate on a different fraction of
+        the replicate than the user tuned."""
+        ex = self._explorer()
+        self._select(ex, 0)
+        self.assertEqual(ex._region_block_count(0), 64)   # 8x8
+        self.assertEqual(ex._region_block_count(1), 4)    # 2x2
+        ex.count_w_plot.band_lo, ex.count_w_plot.band_hi = 8.0, 40.0
+
+        self._select(ex, 1)
+        # 64 -> 4 blocks is a factor of 1/16.
+        self.assertEqual(ex.count_w_plot.band(), (0.5, 2.5))
+
+    def test_revisiting_a_replicate_restores_its_own_bands(self):
+        """Cache beats carry-forward: returning to a scope shows what you left
+        there, not what you were last touching somewhere else."""
+        ex = self._explorer()
+        ch = ex.channel
+        self._select(ex, 0)
+        ex.density_plots[ch].band_lo, ex.density_plots[ch].band_hi = 0.25, 0.75
+        ex.count_w_plot.band_lo, ex.count_w_plot.band_hi = 8.0, 40.0
+
+        self._select(ex, 1)
+        ex.density_plots[ch].band_lo, ex.density_plots[ch].band_hi = 0.4, 0.9
+
+        self._select(ex, 0)
+        self.assertEqual(ex.density_plots[ch].band(), (0.25, 0.75))
+        self.assertEqual(ex.count_w_plot.band(), (8.0, 40.0))
+
+        self._select(ex, 1)
+        self.assertEqual(ex.density_plots[ch].band(), (0.4, 0.9))
+
+    def test_unselected_channels_keep_their_bands_across_a_switch(self):
+        ex = self._explorer()
+        self._select(ex, 0)
+        other = next(n for n in ex.density_plots if n != ex.channel)
+        ex.density_plots[other].band_lo = 1.5
+        ex.density_plots[other].band_hi = 3.5
+
+        self._select(ex, 1)
+        self.assertEqual(ex.density_plots[other].band(), (1.5, 3.5))
+
+    def test_an_off_range_carried_band_warns(self):
+        """A carried band can be correct and still land nowhere near this
+        replicate's data, which reads as a broken detector rather than a
+        tuning miss. Cubes arrive asynchronously, so the check has to run when
+        the matrix lands, not when the region changes."""
+        ex = self._explorer()
+        ch = ex.channel
+        self._select(ex, 0)
+        self._await_matrix(ex)
+        ex.density_plots[ch].band_lo, ex.density_plots[ch].band_hi = 50.0, 60.0
+
+        self._select(ex, 1)
+        dp = self._await_matrix(ex)
+        self.assertFalse(ex.band_note.isHidden())
+        self.assertIn("outside this one's range", ex.band_note.text())
+
+        # Re-dragging into range is how the warning clears.
+        lo = float(np.nanmin(dp.matrix))
+        hi = float(np.nanmax(dp.matrix))
+        dp.band_lo, dp.band_hi = lo, hi
+        ex._on_density_band_committed(ch)
+        self.assertTrue(ex.band_note.isHidden())
+
+    def test_an_in_range_carried_band_is_silent(self):
+        ex = self._explorer()
+        ch = ex.channel
+        self._select(ex, 0)
+        dp = self._await_matrix(ex)
+        dp.band_lo = float(np.nanmin(dp.matrix))
+        dp.band_hi = float(np.nanmax(dp.matrix))
+
+        self._select(ex, 1)
+        self._await_matrix(ex)
+        self.assertTrue(ex.band_note.isHidden())
 
 
 if __name__ == "__main__":

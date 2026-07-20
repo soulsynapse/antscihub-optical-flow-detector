@@ -22,7 +22,7 @@ os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
 
 import numpy as np
 from PyQt6.QtCore import QPoint, QPointF, Qt
-from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtGui import QKeyEvent, QMouseEvent
 from PyQt6.QtWidgets import QApplication
 
 from gui.video_panel import FrameView
@@ -450,6 +450,65 @@ class TabWiringTest(unittest.TestCase):
         tab._on_stamp_at(0.80, 0.20)
         self.assertIsNone(tab.video.view.focus_frac)
         self.assertEqual(len(tab.replicates), 4)
+
+
+class DeleteKeyTest(unittest.TestCase):
+    """Delete removes the selected replicate.
+
+    These send events rather than calling keyPressEvent, because the whole
+    question is PROPAGATION: the key is pressed with focus on the frame view or
+    the list, and it has to travel up to the tab -- but must stop dead in a text
+    field, where Delete means "erase a character" and eating a replicate instead
+    would be silent data loss.
+    """
+
+    def _tab(self):
+        from gui.state import AppState
+        from gui.tab2_replicates import Tab2Replicates
+        tab = Tab2Replicates(AppState())
+        tab.video.view.resize(400, 300)
+        tab.video.view.set_frame(np.zeros((300, 400, 3), np.uint8))
+        tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)     # rep1
+        tab._on_box_drawn(0.60, 0.60, 0.80, 0.80)     # rep2, selected
+        return tab
+
+    def _key(self, w, key=Qt.Key.Key_Delete):
+        _APP.sendEvent(w, QKeyEvent(QKeyEvent.Type.KeyPress, key,
+                                    Qt.KeyboardModifier.NoModifier))
+
+    def test_delete_on_the_frame_view_removes_the_selected_replicate(self):
+        tab = self._tab()
+        self._key(tab.video.view)
+        self.assertEqual([r["label"] for r in tab.replicates], ["rep1"])
+
+    def test_delete_on_the_list_removes_the_selected_replicate(self):
+        tab = self._tab()
+        self._key(tab.list)
+        self.assertEqual([r["label"] for r in tab.replicates], ["rep1"])
+
+    def test_backspace_works_too(self):
+        tab = self._tab()
+        self._key(tab.video.view, Qt.Key.Key_Backspace)
+        self.assertEqual([r["label"] for r in tab.replicates], ["rep1"])
+
+    def test_deleting_the_zoomed_replicate_releases_the_zoom(self):
+        tab = self._tab()
+        tab._zoom_to_selected()
+        self.assertIsNotNone(tab.video.view.focus_frac)
+        self._key(tab.video.view)
+        self.assertIsNone(tab.video.view.focus_frac)
+
+    def test_delete_inside_a_spin_box_edits_text_and_spares_the_replicate(self):
+        tab = self._tab()
+        self._key(tab.pixels_per_mm.lineEdit())
+        self.assertEqual(len(tab.replicates), 2,
+                         "editing a calibration field destroyed a replicate")
+
+    def test_delete_with_nothing_selected_is_a_no_op(self):
+        tab = self._tab()
+        tab.list.setCurrentItem(None)
+        self._key(tab.video.view)
+        self.assertEqual(len(tab.replicates), 2)
 
 
 if __name__ == "__main__":

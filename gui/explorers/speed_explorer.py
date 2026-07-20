@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import csv
 import os
+import warnings
 
 import cv2
 import numpy as np
@@ -679,6 +680,14 @@ class DensityPlot(MiniPlot):
         self._img: QImage | None = None
         self._img_key: tuple | None = None
         self._ver = 0
+        # Memoised _data_range. The min/max is a property of the MATRIX, but it
+        # was being recomputed from paintEvent, _line_ys and _apply_drag -- i.e.
+        # several full T x B scans per mouse-move, and one per plot per frame
+        # during playback, all returning the same number. At 1800 frames x 8000
+        # blocks that measured 22.5 ms of a 22.8 ms repaint: effectively the
+        # entire per-frame cost of this widget, spent re-deriving a constant.
+        # Invalidated in set_matrix, which is the only writer.
+        self._range: tuple[float, float] | None = None
         # Value-axis-only log1p toggle: spreads out the low-speed bulk that a
         # linear axis crushes against the bottom under a handful of fast-block
         # outliers. Never changes what's stored in the matrix or the band --
@@ -723,20 +732,40 @@ class DensityPlot(MiniPlot):
         else:
             self.y = np.zeros(0, np.float32)
         self._img = None
+        self._range = None
         self._ver += 1
         self._refresh_auto_collapse()
         self._repaint_unless_collapsed()
 
     def _data_range(self) -> tuple[float, float]:
+        if self._range is not None:
+            return self._range
         m = self.matrix
-        finite = m[np.isfinite(m)]
-        if finite.size == 0:
-            return 0.0, 1.0
-        lo = float(finite.min())
-        hi = float(finite.max())
+        # nanmin/nanmax scan in place. The old m[np.isfinite(m)] allocated a
+        # full-size boolean mask AND a full copy of the values -- ~100 MB of
+        # churn per call on a long clip -- before reducing them to two floats.
+        # +/-inf is handled below rather than by pre-filtering, which keeps the
+        # single pass; NaN-only and all-inf both fall back to the 0..1 default.
+        if m.size:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN slice
+                lo = float(np.nanmin(m))
+                hi = float(np.nanmax(m))
+        else:
+            lo = hi = float("nan")
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            # An infinite endpoint means the fast path cannot answer: +/-inf is
+            # not a plottable bound, and the original contract is the range of
+            # the FINITE cells. Pay for the mask only in this rare case.
+            finite = m[np.isfinite(m)] if m.size else m
+            if finite.size == 0:
+                lo, hi = 0.0, 1.0
+            else:
+                lo, hi = float(finite.min()), float(finite.max())
         if hi <= lo:
             hi = lo + 1.0
-        return lo, hi
+        self._range = (lo, hi)
+        return self._range
 
     def _density_image(self, w: int, h: int, lo: float, hi: float):
         if w <= 0 or h <= 0 or self.matrix.size == 0:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import unittest
 
 import numpy as np
@@ -411,6 +412,95 @@ class SpeedExplorerRegionTests(unittest.TestCase):
             self.assertEqual(restored_pixel, overlay_pixel)
         finally:
             explorer.close()
+
+
+class DensityPlotDataRangeTests(unittest.TestCase):
+    """_data_range is memoised because it was ~100% of this widget's repaint
+    cost: paintEvent, _line_ys and _apply_drag each call it, so it ran several
+    times per mouse-move and once per plot per frame during playback, every
+    time re-deriving a constant from a full T x B scan (22.5 ms of a 22.8 ms
+    repaint at 1800 frames x 8000 blocks). The memo must not change what it
+    ANSWERS, only how often it is asked."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    @staticmethod
+    def _reference(m):
+        """The pre-memo implementation, verbatim: the range of the FINITE
+        cells, falling back to 0..1 when there are none."""
+        finite = m[np.isfinite(m)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        lo, hi = float(finite.min()), float(finite.max())
+        if hi <= lo:
+            hi = lo + 1.0
+        return lo, hi
+
+    def test_matches_the_unmemoised_range_on_every_edge_case(self):
+        cases = {
+            "plain": np.array([[1.0, 5.0], [2.0, 3.0]], np.float32),
+            "with NaN": np.array([[1.0, np.nan], [2.0, 3.0]], np.float32),
+            # +/-inf must NOT become the axis bound: the contract is the finite
+            # range, and the fast nanmin/nanmax path cannot express that.
+            "with +inf": np.array([[1.0, np.inf], [2.0, 3.0]], np.float32),
+            "with -inf": np.array([[-np.inf, 5.0], [2.0, 3.0]], np.float32),
+            "inf both": np.array([[-np.inf, np.inf], [2.0, 3.0]], np.float32),
+            "all NaN": np.full((2, 2), np.nan, np.float32),
+            "all inf": np.full((2, 2), np.inf, np.float32),
+            "constant": np.full((2, 2), 4.0, np.float32),
+            "empty": np.zeros((0, 0), np.float32),
+        }
+        for name, m in cases.items():
+            with self.subTest(name):
+                pl = DensityPlot("x")
+                pl.set_matrix(m)
+                self.assertEqual(pl._data_range(), self._reference(m))
+
+    def test_repeated_calls_are_stable(self):
+        pl = DensityPlot("x")
+        pl.set_matrix(np.array([[1.0, 5.0], [2.0, 3.0]], np.float32))
+        first = pl._data_range()
+        for _ in range(5):
+            self.assertEqual(pl._data_range(), first)
+
+    def test_a_new_matrix_invalidates_the_memo(self):
+        """The whole hazard of caching a derived value: a stale range would
+        rescale every band handle against data that is no longer there."""
+        pl = DensityPlot("x")
+        pl.set_matrix(np.array([[1.0, 5.0]], np.float32))
+        self.assertEqual(pl._data_range(), (1.0, 5.0))
+        pl.set_matrix(np.array([[10.0, 90.0]], np.float32))
+        self.assertEqual(pl._data_range(), (10.0, 90.0))
+        pl.set_matrix(np.zeros((0, 0), np.float32))
+        self.assertEqual(pl._data_range(), (0.0, 1.0))
+
+    def test_repaint_does_not_scale_with_block_count(self):
+        """The point of the memo. The heatmap image is already cached, so once
+        the range is too, a repaint is O(pixels) -- a 20x block increase must
+        not show up as a 20x repaint."""
+        def per_frame_ms(B, T=400):
+            m = (np.random.default_rng(0).random((T, B), dtype=np.float32) + 0.1)
+            pl = DensityPlot("x")
+            pl.resize(460, MiniPlot.EXPANDED_H)
+            pl.set_expanded(True)
+            pl.set_collapsed(False)
+            pl.set_matrix(m)
+            pl.grab()                       # warm the image cache
+            t = time.perf_counter()
+            for i in range(20):
+                pl.cursor = i % T
+                pl.grab()                   # forces a real synchronous paint
+            return (time.perf_counter() - t) / 20 * 1000
+
+        small = per_frame_ms(200)
+        large = per_frame_ms(4000)          # 20x the blocks
+        # Generous bound: this asserts the O(T*B) scan is gone, not a timing
+        # target. Before the memo this ratio tracked the block count directly.
+        self.assertLess(large, max(small * 5, 2.0),
+                        f"repaint scaled with block count: "
+                        f"{small:.2f} ms -> {large:.2f} ms")
 
 
 if __name__ == "__main__":
