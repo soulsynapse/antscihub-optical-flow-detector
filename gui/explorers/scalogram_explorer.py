@@ -34,6 +34,7 @@ See docs/expanded_cache_plan.md.
 from __future__ import annotations
 
 import os
+import time
 from collections import OrderedDict
 from functools import partial
 
@@ -121,7 +122,9 @@ class ScalogramPlot(MiniPlot):
         self.y = self.matrix.sum(axis=0) if self.matrix.size \
             else np.zeros(0, np.float32)               # cursor readout: total power
         self._img = None
-        self._ver += 1
+        # Writes self.y directly, so it invalidates the base class's memos the
+        # same way DensityPlot.set_matrix does.
+        self._bump_series_version()
         self._repaint_unless_collapsed()
 
     def band_hz(self) -> tuple[float, float]:
@@ -291,11 +294,28 @@ class ScalogramExplorer(QWidget):
         self._phase = "starting…"
         self.frame = int(state.current_frame) if state is not None else 0
         self.playing = False
+        # Achieved-vs-realtime playback rate, measured by comparing two clocks
+        # over the same interval: wall seconds elapsed, and seconds of FOOTAGE
+        # advanced (frames / fps). The window closes once a full wall second has
+        # passed, so the readout updates once a second and covers the whole
+        # per-frame cycle -- decode, channel overlay, in-band highlight, every
+        # expanded plot -- rather than any one stage.
+        #
+        # Frames are counted with a cumulative tick counter, not by differencing
+        # self.frame: playback loops back to 0 at the end of the window, and a
+        # frame-index difference would read that wrap as a large negative jump
+        # and report a nonsense rate on whichever second the loop falls in.
+        self._advance_ticks = 0
+        self._rate_wall0 = 0.0
+        self._rate_ticks0 = 0
         # Per-frame detection gate. Owned here rather than read back off a plot
         # so that removing or collapsing a readout cannot change the detection.
         self.detect: np.ndarray = np.zeros(0, np.float32)
         self._overlay_peek_hidden = False
         self._render_frac = (0.0, 0.0, 1.0, 1.0)
+        # Constant green layers for the in-band highlight, keyed by ROI shape.
+        # Bounded by the number of distinct replicate tile sizes on screen.
+        self._tint_cache: dict[tuple, np.ndarray] = {}
         self._ov_scale = EPS       # replaced by a real percentile in _rebuild
         # Detection-window D (frames): the binary gate reads the centered mean of
         # "# blocks in band" over D, so a 1-frame spike of N blocks dilutes to
@@ -324,6 +344,12 @@ class ScalogramExplorer(QWidget):
         # drag re-sum every cube -- exactly the per-refresh cost T14 removed.
         # Only a real [+] click belongs here (set_collapsed emits no signal).
         self._density_user_open: set[str] = set()
+        # The mirror set, for the SELECTED plot only. A selected heatmap opens by
+        # default, so "user intent" for it is the collapse, not the expand -- the
+        # two sets are not complements and cannot be folded into one. Tracked
+        # separately so a channel collapsed while selected stays collapsed when
+        # you come back to it, instead of springing open on every reselect.
+        self._density_user_collapsed: set[str] = set()
 
         # Per-scope band memory, keyed by region index. A replicate switch used
         # to wipe every band to None; that made a threshold un-comparable across
@@ -665,6 +691,19 @@ class ScalogramExplorer(QWidget):
         self.time_lbl = QLabel("0.00 s")
         self.time_lbl.setMinimumWidth(120)
         trow.addWidget(self.time_lbl)
+        self.rate_lbl = QLabel("")
+        self.rate_lbl.setMinimumWidth(112)
+        self.rate_lbl.setToolTip(
+            "Achieved playback rate against realtime, measured over the last "
+            "~1 s of frames: 1.00x means the panel is keeping up with the "
+            "clip's own frame rate.\n\n"
+            "It CANNOT read above ~1.00x — playback is driven by a timer at "
+            "the clip's fps, so this measures whether the per-frame work "
+            "(decode, channel overlay, in-band highlight, every expanded plot) "
+            "fits in one frame's budget, not how fast it could go unthrottled.")
+        self.rate_lbl.setStyleSheet(
+            "font-family:Consolas; font-size:11px; color:#777;")
+        trow.addWidget(self.rate_lbl)
         left.addLayout(trow)
 
         rrow = QHBoxLayout()
@@ -892,11 +931,16 @@ class ScalogramExplorer(QWidget):
         """Expand + activate the value band on the selected channel's density;
         deactivate the rest (their matrices stay visible).
 
-        The selected plot is also made PERMANENT -- uncollapsed, and stripped
-        of its [+] -- because it carries the value band that defines the
-        detection, and _refresh_densities already exempts it from the
-        collapsed-skip for exactly that reason: it is the detector's input, not
-        a picture. Hiding it hid the control, not the cost.
+        The selected plot OPENS uncollapsed, because it carries the value band
+        that defines the detection -- but it keeps its [+]. Batch N made it
+        permanent (no toggle at all) on the grounds that a toggle hiding a live
+        control makes the panel look broken; defaulting it open already carries
+        that, and removing the toggle outright also removed the only way to ask
+        "is this plot what is costing me 3x during playback?". The A/B is worth
+        more than the last increment of protection, and it is safe to offer
+        precisely because _refresh_densities exempts the selected channel by
+        NAME, not by collapse state: collapsing it stops the drawing and cannot
+        stop the detector. Hiding it hides the control, never the computation.
 
         The selected plot is exempt from T13's auto-collapse-empty as well, and
         that is not the same call as the [+]. Auto-collapse fires exactly when
@@ -917,20 +961,28 @@ class ScalogramExplorer(QWidget):
             sel = (name == self.channel)
             dp.set_band_active(sel)
             dp.set_expanded(sel)
-            dp.set_collapsible(not sel)
+            dp.set_collapsible(True)
             dp.set_auto_collapse_empty(not sel)
-            dp.set_collapsed(False if sel
+            dp.set_collapsed(name in self._density_user_collapsed if sel
                              else name not in self._density_user_open)
 
     def _on_density_toggled(self, name: str, expanded: bool) -> None:
         """Record a real [+]/[-] click so deselection can restore it. Only the
         user's own intent lands here; the forced open/close in
         _apply_selected_plot_ui goes through set_collapsed, which emits
-        nothing."""
+        nothing.
+
+        Both sets are written on every click regardless of which plot is
+        selected, so the record stays correct across a selection that moves
+        afterwards -- a plot collapsed while selected must still read as
+        collapsed if it is reselected later, and as closed (its default) if it
+        is merely deselected."""
         if expanded:
             self._density_user_open.add(name)
+            self._density_user_collapsed.discard(name)
         else:
             self._density_user_open.discard(name)
+            self._density_user_collapsed.add(name)
 
     def _on_plot_expanded(self, expanded: bool):
         """A plot the user just opened may have been skipped while collapsed.
@@ -1334,6 +1386,22 @@ class ScalogramExplorer(QWidget):
                              interpolation=cv2.INTER_AREA)
         return np.ascontiguousarray(bgr)
 
+    def _tint(self, shape) -> np.ndarray:
+        """The flat green layer the in-band highlight blends toward.
+
+        It is a constant, but it was being re-allocated per region per frame by
+        ``np.zeros_like(roi)`` -- a full display-resolution uint8 image built
+        and thrown away on every redraw. Cached by shape (one entry per
+        replicate tile size) and never written to after construction, so the
+        callers below may treat it as read-only.
+        """
+        tint = self._tint_cache.get(shape)
+        if tint is None:
+            tint = np.zeros(shape, np.uint8)
+            tint[..., 1] = 255
+            self._tint_cache[shape] = tint
+        return tint
+
     def _display_bbox(self, region, width, height):
         """Where a replicate's full-frame frac lands in the rendered view."""
         x0, y0, x1, y1 = region["frac"]
@@ -1394,10 +1462,15 @@ class ScalogramExplorer(QWidget):
                     mm = cv2.resize(grid, (dx1 - dx0, dy1 - dy0),
                                     interpolation=cv2.INTER_NEAREST)
                     roi = out[dy0:dy1, dx0:dx1]
-                    tint = np.zeros_like(roi)
-                    tint[..., 1] = 255
-                    blended = cv2.addWeighted(roi, 0.5, tint, 0.5, 0)
-                    np.copyto(roi, blended, where=(mm > 0)[:, :, None])
+                    blended = cv2.addWeighted(roi, 0.5, self._tint(roi.shape),
+                                              0.5, 0)
+                    # cv2.copyTo, not np.copyto(where=...). The numpy form was
+                    # 3/4 of this whole branch: `where` takes a full-size
+                    # boolean it has to broadcast to 3 channels, and it walks
+                    # the ROI elementwise. The OpenCV masked copy takes the
+                    # single-channel mask directly. Pixel-identical -- verified
+                    # by test_highlight_overlay_is_unchanged_by_the_fast_path.
+                    cv2.copyTo(blended, mm, roi)
                     contours, _ = cv2.findContours(mm, cv2.RETR_EXTERNAL,
                                                    cv2.CHAIN_APPROX_SIMPLE)
                     cv2.drawContours(roi, contours, -1, (60, 255, 60), 1)
@@ -1414,7 +1487,32 @@ class ScalogramExplorer(QWidget):
             self._update_frame(int(v))
 
     def _advance(self):
+        self._advance_ticks += 1
         self._update_frame(0 if self.frame + 1 >= self.T else self.frame + 1)
+        # After the frame's work, not before: the tick that closes the window
+        # must have its own redraw counted, or the reported rate is always one
+        # frame optimistic.
+        self._sync_rate_label()
+
+    def _sync_rate_label(self):
+        """Close the measurement window once a full wall second has passed, and
+        report footage-seconds advanced per wall-second."""
+        elapsed = time.monotonic() - self._rate_wall0
+        if elapsed < 1.0:
+            return
+        footage = (self._advance_ticks - self._rate_ticks0) / max(self.fps, EPS)
+        ratio = footage / elapsed
+        self._start_rate_window()
+        # Green only when it is genuinely keeping up. The 0.95 floor is slack
+        # for timer jitter, not a "close enough" -- below it, frames really are
+        # being missed.
+        colour = ("#6ee678" if ratio >= 0.95
+                  else "#e0a94a" if ratio >= 0.6 else "#e06a5a")
+        self._set_rate_text(f"{ratio:.2f}x realtime", colour)
+
+    def _start_rate_window(self):
+        self._rate_wall0 = time.monotonic()
+        self._rate_ticks0 = self._advance_ticks
 
     def _update_frame(self, frame):
         """Single entry point for a frame change. When embedded, route through
@@ -1618,9 +1716,23 @@ class ScalogramExplorer(QWidget):
         self.playing = not self.playing
         self.play_btn.setText("Pause" if self.playing else "Play")
         if self.playing:
+            # Restart the window on resume: a window left open across a pause
+            # would charge the paused wall time against zero frames advanced
+            # and report a rate near 0 for the first second back.
+            self._start_rate_window()
+            self._set_rate_text("measuring…", "#777")
             self._timer.start(int(1000 / max(self.fps, 1)))
         else:
             self._timer.stop()
+            # The last reading stands, greyed: it describes playback that
+            # really happened, and blanking it would erase the number right as
+            # the user pauses to read it.
+            self._set_rate_text(self.rate_lbl.text(), "#777")
+
+    def _set_rate_text(self, text: str, colour: str) -> None:
+        self.rate_lbl.setStyleSheet(
+            f"font-family:Consolas; font-size:11px; color:{colour};")
+        self.rate_lbl.setText(text)
 
     def toggle_playback(self):
         self._toggle_play()

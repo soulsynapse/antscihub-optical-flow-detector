@@ -247,6 +247,19 @@ class MiniPlot(QWidget):
         self.color = color
         self.y: np.ndarray = np.zeros(0, np.float32)
         self.cursor = 0
+        # Series version + memoised derivations of it. Everything paintEvent
+        # draws except the cursor is a function of (series, widget size), but it
+        # was all being rebuilt per paint -- i.e. per cursor move, so once per
+        # frame during playback. The envelope in particular is a Python loop
+        # calling np.nanmax once per pixel column: 1.7 ms/paint at T=1200,
+        # against 0.11 ms for the DensityPlot beside it, spent re-deriving a
+        # constant. Same shape as the DensityPlot._data_range memo below it.
+        # Bumped by set_series (and by DensityPlot.set_matrix, which writes y
+        # directly); the caches key on it, so staleness is not representable.
+        self._ver = 0
+        self._range_memo: tuple[float, float] | None = None
+        self._env_memo: tuple[tuple, np.ndarray] | None = None
+        self._poly_memo: tuple[tuple, "QPolygonF"] | None = None
         # T15: frames the detector calls positive, painted as green spans behind
         # the series. A picture of a quantity computed elsewhere -- this widget
         # never derives it, so a collapsed plot cannot disarm the detector.
@@ -272,6 +285,7 @@ class MiniPlot(QWidget):
 
     def set_series(self, y: np.ndarray) -> None:
         self.y = np.asarray(y, np.float32)
+        self._bump_series_version()
         # A mask belongs to the series it was computed from, so a new series
         # invalidates it. Batch D's rule again: EMPTY rather than stale. A mask
         # held across a replicate switch would shade the new clip with the
@@ -416,17 +430,50 @@ class MiniPlot(QWidget):
             self.band_lo, self.band_hi = float("-inf"), float("inf")
         self.update()
 
+    def _bump_series_version(self) -> None:
+        """Invalidate every memo derived from the series. The single writer for
+        all of them, so a new derivation cannot forget to be invalidated."""
+        self._ver += 1
+        self._range_memo = None
+        self._env_memo = None
+        self._poly_memo = None
+
     def _data_range(self) -> tuple[float, float]:
+        if self._range_memo is not None:
+            return self._range_memo
         n = self.y.size
         if n == 0:
-            return 0.0, 1.0
+            return 0.0, 1.0                  # not memoised: nothing to reuse
         lo = float(np.nanmin(self.y))
         hi = float(np.nanmax(self.y))
         if not np.isfinite(lo) or not np.isfinite(hi):
             lo, hi = 0.0, 1.0
         if hi <= lo:
             hi = lo + 1.0
-        return lo, hi
+        self._range_memo = (lo, hi)
+        return self._range_memo
+
+    def _envelope(self, cols: int, lo: float) -> np.ndarray:
+        """Per-pixel-column MAX of the series (never the mean -- see the class
+        docstring: a 3-frame burst must not be smeared into the baseline).
+
+        ``np.fmax.reduceat`` replaces a Python loop over the columns. reduceat
+        on a run of equal indices returns that single element, which is exactly
+        the old loop's ``max(edges[i] + 1, edges[i + 1])`` clamp for a column
+        narrower than one sample. fmax, not maximum: fmax ignores NaN, matching
+        the nanmax the loop called.
+        """
+        key = (cols, self._ver)
+        if self._env_memo is not None and self._env_memo[0] == key:
+            return self._env_memo[1]
+        n = self.y.size
+        edges = np.linspace(0, n, cols + 1).astype(int)
+        starts = np.minimum(edges[:-1], n - 1)
+        env = np.fmax.reduceat(self.y, starts).astype(np.float32)
+        # An all-NaN column has no max; the loop fell back to the axis minimum.
+        env = np.where(np.isnan(env), lo, env)
+        self._env_memo = (key, env)
+        return env
 
     def band(self) -> tuple[float, float]:
         # An unset endpoint is unbounded on ITS OWN side only -- never force the
@@ -484,12 +531,7 @@ class MiniPlot(QWidget):
 
         w = int(r.width())
         cols = max(1, min(n, w))
-        edges = np.linspace(0, n, cols + 1).astype(int)
-        env = np.empty(cols, np.float32)
-        for i in range(cols):
-            a, b = edges[i], max(edges[i] + 1, edges[i + 1])
-            seg = self.y[a:b]
-            env[i] = np.nanmax(seg) if seg.size else lo
+        env = self._envelope(cols, lo)
 
         def y_of(val: float) -> float:
             return self._y_of(val, r, lo, hi)
@@ -500,10 +542,21 @@ class MiniPlot(QWidget):
             p.setPen(QPen(QColor(70, 70, 70), 1, Qt.PenStyle.DashLine))
             p.drawLine(int(r.left()), int(yb), int(r.right()), int(yb))
 
-        poly = QPolygonF()
-        for i in range(cols):
-            x = r.left() + (i + 0.5) / cols * r.width()
-            poly.append(QPointF(x, y_of(env[i])))
+        # The polyline is cached too, not just the envelope behind it: building
+        # it is another per-column Python loop, and between two frames of
+        # playback only the cursor moves, so the whole curve is identical.
+        # Keyed on the plot rect as well as the series, since the geometry is
+        # what maps values to pixels.
+        pkey = (cols, self._ver, r.left(), r.top(), r.width(), r.height(),
+                lo, hi)
+        if self._poly_memo is not None and self._poly_memo[0] == pkey:
+            poly = self._poly_memo[1]
+        else:
+            xs = r.left() + (np.arange(cols) + 0.5) / cols * r.width()
+            ys = self._y_of(env.astype(np.float64), r, lo, hi)
+            poly = QPolygonF([QPointF(float(x), float(y))
+                              for x, y in zip(xs, ys)])
+            self._poly_memo = (pkey, poly)
         p.setPen(QPen(self.color, 1))
         p.drawPolyline(poly)
 
@@ -733,7 +786,9 @@ class DensityPlot(MiniPlot):
             self.y = np.zeros(0, np.float32)
         self._img = None
         self._range = None
-        self._ver += 1
+        # set_matrix writes self.y directly rather than going through
+        # set_series, so it has to invalidate the base class's memos itself.
+        self._bump_series_version()
         self._refresh_auto_collapse()
         self._repaint_unless_collapsed()
 
@@ -859,17 +914,30 @@ class PixelBarPlot(MiniPlot):
     BASE_H = MiniPlot.BASE_H * 2
 
     def _data_range(self) -> tuple[float, float]:
+        if self._range_memo is not None:
+            return self._range_memo
         n = self.y.size
         if n == 0:
             return 0.0, 1.0
         hi = float(np.nanmax(self.y))
         if not np.isfinite(hi) or hi <= 0:
             hi = 1.0
-        return 0.0, hi
+        self._range_memo = (0.0, hi)
+        return self._range_memo
+
+    def _release_render_cache(self) -> None:
+        self._bar_memo = None
 
     def _bar_image(self, w: int, h: int, hi: float):
         if w <= 0 or h <= 0 or self.y.size == 0:
             return None
+        # Cached like DensityPlot's heatmap: the bars are a function of the
+        # series and the widget size, but this was rasterising the whole image
+        # -- including a per-column Python loop -- on every cursor move.
+        key = (w, h, float(hi), self._ver)
+        memo = getattr(self, "_bar_memo", None)
+        if memo is not None and memo[0] == key:
+            return memo[1]
         T = self.y.size
         col = np.clip((np.arange(T) * w) // max(1, T), 0, w - 1)
         heights = np.zeros(w, np.float32)
@@ -886,6 +954,7 @@ class PixelBarPlot(MiniPlot):
                 rgb[h - bp:h, x] = bar_color
         rgb = np.ascontiguousarray(rgb)
         img = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+        self._bar_memo = (key, img)
         return img
 
     def paintEvent(self, _):

@@ -1345,3 +1345,132 @@ is the *opposite* convention to `_source_box`, which matches by `replicate_id`
 precisely because `build_layout` re-sorts. Filtering that comprehension -- to
 hide boxes outside the zoom, the obvious future optimization -- would silently
 move the wrong replicate. The contract is commented at the point it is created.
+
+---
+
+## 20. The band-power playback lag is the video OVERLAY, not the plots
+
+**The symptom.** On the live surface, playback runs ~realtime until the change
+energy cube lands and ~1/3 realtime after. The obvious reading -- "the band
+power channels are expensive" -- is wrong twice over: the cube is already built
+by then (it is what "loaded in" means), and the plots are not what got slower.
+
+**The plots were ruled out by measurement, not by argument.** §17 had already
+priced the panel, and the `DensityPlot._data_range` memo took out the last of
+it. The decisive test was making the SELECTED channel's heatmap collapsible
+again (Batch N had stripped its `[+]`) purely so the two states could be
+compared live: collapsed, playback was still slow. That is worth keeping as a
+standing capability -- a permanent plot is a plot you cannot A/B.
+
+**What actually turns on.** The "highlight blocks in band" branch of
+`_redraw_video` is gated on `m.size and ... m.shape[1] == total`, i.e. on the
+selected channel's density matrix being populated. Before the cube it is
+skipped entirely; from `_on_cube_ready` onward it runs on every frame. It is
+the ONLY per-frame work whose on/off point is exactly the cube's arrival, which
+is what makes the symptom so sharply staged.
+
+Measured through the real `_redraw_video`, 1600x900 source, 40x50 blocks:
+
+| | ms/frame |
+|---|---|
+| pre-cube (branch skipped) | 4.6 |
+| post-cube, old code | 12.2 |
+| post-cube, new code | 6.8 |
+| post-cube, highlight unchecked | 4.7 |
+
+The branch itself: **7.7 ms -> 2.0 ms, 3.9x.**
+
+**The cost was `np.copyto(where=)`, and that is the counter-intuitive part.**
+The branch does five things and the expensive one is not the arithmetic. A
+component-level micro-benchmark put `np.copyto(roi, blended, where=...)` at
+0.06 ms and pointed at `addWeighted` and `findContours` instead -- it was
+**wrong**, because it passed `roi` as both source and destination and numpy
+short-circuited the copy. Only end-to-end candidate timings found it. `where`
+takes a full-size boolean that has to be broadcast to three channels and walked
+elementwise; `cv2.copyTo` takes the single-channel mask directly.
+
+> A micro-benchmark whose result is suspiciously good is measuring something
+> other than what you think. Time whole candidate implementations.
+
+`findContours` was the intuitive suspect and is a red herring: tracing at
+display resolution costs only 0.7 ms of the 6.4, and moving it to block
+resolution is not worth the coordinate-scaling code.
+
+**Rejected: restricting the work to the bbox of passing blocks.** It measured
+no better than the simple fix (1.9 vs 2.0 ms) because a scattered mask has a
+bbox covering most of the tile, and it adds a block->display coordinate
+conversion whose failure mode is a highlight on the wrong pixels.
+
+**Also removed:** the `np.zeros_like(roi)` tint, a full display-resolution
+uint8 image allocated per region per frame to hold a constant. Now cached by
+shape on the explorer.
+
+**The fix is pixel-identical and is tested that way.** A speed fix that alters
+the picture is worse than the lag, because the picture is what the value band
+is tuned against by eye. `tests/test_highlight_overlay.py` holds the old
+implementation verbatim as an oracle -- deliberately duplicated rather than
+shared, so it cannot drift with the code under test -- and checks equality
+across mask densities, the 0.5/0.5 rounding boundaries, and a NON-CONTIGUOUS
+sliced ROI view (which is what the call site actually passes, and the one case
+where `cv2.copyTo`'s in-place write could have differed). Confirmed to fail
+against a sabotaged tint rather than merely to pass against the fixed code.
+
+### The budget is 8.33 ms, not 33 ms, and that is why this was ever visible
+
+`output.mp4` is **120 fps**. Every per-frame cost on this panel is priced
+against an **8.33 ms** budget, of which a sequential decode already takes
+**2.70 ms** (1920x1080, and the `frame_at` fast path is working -- this is
+decode, not seek). That leaves ~5.6 ms for the overlay and every plot repaint
+combined.
+
+This is the single most useful number in this section, and not knowing it is
+what made the first diagnosis so slow. At 30 fps none of the costs below would
+be visible at all; at 120 fps a 2 ms regression is a quarter of the frame. Any
+future "is this fast enough" question on the live surface has to name the
+clip's fps before it means anything.
+
+**A rate meter now sits beside the timestamp** (`rate_lbl`), comparing footage-
+seconds advanced against wall-seconds elapsed over a window that closes on the
+first tick past one wall second. It reads ~1.00x when the panel keeps up and
+cannot read above that, since playback is timer-driven at the clip's fps -- it
+measures whether the per-frame work fits the budget, not unthrottled
+throughput. The window restarts on resume so a pause is not charged against
+zero frames advanced.
+
+### MiniPlot was the second half, and the collapse A/B could not have found it
+
+With the overlay fixed, playback measured a consistent **0.7x**. The remaining
+cost was `MiniPlot.paintEvent` rebuilding its decimated envelope on every
+paint -- a Python loop calling `np.nanmax` once per pixel column -- for a
+series that had not changed between frames. **1.70 ms/paint at T=1200, against
+0.11 ms for the DensityPlot beside it.**
+
+> The cheap-looking sparkline was 15x the cost of the heatmap it sat under.
+
+**Why the collapse A/B missed it.** The plot carrying this cost is
+`count_w_plot`, which is PERMANENT (no `[+]`, Batch N) and becomes populated at
+exactly the moment the cube lands -- the same trigger as the overlay. Only the
+selected density heatmap could be collapsed, so the experiment that correctly
+exonerated the heatmaps could not reach the one plot that mattered. A
+non-collapsible plot is a plot that cannot be ruled out.
+
+Memoised on a version counter with a single writer (`_bump_series_version`,
+called by `set_series` and by the two subclasses that write `self.y` directly),
+and the loop replaced by `np.fmax.reduceat`. The polyline is cached too -- it
+was a second per-column Python loop. `PixelBarPlot._bar_image` got the same
+treatment; it had no cache at all.
+
+| plot | before | after |
+|---|---|---|
+| MiniPlot (T=1200) | 1.70 ms | **0.20 ms** |
+| PixelBarPlot (T=1200) | 0.63 ms | **0.10 ms** |
+| DensityPlot (T=1200, B=2000) | 0.11 ms | 0.13 ms |
+
+**One deliberate divergence from the old loop**, pinned in
+`tests/test_miniplot_envelope.py`: an all-NaN column made `np.nanmax` emit NaN
+(plus a RuntimeWarning), which became a NaN QPointF and an undefined polyline
+vertex. It now falls back to the axis minimum -- what the loop's own
+unreachable `else lo` branch intended. Everything else is asserted bit-identical
+against the original loop kept verbatim as an oracle, including that a
+single-frame burst in 1200 frames still survives decimation to 460 columns as
+the peak, which is the whole reason the envelope is a max and not a mean.
