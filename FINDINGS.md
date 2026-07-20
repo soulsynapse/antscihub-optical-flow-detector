@@ -1709,3 +1709,72 @@ recorded because both are easy to reintroduce.
   first channel of a live frame and then raised — leaving that frame holding data
   from two points in the clip while `[start, frontier)` still claimed to be
   intact.
+
+---
+
+## 22. Batch P: the extraction loop as a generator
+
+**What changed.** `_stream_channels`'s loop body became
+`stream_channel_planes(video_path, plan)`, a generator yielding
+`(absolute_index, {channel: (ny, nx)})` per frame. `_stream_channels` is now a
+consumer that drains it into the same `(n, ny, nx)` arrays as before. The
+windowed API — `extract_channels`, `extract_channels_live`,
+`live_channel_source` — is untouched in signature and return shape, and
+`CHANNEL_VERSION` did not move, because no arithmetic changed.
+
+**The measurement, which was the point of taking it.** The plan flagged
+per-frame yield overhead as "negligible, but measure rather than assume."
+Measured on `GX010047c2`, 11 tiles, block 64, scale 1.0, `intensity`+`change`,
+400-frame window, back-to-back against the stashed pre-refactor file:
+
+| | best of 3 | fps |
+|---|---|---|
+| pre-refactor windowed | 5.028 s | 79.5 |
+| post-refactor windowed | 5.031 s | 79.5 |
+
+Unchanged. A separate interleaved run (6 reps each) put a bare drain that
+*discards* every frame 3.7% ahead of the windowed fill — and the windowed arm
+also pays the big-array write, so the generator's own yield-plus-allocate cost is
+below that. Per frame the allocation is `len(want)` arrays of `ny*nx` float32
+(~9 KB at this grid) against ~12 ms of tensor work.
+
+**Beware quoting absolute fps across sessions.** The same 300-frame window
+measured 79.5 fps in one session and 67 fps in another on the same machine, so
+run-to-run drift is ~15% and swamps anything this refactor could have cost. Only
+the back-to-back paired comparison above is load-bearing; the standalone numbers
+are not comparable to §14's or §16's unless taken in the same sitting.
+
+### The clamp had to stop being computed twice
+
+`ChannelPlan` (from `plan_channel_stream`, decode-free) holds the resolved
+window, geometry and per-channel gating. It exists because a streaming consumer
+must size a ring buffer *before* the pass starts, and the obvious way to do that
+— let the caller work out `n` itself — puts a second copy of the
+`start`/`n`-vs-`n_frames` clamp next to the pass filling the buffer. That is the
+T17/T11 shape again: two pieces of state answering one question, diverging
+exactly at the clip end where the window gets truncated.
+
+### Three things review caught, all in the new seam rather than the moved code
+
+- **The empty-channel guard was one layer too high.** `live_channel_source`
+  raises on an empty channel set; `plan_channel_stream` is the entry point a
+  streaming worker calls *directly*, so the new path routed around it. A pass
+  with no channels still decodes and preprocesses every frame and yields frames
+  with nothing in them — which `StreamBuffer` cannot even be constructed to
+  hold. The check now lives in the plan as well.
+- **A negative index does not raise in numpy, it writes the end of the array.**
+  The consumer's `out[k][i - plan.start] = plane` is safe by construction, and is
+  now checked anyway: the failure mode of that invariant breaking is a frame
+  landing silently at the wrong *time*, not a crash. `StreamBuffer.append`
+  already refuses a non-contiguous index for this reason, and the two consumers
+  of one generator should not disagree about how far to trust it.
+- **`ChannelPlan` is comparable but deliberately not hashable.** `tiles` holds
+  dicts, so the frozen dataclass's generated `__hash__` raised
+  `unhashable type: 'dict'` from inside a tuple — naming neither the class nor
+  the caller. `__hash__ = None` makes the error name `ChannelPlan`. Equality is
+  the operation a surface actually wants ("did the plan change? then restart").
+
+**`done` is counted before the yield, not after the resume.** Counting on resume
+undercounts by one whenever a consumer closes the generator instead of draining
+it — and the log line for a cancelled pass, which is exactly when that happens
+(a knob edit supersedes the running extraction), is where the lie would land.

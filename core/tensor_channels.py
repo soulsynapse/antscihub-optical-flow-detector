@@ -25,7 +25,7 @@ as approximated when any of them were configured.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -203,46 +203,74 @@ def _open_clips(clip_paths: list[str], tiles: list[dict], first: int,
     return clips, frames()
 
 
-def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
-                     start: int = 0, n: int | None = None,
-                     cached_uv: tuple[np.ndarray, np.ndarray] | None = None,
-                     cached_texture: np.ndarray | None = None,
-                     clip_paths: list[str] | None = None,
-                     want: frozenset | None = None,
-                     denoise: str | None = None, progress=None) -> dict:
-    """Stream a frame window [start, start+n) and return per-block channel arrays.
+@dataclass(frozen=True)
+class ChannelPlan:
+    """Everything about a pass that is fixed before the first frame is decoded.
 
-    Geometry comes from ``meta`` (the same shape a feature cache carries); the
-    video is streamed directly, so this needs no cache -- it is the seam that lets
-    the tensor/scalogram path run on a bare video.
+    Split out of the extraction loop so the two consumers agree by construction
+    rather than by both getting the clamping right: :func:`_stream_channels`
+    allocates its ``(n, ny, nx)`` arrays from this, and a streaming consumer
+    sizes its ring buffer from the same object. The clamp of ``start``/``n``
+    against the video length lives here and nowhere else -- a second copy of it
+    is how a buffer and the pass filling it end up disagreeing about which frame
+    is which.
 
-    ``cached_uv`` is the pipeline's block flow (u, v) in px/s, indexed by absolute
-    frame, used for the appearance residual; pass ``None`` to measure the residual
-    against the tensor's OWN per-pixel flow instead (px/frame, no cache needed).
-    ``cached_texture`` is read straight through when present, else computed.
-    ``denoise`` overrides the config's temporal-denoise mode (the live/windowed
-    path forces it off, since denoise is stateful from frame zero and cannot be
-    reproduced starting mid-clip).
+    ``channels_computed`` is the authoritative list of which keys hold
+    measurements; gate on it, not on key presence.
 
-    ``want`` restricts which channels are computed; ``None`` means all of them.
-    Every ``CHANNELS`` key is still returned -- this dict's shape is fixed, and
-    ``load_or_extract_channels``' sidecar depends on that -- but an unwanted
-    channel's array is a **zero-length** ``(0, ny, nx)`` placeholder. Length
-    zero, not NaN-filled and not zero-filled: a full-length array of either
-    still costs the memory the selection exists to save (~88 MB per channel per
-    hour of 30 fps footage at a 41x5 grid), and a zero-FILLED one is worse than
-    that, being indistinguishable from "measured, and nothing happened" -- the
-    same silent false negative the truncation trim below exists to prevent.
-    A zero-length array cannot be mistaken for data or silently broadcast
-    against a real one.
+    **Comparable, not hashable.** ``==`` works and is the useful operation -- a
+    streaming surface asks "did the plan change?" to decide whether to restart.
+    Hashing does not, because ``tiles`` holds dicts, and a frozen dataclass
+    generates a ``__hash__`` that would raise ``unhashable type: 'dict'`` from
+    inside the tuple -- an error naming neither this class nor the caller. So it
+    is disabled explicitly below, which at least names ``ChannelPlan`` in the
+    traceback. Making the tiles hashable instead was considered and dropped: a
+    plan is a description rather than an identity, and keying anything by one
+    would reintroduce exactly the second copy of window state this class exists
+    to collapse.
+    """
 
-    ``meta['channels_computed']`` is the authoritative list of which keys hold
-    measurements; gate on it, not on key presence. (``live_channel_source``
-    hands out a ``ChannelData`` that drops the placeholders entirely, so at THAT
-    layer -- and only there -- key presence is equivalent.)
+    __hash__ = None     # see the note above; keeps ``==`` and drops ``hash()``
 
-    Returns a dict of the ``CHANNELS`` arrays (length = clamped window n) plus
-    ``meta`` describing how they were built.
+    fps: float
+    block: int
+    ny: int
+    nx: int
+    scale: float
+    start: int              # absolute index of the first STORED frame
+    n: int                  # stored frames, already clamped to the video
+    want: frozenset
+    approximated: bool
+    # -- how the work is gated; internal to the extraction loop ---------------
+    tiles: tuple
+    pre_cfg: object
+    comps: frozenset
+    need_tensor: bool
+    need_flow: bool
+    need_texture: bool
+    need_appearance: bool
+
+    @property
+    def channels_computed(self) -> list:
+        return sorted(self.want)
+
+    @property
+    def stop(self) -> int:
+        """Absolute index one past the last stored frame."""
+        return self.start + self.n
+
+
+def plan_channel_stream(meta: dict, *, start: int = 0, n: int | None = None,
+                        want: frozenset | None = None,
+                        cached_uv: tuple[np.ndarray, np.ndarray] | None = None,
+                        cached_texture: np.ndarray | None = None,
+                        denoise: str | None = None) -> ChannelPlan:
+    """Resolve geometry, window and per-channel gating for a pass.
+
+    Cheap and decode-free, so a caller can build the plan, size a buffer from it
+    and only then start the (expensive) stream. ``cached_uv`` and
+    ``cached_texture`` are inspected for presence only -- they change what work
+    is needed, and are passed again to the stream itself, which reads them.
     """
     fps = float(meta["fps"])
     block = int(meta["block_size"])
@@ -266,10 +294,19 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                     denoise != base_cfg.denoise)
 
     want = frozenset(CHANNELS) if want is None else frozenset(want) & frozenset(CHANNELS)
+    if not want:
+        # ``live_channel_source`` already rejects this, but that guard is one
+        # layer up and this function is the entry point a streaming consumer
+        # calls directly -- so the check has to live here too or the new path
+        # routes around it. A pass with nothing to measure still decodes and
+        # preprocesses every frame, so it is always a caller bug rather than a
+        # cheap no-op: it costs a full pass and returns frames with no channels
+        # in them, which a ring buffer cannot even be constructed to hold.
+        raise ValueError(f"no channels requested; pick from {sorted(CHANNELS)}")
     # What the selection actually buys, resolved once. ``appearance`` needs the
     # flow solve only when no cached block flow was handed in to form the
     # residual against; with cached_uv it rides the supplied field.
-    need_tensor = bool(want & _NEEDS_TENSOR)
+    #
     # Read _NEEDS_FLOW rather than restating its members here, so adding a
     # flow-dependent channel to the table above is enough to make it work.
     # ``appearance`` is the one exception the table cannot express: it needs the
@@ -291,29 +328,70 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
         comps |= _COMPONENTS["texture"]
     if need_flow:
         comps |= _COMPONENTS["flow"]
-    # Recomputed from ``comps`` rather than from ``want``: the two disagree
-    # exactly in the appearance-with-cached-flow case above, and ``comps`` is the
-    # one that reflects the work.
-    need_tensor = bool(comps)
-    # Appearance is gated separately from the tensor for the same reason.
-    need_appearance = "appearance" in want
+    return ChannelPlan(
+        fps=fps, block=block, ny=ny, nx=nx, scale=scale, start=start, n=n,
+        want=want, approximated=approximated, tiles=tuple(tiles),
+        pre_cfg=pre_cfg, comps=frozenset(comps),
+        # Derived from ``comps`` rather than from ``want``: the two disagree
+        # exactly in the appearance-with-cached-flow case above, and ``comps`` is
+        # the one that reflects the work.
+        need_tensor=bool(comps),
+        need_flow=need_flow, need_texture=need_texture,
+        # Appearance is gated separately from the tensor for the same reason.
+        need_appearance="appearance" in want)
 
-    out = {k: np.zeros((n if k in want else 0, ny, nx), np.float32)
-           for k in CHANNELS}
+
+def stream_channel_planes(video_path: str, plan: ChannelPlan, *,
+                          sigma: float = 2.0,
+                          cached_uv: tuple[np.ndarray, np.ndarray] | None = None,
+                          cached_texture: np.ndarray | None = None,
+                          clip_paths: list[str] | None = None, progress=None):
+    """Yield ``(absolute_index, {channel: (ny, nx)})`` as each frame is measured.
+
+    This is the extraction loop itself; :func:`_stream_channels` is a consumer
+    that happens to fill one big array with it. The point of the generator form
+    is that the partial result already exists in memory during a pass and used to
+    be unreachable until the pass ended -- a live surface can now render frames
+    as they arrive instead of extracting a window and blocking on it.
+
+    **Absolute indices**, matching ``core.stream_buffer.StreamBuffer.append``,
+    which is the intended consumer and for which the ring position is private.
+    The first yielded index is ``plan.start``; indices are contiguous.
+
+    Every key in ``plan.want`` is present in every yielded dict, so a consumer
+    never has to branch on which channels a given frame happens to carry.
+    Channels that need a previous frame (everything but ``intensity`` and
+    read-through ``texture``) are zero on the first frame of a window starting at
+    frame zero -- there is no motion to measure across a boundary that has no
+    other side.
+
+    The generator RETURNS the pass metadata (``StopIteration.value``): frame
+    count, ``truncated``, and the timing spans. It is only available at the end
+    because ``truncated`` and the spans are only known then. A consumer that
+    stops early gets no metadata and should not invent any -- close the generator
+    and the timing still lands in the log, which is the honest record of a
+    partial pass.
+    """
+    fps, block, ny, nx = plan.fps, plan.block, plan.ny, plan.nx
+    start, n, want = plan.start, plan.n, plan.want
+    tiles, comps = plan.tiles, plan.comps
+    need_tensor, need_flow = plan.need_tensor, plan.need_flow
+    need_texture, need_appearance = plan.need_texture, plan.need_appearance
+
+    base_meta = {"fps": fps, "block": block, "grid": (ny, nx),
+                 "channel_version": CHANNEL_VERSION,
+                 "approximated": plan.approximated, "sigma": sigma,
+                 "window_start": start,
+                 "channels_computed": plan.channels_computed}
     if n == 0:
-        out["meta"] = {"fps": fps, "block": block, "grid": (ny, nx),
-                       "n_frames": 0, "channel_version": CHANNEL_VERSION,
-                       "approximated": approximated, "sigma": sigma,
-                       "window_start": start,
-                       "channels_computed": sorted(want),
-                       # Present on both exits: an empty window was asked for and
-                       # delivered, which is not the same as a decode ending
-                       # early, and a consumer reading meta["truncated"] should
-                       # not have to know which return path produced its dict.
-                       "truncated": False}
-        return out
+        # Present on both exits: an empty window was asked for and delivered,
+        # which is not the same as a decode ending early, and a consumer reading
+        # meta["truncated"] should not have to know which return path produced
+        # its dict.
+        return {**base_meta, "n_frames": 0, "truncated": False}
 
-    pres = {t["id"]: Preprocessor(pre_cfg, t["source_box"][2] - t["source_box"][0],
+    pres = {t["id"]: Preprocessor(plan.pre_cfg,
+                                  t["source_box"][2] - t["source_box"][0],
                                   t["source_box"][3] - t["source_box"][1])
             for t in tiles}
     prev_g: dict = {t["id"]: None for t in tiles}
@@ -356,6 +434,14 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                 break
             i, frame = nxt
             oi = i - start                     # <0 for the seed frame (not stored)
+            # One (ny, nx) plane per wanted channel, allocated fresh each frame
+            # because it is handed to the consumer and outlives this iteration.
+            # Zero-filled so the no-previous-frame case (and any tile the atlas
+            # does not cover) reads as the same zero it did when this loop wrote
+            # into a preallocated array -- the yielded dict is the whole frame,
+            # not a sparse update.
+            planes = ({k: np.zeros((ny, nx), np.float32) for k in want}
+                      if oi >= 0 else {})
             for ti, t in enumerate(tiles):
                 rid = t["id"]
                 x0, y0, x1, y1 = t["source_box"]
@@ -374,10 +460,10 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                 gp = prev_g[rid]
                 if oi >= 0:
                     if "intensity" in want:
-                        out["intensity"][oi, ay0:ay1, ax0:ax1] = \
+                        planes["intensity"][ay0:ay1, ax0:ax1] = \
                             _reduce(g, block, th, tw, tm)
                     if "texture" in want and cached_texture is not None:
-                        out["texture"][oi, ay0:ay1, ax0:ax1] = \
+                        planes["texture"][ay0:ay1, ax0:ax1] = \
                             cached_texture[i, ay0:ay1, ax0:ax1]
                     if gp is not None and (need_tensor or need_appearance):
                         # Form and spatially smooth the tensor components this
@@ -401,10 +487,10 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                                 uv = flow_from_tensor(J)         # px/frame
                         if "tensor_speed" in want:
                             speed = np.hypot(uv[..., 0], uv[..., 1]) * fps
-                            out["tensor_speed"][oi, ay0:ay1, ax0:ax1] = \
+                            planes["tensor_speed"][ay0:ay1, ax0:ax1] = \
                                 _reduce(speed, block, th, tw, tm)
                         if "change" in want:
-                            out["change"][oi, ay0:ay1, ax0:ax1] = \
+                            planes["change"][ay0:ay1, ax0:ax1] = \
                                 _reduce(J[2], block, th, tw, tm)
                         # Appearance residual r = I_t + grad(I).v. Against cached
                         # block flow (px/s -> px/frame, upsampled) when given, else
@@ -423,16 +509,23 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                                     ub, vb = uv[..., 0], uv[..., 1]
                                 iy, ix = np.gradient(g)
                                 r = (g - gp) + ix * ub + iy * vb
-                            out["appearance"][oi, ay0:ay1, ax0:ax1] = \
+                            planes["appearance"][ay0:ay1, ax0:ax1] = \
                                 _reduce(r * r, block, th, tw, tm)
                         if need_texture:
                             with tm.span("texture"):
                                 mineig = spatial_min_eigen(J)
-                            out["texture"][oi, ay0:ay1, ax0:ax1] = \
+                            planes["texture"][ay0:ay1, ax0:ax1] = \
                                 _reduce(mineig, block, th, tw, tm)
                 prev_g[rid] = g
             if oi >= 0:
+                # Counted as produced BEFORE it is handed over, which keeps
+                # ``done`` meaning what it meant when this loop wrote into an
+                # array: frames this pass measured. Counting on resume instead
+                # would silently undercount by one whenever a consumer closes the
+                # generator rather than draining it -- and the log line for a
+                # cancelled pass is exactly where that lie would land.
                 done = oi + 1
+                yield i, planes
             if progress and (oi >= 0) and (oi % 20 == 0):
                 # The progress hook re-enters the GUI thread and can supersede or
                 # cancel the pass, so it is timed apart from the actual work.
@@ -455,40 +548,118 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
         # wanted -- most passes leave by the exception path. ``done`` distinguishes
         # a partial line from a complete one.
         tm.log(frames=n, done=done, tiles=len(tiles), grid=f"{ny}x{nx}",
-               block=block, scale=f"{scale:.3f}",
+               block=block, scale=f"{plan.scale:.3f}",
                src="clips" if clip_paths is not None else
                    ("roi" if roi is not None else "full"))
 
-    # A decoder that ended early leaves the tail of every channel at zero. Return
-    # a SHORT window rather than a full-length one padded with zeros: a short
-    # window is self-describing, whereas zeros are indistinguishable from
-    # "measured, and nothing happened" -- i.e. a silent false negative, on the
-    # detection default (``change``) above all. Reachable in practice: a clip
-    # truncated by a crash or a full disk during the cut passes
-    # ``verify_manifest`` (which checks a clip exists, not how long it is), and a
-    # 20-of-64-frame clip was measured yielding 36 all-zero frames of 40 reported
-    # as real. The ROI and full-frame paths get the same treatment; they can hit
-    # it too, just far less often.
+    # A decoder that ended early yields FEWER frames than the window claimed, and
+    # the metadata says so rather than letting a consumer pad. A short window is
+    # self-describing, whereas zeros are indistinguishable from "measured, and
+    # nothing happened" -- i.e. a silent false negative, on the detection default
+    # (``change``) above all. Reachable in practice: a clip truncated by a crash
+    # or a full disk during the cut passes ``verify_manifest`` (which checks a
+    # clip exists, not how long it is), and a 20-of-64-frame clip was measured
+    # yielding 36 all-zero frames of 40 reported as real. The ROI and full-frame
+    # paths get the same treatment; they can hit it too, just far less often.
     short = done < n
-    if short:
+    if progress:
+        progress(done, done)
+    return {**base_meta, "n_frames": done, "truncated": short,
+            # The spans are already measured for the log line; returning them too
+            # is what lets the cost model be built from passes the user actually
+            # ran instead of from asserted constants. Only on the complete path:
+            # a cancelled pass unwinds through the finally above and never
+            # reaches here, so a partial pass can never be mistaken for a timing
+            # sample.
+            "timing": {"wall": tm.elapsed, "spans": dict(tm.totals),
+                       "frames": done, "scale": plan.scale, "block": block}}
+
+
+def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
+                     start: int = 0, n: int | None = None,
+                     cached_uv: tuple[np.ndarray, np.ndarray] | None = None,
+                     cached_texture: np.ndarray | None = None,
+                     clip_paths: list[str] | None = None,
+                     want: frozenset | None = None,
+                     denoise: str | None = None, progress=None) -> dict:
+    """Stream a frame window [start, start+n) and return per-block channel arrays.
+
+    The windowed contract: drain :func:`stream_channel_planes` into one array per
+    channel. Everything about *how* a frame is measured lives there; this is the
+    consumer that waits for all of them.
+
+    Geometry comes from ``meta`` (the same shape a feature cache carries); the
+    video is streamed directly, so this needs no cache -- it is the seam that lets
+    the tensor/scalogram path run on a bare video.
+
+    ``cached_uv`` is the pipeline's block flow (u, v) in px/s, indexed by absolute
+    frame, used for the appearance residual; pass ``None`` to measure the residual
+    against the tensor's OWN per-pixel flow instead (px/frame, no cache needed).
+    ``cached_texture`` is read straight through when present, else computed.
+    ``denoise`` overrides the config's temporal-denoise mode (the live/windowed
+    path forces it off, since denoise is stateful from frame zero and cannot be
+    reproduced starting mid-clip).
+
+    ``want`` restricts which channels are computed; ``None`` means all of them.
+    Every ``CHANNELS`` key is still returned -- this dict's shape is fixed, and
+    ``load_or_extract_channels``' sidecar depends on that -- but an unwanted
+    channel's array is a **zero-length** ``(0, ny, nx)`` placeholder. Length
+    zero, not NaN-filled and not zero-filled: a full-length array of either
+    still costs the memory the selection exists to save (~88 MB per channel per
+    hour of 30 fps footage at a 41x5 grid), and a zero-FILLED one is worse than
+    that, being indistinguishable from "measured, and nothing happened" -- the
+    same silent false negative the truncation trim below exists to prevent (its
+    rationale now lives on ``stream_channel_planes``, which is what detects the
+    short decode; this function only acts on the ``truncated`` flag).
+    A zero-length array cannot be mistaken for data or silently broadcast
+    against a real one.
+
+    ``meta['channels_computed']`` is the authoritative list of which keys hold
+    measurements; gate on it, not on key presence. (``live_channel_source``
+    hands out a ``ChannelData`` that drops the placeholders entirely, so at THAT
+    layer -- and only there -- key presence is equivalent.)
+
+    Returns a dict of the ``CHANNELS`` arrays (length = clamped window n) plus
+    ``meta`` describing how they were built.
+    """
+    plan = plan_channel_stream(meta, start=start, n=n, want=want,
+                               cached_uv=cached_uv,
+                               cached_texture=cached_texture, denoise=denoise)
+    out = {k: np.zeros((plan.n if k in plan.want else 0, plan.ny, plan.nx),
+                       np.float32) for k in CHANNELS}
+    planes = stream_channel_planes(video_path, plan, sigma=sigma,
+                                   cached_uv=cached_uv,
+                                   cached_texture=cached_texture,
+                                   clip_paths=clip_paths, progress=progress)
+    # Driven by hand rather than with a ``for``, because the pass metadata is the
+    # generator's RETURN value and a ``for`` loop discards it.
+    while True:
+        try:
+            i, frame = next(planes)
+        except StopIteration as stop:
+            chan_meta = stop.value
+            break
+        oi = i - plan.start
+        if not 0 <= oi < plan.n:
+            # Cannot happen through the generator, which only yields indices in
+            # the window -- and that is exactly why it is checked. A negative
+            # ``oi`` does not raise in numpy, it writes to the END of the array,
+            # so the failure mode of this invariant breaking is a frame silently
+            # landing at the wrong time. ``StreamBuffer.append`` refuses a
+            # non-contiguous index for the same reason; the two consumers of this
+            # generator should not disagree about how much they trust it.
+            raise AssertionError(
+                f"frame {i} is outside the planned window "
+                f"[{plan.start}, {plan.stop})")
+        for k, plane in frame.items():
+            out[k][oi] = plane
+
+    # Trim to what was actually measured; see the truncation note above.
+    done = int(chan_meta["n_frames"])
+    if chan_meta["truncated"]:
         for k in CHANNELS:
             out[k] = out[k][:done]
-        n = done
-    if progress:
-        progress(n, n)
-    out["meta"] = {"fps": fps, "block": block, "grid": (ny, nx), "n_frames": n,
-                   "channel_version": CHANNEL_VERSION, "approximated": approximated,
-                   "sigma": sigma, "window_start": start, "truncated": short,
-                   # Which arrays hold measurements; the rest are NaN placeholders.
-                   "channels_computed": sorted(want),
-                   # The spans are already measured for the log line; returning
-                   # them too is what lets the cost model be built from passes
-                   # the user actually ran instead of from asserted constants.
-                   # Only on the complete path: a cancelled pass unwinds through
-                   # the finally above and never reaches here, so a partial pass
-                   # can never be mistaken for a timing sample.
-                   "timing": {"wall": tm.elapsed, "spans": dict(tm.totals),
-                              "frames": n, "scale": scale, "block": block}}
+    out["meta"] = chan_meta
     return out
 
 
