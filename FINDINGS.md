@@ -1564,3 +1564,55 @@ large fraction of a block's total energy across its boundary. The tail is where
 detection happens, so a p95 of 35% is disqualifying however good the median and
 the correlation look. **Do not remove this blur**, and do not trust a
 correlation coefficient to license a change to a thresholded channel.
+
+## 21. The per-pixel cache never built on real footage: a budget, not a bug
+
+Reported as "changing the block size refetches the extraction — not sure where
+that regression came from." It was not a regression. `git log -S` shows
+`_pp_budget` and `_perpixel_fits` unchanged since they landed in `90da164`, and
+the 10 s window default unchanged since the tab was created. The feature had
+never worked on this project's own clips.
+
+The re-reduce path was correct throughout. What failed was the gate in front of
+it: `_perpixel_fits` charged the window against a flat **2 GiB**, and at scale
+1.0 that buys almost nothing on 5.3K footage with a dozen replicate boxes.
+Measured against the real `.rois.json` for each clip:
+
+| clip | reps | scale 1.0 | scale 0.5 | scale 0.25 |
+| --- | --- | --- | --- | --- |
+| `stab_GX010050c2` 60 fps | 13 | **0.97 s** | 3.89 s | 15.5 s |
+| `GX320051c2` 60 fps | 8 | **1.53 s** | 6.12 s | 24.5 s |
+| `GX010047c2` 24 fps | 11 | **4.50 s** | 18.0 s | 71.5 s |
+| `output.mp4` 120 fps | 2 | **0.97 s** | 3.90 s | 15.6 s |
+
+Against a 10 s default window, every clip missed at scale 1.0, so `_pp` stayed
+`None` and every Block change fell through to a full re-extract — the exact cost
+the cache exists to remove.
+
+**2 GiB was a magic number.** On the development machine (64 GB installed,
+~34 GB available) it is ~3% of the box and bears no relation to it. This is the
+same frame-relative-versus-machine-relative error the project has flagged
+elsewhere: the budget belongs in units of what the machine actually has.
+`core/sysmem.py` now reads available physical memory natively per platform (no
+psutil for one number) and `_pp_budget` is a quarter of it, floored at the old
+2 GiB so small or unreadable machines keep today's behaviour, capped at 16 GiB
+where decode latency rather than memory becomes binding. The quarter is because
+the extract holds its own copy alongside the cache, so peak is ~2x the budget.
+
+At 8.5 GiB that clears the 10 s default at scale 0.5 on every clip and at scale
+1.0 on three of five. **It does not clear all of them** — `stab_GX010050c2` at
+full scale still fits only 4.07 s — which is why the fallback is no longer
+silent: `_on_block_changed` now prints what the window needs, what the budget
+is, and how many seconds would fit. A silent fallback under a tooltip that
+promises a re-reduce is what made this read as a regression for months.
+
+### The test gap that hid it
+
+`test_block_change_re_reduces_cached_pixel_channels` passed the whole time. It
+assigns `_pp` and `_pp_key` by hand, so it verifies the *compare* half and never
+the *store* half — it cannot fail when nothing populates the cache. The general
+shape: a test that constructs the state under test rather than driving the code
+that produces it will not notice when production stops producing it.
+`test_extract_then_block_change_reuses_the_cache_it_just_stored` runs a real
+extract and asserts on the cache that pass actually stored; it fails if the fit
+check misses.

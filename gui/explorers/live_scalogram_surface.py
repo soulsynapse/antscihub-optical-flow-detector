@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel,
 
 from core.channel_source import (LIVE_CHANNELS, live_channel_source,
                                  reduce_channel_data)
+from core.cache import human_bytes
 from core.config import FlowConfig, PipelineConfig, PreprocessConfig
 from core.cost_model import CostModel, PassSample
 from core.scale_sweep import measure_scale
@@ -42,6 +43,7 @@ from core.replicates import build_layout, in_tile_order
 # never copy them across -- see refresh_replicate_metadata.
 _GEOMETRY_KEYS = frozenset({"frac", "id"})
 from core.detection import detect_channel_region
+from core.sysmem import budget_bytes
 from core.video import VideoSource
 from core.wavelet import default_freqs
 from gui.explorers.detection_timeline import DetectionNavigator
@@ -65,6 +67,22 @@ _PROCESS_TEXT = "Process whole video ▶"
 # "the caller did not say which block regime this pass ran in". Distinct from
 # None, which is a real regime (the block tracked the scale).
 _INFER = object()
+
+# Per-pixel cache budget, sized from free RAM rather than fixed. The old flat
+# 2 GiB covered under a second of 5.3K footage at scale 1.0 with a dozen
+# replicates, so on real clips the cache never built and every Block change paid
+# a full re-extract -- the exact cost this cache exists to avoid. A fraction of
+# what the machine actually has is the honest unit; the floor preserves the old
+# behaviour where free RAM is small or unreadable.
+#
+# The fraction is a quarter because the extract holds its own copy of the
+# channels alongside the cache for the length of the pass, so peak footprint is
+# ~2x the budget -- a quarter of free RAM keeps that peak at half.
+_PP_BUDGET_FRACTION = 0.25
+_PP_BUDGET_FLOOR = 2 * 1024 ** 3
+# Above this, filling the window costs more decode time than anyone waits
+# through interactively; memory stops being the binding constraint.
+_PP_BUDGET_CAP = 16 * 1024 ** 3
 
 # Longest side of the source crop the render strip works from. A replicate box
 # can be the whole frame, and squeezing 5312 px into a ~108 px tile makes every
@@ -337,7 +355,11 @@ class LiveScalogramSurface(QWidget):
         # footprint would exceed the budget (then Block falls back to re-extract).
         self._pp: object | None = None
         self._pp_key: tuple | None = None
-        self._pp_budget = 2 * 1024 ** 3
+        # Read once per surface, not per check: it feeds a cache-sizing decision,
+        # and re-reading would let the same window flip between fitting and not
+        # as unrelated processes come and go.
+        self._pp_budget = budget_bytes(_PP_BUDGET_FRACTION, _PP_BUDGET_FLOOR,
+                                       _PP_BUDGET_CAP)
         self._pending_pp = False        # is the running extract building a cache?
         self._pending_key: tuple | None = None
         self._pending_cfg: PipelineConfig | None = None
@@ -1185,11 +1207,27 @@ class LiveScalogramSurface(QWidget):
         scale = cfg.preprocess.resolve_downsample(self._dims[0])
         return (start, n, round(float(scale), 6), cfg.preprocess.normalize)
 
-    def _perpixel_fits(self, cfg: PipelineConfig, n: int) -> bool:
+    def _perpixel_bytes(self, cfg: PipelineConfig, n: int) -> int:
         w, h = self._dims[0], self._dims[1]
         scale = cfg.preprocess.resolve_downsample(w)
         ny, nx = build_layout(self.replicates, w, h, scale, 1).atlas_grid
-        return n * ny * nx * len(LIVE_CHANNELS) * 4 <= self._pp_budget
+        return n * ny * nx * len(LIVE_CHANNELS) * 4
+
+    def _perpixel_fits(self, cfg: PipelineConfig, n: int) -> bool:
+        return self._perpixel_bytes(cfg, n) <= self._pp_budget
+
+    def _pp_miss_reason(self, cfg: PipelineConfig, n: int) -> str:
+        """Why a Block change had to re-extract, in the numbers the user can act
+        on. A silent fallback here reads as a bug (it did, for a while): the
+        tooltip promises a re-reduce, so the exception has to say what it would
+        take -- shorten the window or drop the scale."""
+        need = self._perpixel_bytes(cfg, n)
+        if need <= self._pp_budget:
+            return "window changed"          # a real miss, not a budget miss
+        secs = self._pp_budget / max(1, need / max(n, 1)) / max(self.fps, 1e-6)
+        return (f"window needs {human_bytes(need)} of pixel cache, "
+                f"budget {human_bytes(self._pp_budget)} "
+                f"(~{secs:.1f} s fits at this scale)")
 
     def _resolved_block(self, cfg: PipelineConfig) -> int:
         """The working block size a pass will actually use (auto tracks scale)."""
@@ -1226,6 +1264,9 @@ class LiveScalogramSurface(QWidget):
             self._show_channel_data(
                 reduce_channel_data(self._pp, cfg, self.replicates))
         else:
+            self.status_lbl.setText(
+                f"re-extracting — {self._pp_miss_reason(cfg, n)}…")
+            self.status_lbl.repaint()
             self.extract()
 
     def _on_failed(self, msg: str):

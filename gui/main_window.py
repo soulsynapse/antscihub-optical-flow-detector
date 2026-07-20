@@ -1,8 +1,12 @@
-"""Main window: three tabs over one shared AppState.
+"""Main window: two tabs over one shared AppState.
 
 Hotkeys follow the reference color detector so the two tools feel the same:
 Space plays/pauses, arrows step a frame, shift+arrows step a second, Home/End
-jump to the ends, Ctrl+1/2/3 switch tabs.
+jump to the ends, Ctrl+1/2 switch tabs.
+
+The flow-cache commit and Behavior Classification tabs were retired to
+gui/_shelved/ -- the tensor path does not read a flow cache, so both had lost
+the artefact they were built around. See gui/_shelved/README.md.
 """
 from __future__ import annotations
 
@@ -14,9 +18,7 @@ from PyQt6.QtWidgets import (QApplication, QFileDialog, QLabel, QMainWindow,
                              QMessageBox, QTabWidget)
 
 from gui.state import AppState
-from gui.tab1_flow import Tab1Flow
 from gui.tab2_replicates import Tab2Replicates
-from gui.tab3_behavior import Tab3Behavior
 from gui.tab_live_preprocess import TabLivePreprocess
 
 
@@ -30,27 +32,18 @@ class MainWindow(QMainWindow):
         self.state = AppState(project_dir)
 
         self.tabs = QTabWidget()
-        self.tab1 = Tab1Flow(self.state)
         self.tab2 = Tab2Replicates(self.state)
-        self.tab3 = Tab3Behavior(self.state)
         self.tab_live = TabLivePreprocess(self.state)
-        # Tensor path primary: live preprocessing is the main surface; the flow
-        # pass is demoted to an optional commit step. Tab indices: 0 Replicates,
-        # 1 Live preprocessing, 2 Flow commit, 3 Behavior.
+        # Tensor path primary: live preprocessing is the main surface, and it
+        # needs no cache. Tab indices: 0 Replicates, 1 Live preprocessing.
         self.tabs.addTab(self.tab2, "1 · Replicates")
         self.tabs.addTab(self.tab_live, "2 · Preprocessing (live)")
-        self.tabs.addTab(self.tab1, "3 · Flow cache (commit)")
-        self.tabs.addTab(self.tab3, "4 · Behavior Classification")
         self.setCentralWidget(self.tabs)
-
-        # Replicates must be defined before flow. Behavior needs a cache.
-        self.tabs.setTabEnabled(3, False)
 
         self.status = QLabel("Open a video to begin.")
         self.statusBar().addWidget(self.status)
 
         self.state.status.connect(self.status.setText)
-        self.state.cache_opened.connect(self._on_cache_opened)
         self.state.video_loaded.connect(self._on_video_loaded)
         self.state.request_tab.connect(self.tabs.setCurrentIndex)
 
@@ -93,8 +86,6 @@ class MainWindow(QMainWindow):
         sc(Qt.Key.Key_End.value, lambda: self.state.set_frame(10 ** 9))
         sc("Ctrl+1", lambda: self.tabs.setCurrentIndex(0))
         sc("Ctrl+2", lambda: self.tabs.setCurrentIndex(1))
-        sc("Ctrl+3", lambda: self.tabs.setCurrentIndex(2))
-        sc("Ctrl+4", lambda: self.tabs.setCurrentIndex(3))
 
     def _toggle_play(self):
         # Prefer the video the user actually clicked. Both VideoPanel and the
@@ -108,10 +99,8 @@ class MainWindow(QMainWindow):
                 return
             widget = widget.parentWidget()
 
-        panel = {0: self.tab2.video, 3: self.tab3.video}.get(
-            self.tabs.currentIndex())
-        if panel:
-            panel.toggle_playback()
+        if self.tabs.currentIndex() == 0:
+            self.tab2.video.toggle_playback()
 
     def _open_video(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -124,18 +113,12 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Could not open video", str(e))
 
-    def _on_cache_opened(self):
-        for i in range(4):
-            self.tabs.setTabEnabled(i, True)
-
     def _on_video_loaded(self):
         # ROI-first workflow: draw/import ownership boxes before processing.
-        # Live preprocessing (1) and the flow commit (2) open with the video;
-        # Behavior (3) still needs a completed cache.
+        # Both tabs open with the video -- neither needs a cache now that live
+        # preprocessing runs off the raw frames.
         self.tabs.setTabEnabled(0, True)
         self.tabs.setTabEnabled(1, True)
-        self.tabs.setTabEnabled(2, True)
-        self.tabs.setTabEnabled(3, False)
         self.tabs.setCurrentIndex(0)
 
     def _about(self):

@@ -1,7 +1,7 @@
 """Replicates tab: manual experimental-unit bounding boxes.
 
 The histogram-driven automatic ROI discovery is shelved in
-gui/_shelved_tab2_roi_auto.py -- it worked, but on footage where the behavior is
+gui/_shelved/tab2_roi_auto.py -- it worked, but on footage where the behavior is
 everywhere and the camera moves, drawing the replicate regions by hand is faster
 and less error-prone than tuning a filter to segment them. Each box becomes a
 replicate: a spatial region present for the whole clip, which Tab 3 then
@@ -129,10 +129,10 @@ class Tab2Replicates(QWidget):
         row2.addWidget(load)
         bl.addLayout(row2)
 
-        to3 = QPushButton("Classify these in Tab 3 →")
-        to3.setStyleSheet("padding:6px; font-weight:bold;")
-        to3.clicked.connect(self._go_classify)
-        bl.addWidget(to3)
+        to_live = QPushButton("Tune these in Preprocessing →")
+        to_live.setStyleSheet("padding:6px; font-weight:bold;")
+        to_live.clicked.connect(self._go_preprocess)
+        bl.addWidget(to_live)
         rl.addWidget(box)
 
         std_box = QGroupBox("Selected replicate standardization")
@@ -682,17 +682,12 @@ class Tab2Replicates(QWidget):
         self._autosave()
         self.state.status.emit(f"Loaded {len(self.replicates)} boxes.")
 
-    def _go_classify(self):
+    def _go_preprocess(self):
+        # Live preprocessing reads raw frames, so boxes are the only
+        # precondition -- there is no cache to build first.
         if not self.replicates:
             QMessageBox.information(self, "No replicates",
                                     "Draw at least one box first.")
             return
         self._rebuild_rois()
-        if not self.state.has_cache:
-            QMessageBox.information(
-                self, "Processing required",
-                "These boxes do not yet have a matching per-replicate cache. "
-                "Run Test or Full processing in Preprocessing & Flow first.")
-            self.state.request_tab.emit(1)
-            return
-        self.state.request_tab.emit(2)
+        self.state.request_tab.emit(1)

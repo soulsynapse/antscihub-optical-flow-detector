@@ -13,8 +13,11 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
+from core.channel_source import live_channel_source
 from gui.explorers import live_scalogram_surface
 from gui.explorers.live_scalogram_surface import (_Busy, _Cancelled,
+                                                  _PP_BUDGET_CAP,
+                                                  _PP_BUDGET_FLOOR,
                                                   _StreamWorker,
                                                   LiveScalogramSurface)
 from gui.tuning_store import tuning_path
@@ -175,6 +178,54 @@ class LiveScalogramSurfaceBlockTests(_SurfaceTestCase):
 
         surface.extract.assert_called_once()
         surface._show_channel_data.assert_not_called()
+
+    def test_extract_then_block_change_reuses_the_cache_it_just_stored(self):
+        """The round trip the other tests skip: they set ``_pp_key`` by hand, so
+        they pass even when nothing ever POPULATES the cache. That gap hid a real
+        failure -- the budget was a flat 2 GiB, which covers under a second of
+        5.3K footage, so on real clips the cache never built and every Block
+        change silently paid a full re-extract. Drive store and compare together.
+        """
+        surface = self._surface()
+        start, n = surface._window()
+        cfg = surface._build_cfg()
+        self.assertTrue(surface._perpixel_fits(cfg, n),
+                        "fixture must fit the budget for this to mean anything")
+
+        # Exactly what extract() sets up before handing off to the worker.
+        surface._pending_pp = True
+        surface._pending_key = surface._pp_signature(cfg, start, n)
+        surface._pending_cfg = cfg
+        cd = live_channel_source(
+            self.video, surface._cfg_block1(cfg), surface.replicates,
+            start=start, n=n, width=surface._dims[0], height=surface._dims[1],
+            fps=surface._dims[2], frame_count=surface._dims[3])
+        self.assertEqual(int(cd.meta["block_size"]), 1)
+        surface._on_extracted(cd)
+
+        self.assertIsNotNone(surface._pp, "extract stored no per-pixel cache")
+        surface.block_spin.setValue(8)
+        surface._on_block_changed()
+        surface.extract.assert_not_called()
+
+    def test_budget_is_sized_from_free_ram_not_a_flat_constant(self):
+        surface = self._surface()
+        self.assertGreaterEqual(surface._pp_budget, _PP_BUDGET_FLOOR)
+        self.assertLessEqual(surface._pp_budget, _PP_BUDGET_CAP)
+
+    def test_budget_miss_says_why_it_re_extracted(self):
+        """A silent fallback here reads as a bug, because the tooltip promises a
+        re-reduce. The status must name the budget as the reason."""
+        surface = self._surface()
+        surface._pp = None
+        surface._pp_budget = 1          # nothing can fit
+        surface.block_spin.setValue(8)
+        surface._on_block_changed()
+
+        surface.extract.assert_called_once()
+        text = surface.status_lbl.text()
+        self.assertIn("re-extracting", text)
+        self.assertIn("budget", text)
 
     def test_block_change_is_ignored_during_the_whole_video_pass(self):
         surface = self._surface()

@@ -88,17 +88,20 @@ def cache_key(self, video_hash, replicate_geometry_hash, *, provenance_key): ...
 
 Every call site must then write `provenance_key=None` deliberately, which is a
 claim ("this pass read the source") rather than an oversight. Cost is three call
-sites — `core/pipeline.py:174`, the shelved `gui/tab1_flow.py:757`,
-`scripts/validate_standardization.py:114` — plus `tests/test_clip_extraction.py`.
+sites — `core/pipeline.py:174`, `scripts/validate_standardization.py:114` — plus
+`tests/test_clip_extraction.py`. (A third was `gui/tab1_flow.py`, now retired to
+`gui/_shelved/`; leave it broken if this lands.)
 The *hashing* behaviour must not change: `None` stays omitted from the blob, so
 every pre-clip cache keeps its key. This is the T17 shape handled early — state
 that quietly stops meaning what it meant — and the same remedy class as bumping
 `PRETRANSCODE_VERSION`: make the silent case loud at the boundary.
 
-**Shelved (T8, T9).** `gui/tab1_flow.py` and `gui/tab3_behavior.py` are
-unmaintained. Don't fix them if a change breaks them; just note it. Consider
-renaming to `_shelved_*` once nothing imports them. (Overridden once, deliberately,
-in Batch K — see `FINDINGS.md` §9.)
+**Shelved (T8, T9) — done.** `tab1_flow.py` and `tab3_behavior.py` moved to
+`gui/_shelved/`, joining the two files that already used the flat `_shelved_*`
+prefix (the old prefix convention is retired; the package replaces it). Nothing
+imports them. `MainWindow` is down to two tabs, and `tests/test_cache_naming.py`
+was deleted with the `_test_cache_suffix` it covered. Don't fix anything in
+`gui/_shelved/` if a change breaks it; just note it.
 
 ## 3. Done
 
