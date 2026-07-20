@@ -290,10 +290,15 @@ class LiveScalogramSurface(QWidget):
     calibration_changed = pyqtSignal(int, object)   # (replicate id, fields)
 
     def __init__(self, video_path: str, replicates: list[dict],
-                 base_cfg: PipelineConfig | None = None, parent=None):
+                 base_cfg: PipelineConfig | None = None, parent=None,
+                 frame_provider=None):
         super().__init__(parent)
         self.video_path = video_path
         self.replicates = list(replicates)
+        # Where the rest of the app is parked in the clip, if the owner can tell
+        # us. Read on demand rather than tracked: the surface only cares at the
+        # moment the user asks to inherit that position.
+        self._frame_provider = frame_provider
         cfg = base_cfg or PipelineConfig()
 
         with VideoSource(video_path) as src:
@@ -433,6 +438,16 @@ class LiveScalogramSurface(QWidget):
         self.start_lbl = QLabel("0.00 s")
         self.start_lbl.setMinimumWidth(70)
         row.addWidget(self.start_lbl)
+
+        # Carries the playhead over from the Replicates tab: the usual way a
+        # window gets chosen is by scrubbing there until something interesting is
+        # on screen, and retyping that frame here is the step that loses it.
+        self.inherit_btn = QPushButton("Inherit")
+        self.inherit_btn.setToolTip(
+            "Set the window start to where the Replicates tab is parked.")
+        self.inherit_btn.clicked.connect(self._inherit_start)
+        self.inherit_btn.setVisible(self._frame_provider is not None)
+        row.addWidget(self.inherit_btn)
 
         row.addWidget(QLabel("Length"))
         self.len_spin = QDoubleSpinBox()
@@ -587,6 +602,20 @@ class LiveScalogramSurface(QWidget):
     def _on_window_changed(self, *_):
         self._sync_window_label()
         self._debounce.start()
+
+    def _inherit_start(self):
+        """Move the window start to the app's current playhead frame."""
+        if self._frame_provider is None:
+            return
+        frame = int(self._frame_provider())
+        # Clamp rather than ignore an out-of-range playhead: the spin box range
+        # stops two frames short of the end, and landing on the last usable
+        # window is a better answer than silently doing nothing.
+        frame = max(self.start_slider.minimum(),
+                    min(self.start_slider.maximum(), frame))
+        # setValue is a no-op when it matches, so a second press costs nothing;
+        # when it differs, valueChanged carries the re-extract as usual.
+        self.start_slider.setValue(frame)
 
     def _sync_window_label(self):
         self.start_lbl.setText(f"{self.start_slider.value() / self.fps:.2f} s")

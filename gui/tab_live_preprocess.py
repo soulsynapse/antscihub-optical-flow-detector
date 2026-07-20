@@ -75,7 +75,8 @@ class TabLivePreprocess(QWidget):
         self._info.setVisible(False)
         self._surface = LiveScalogramSurface(
             self.state.source.info.path, self.state.replicate_specs,
-            base_cfg=self.state.cfg, parent=self)
+            base_cfg=self.state.cfg, parent=self,
+            frame_provider=lambda: self.state.current_frame)
         # The surface works from AppState's copies of the replicate dicts, so a
         # calibration measured in its downsample window has to be relayed here
         # to reach the replicate tab's list and its per-video sidecar.
