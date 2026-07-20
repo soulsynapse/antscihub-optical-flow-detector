@@ -28,11 +28,11 @@ from __future__ import annotations
 
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen
+from PyQt6.QtGui import QFont, QImage, QPainter, QPen
 from PyQt6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
                              QWidget)
 
-from gui.explorers.speed_explorer import BG, CURSOR, PLOT_BG, TXT, TXT_DIM
+from gui.explorers.speed_explorer import BG, CURSOR, PLOT_BG, TXT_DIM
 
 # Examined-and-current. The clump ramp runs cool-to-hot; the gate band and the
 # "we looked" baseline are the same green so they read as one statement.
@@ -63,6 +63,11 @@ class _Strip(QWidget):
     # frame). Kept separate from `seek_committed` so a drag across the clip does
     # not fire one re-extract per pixel.
     scrubbed = pyqtSignal(int)
+    # Mouse-DOWN: distinct from `scrubbed` (which also fires on every drag move)
+    # so a consumer can start loading the clicked frame the instant the strip is
+    # pressed, instead of waiting out the release. A drag fires it once, at the
+    # grab point, which is a useful preload and not a per-pixel cost.
+    pressed = pyqtSignal(int)
     seek_committed = pyqtSignal(int)        # release: the expensive action
 
     def __init__(self, parent=None):
@@ -205,6 +210,7 @@ class _Strip(QWidget):
         f = self._frame_at(e.position().x())
         self.set_cursor(f)
         self.scrubbed.emit(f)
+        self.pressed.emit(f)
 
     def mouseMoveEvent(self, e):
         if not self._dragging:
@@ -227,6 +233,7 @@ class DetectionNavigator(QWidget):
     commit pass lands would remove the seeker from a tab that has one.
     """
     scrubbed = pyqtSignal(int)              # cheap: cursor moved
+    pressed = pyqtSignal(int)               # mouse-down: jump here now
     seek_committed = pyqtSignal(int)        # expensive: load this position
     focus_requested = pyqtSignal(int)       # a detection was chosen
 
@@ -245,6 +252,7 @@ class DetectionNavigator(QWidget):
         lay.addWidget(self.summary)
         self.strip = _Strip()
         self.strip.scrubbed.connect(self.scrubbed)
+        self.strip.pressed.connect(self.pressed)
         self.strip.seek_committed.connect(self._on_committed)
         lay.addWidget(self.strip)
 

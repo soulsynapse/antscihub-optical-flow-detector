@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 
 from core.config import PreprocessConfig
-from core.scale_render import (ScaleRender, fit_box_to, render_box_at_scales,
+from core.scale_render import (fit_box_to, render_box_at_scales,
                                _preprocess_cfg)
 
 

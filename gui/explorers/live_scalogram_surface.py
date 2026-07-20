@@ -43,8 +43,9 @@ from enum import Enum
 
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel,
-                             QPushButton, QSpinBox, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout,
+                             QLabel, QPushButton, QSpinBox, QVBoxLayout,
+                             QWidget)
 
 from core.channel_source import (LIVE_CHANNELS, ChannelData,
                                  live_channel_source, synth_live_meta)
@@ -58,6 +59,9 @@ from core.replicates import build_layout, in_tile_order
 # never copy them across -- see refresh_replicate_metadata.
 _GEOMETRY_KEYS = frozenset({"frac", "id"})
 from core.detection import detect_channel_region, region_grid_from_meta
+from core.process_plan import (BUDGETED, DEFAULT_BUDGET, DEFAULT_CHUNK_S,
+                               DEFAULT_STRATEGY, GAPS, Segment, coverage_note,
+                               plan_segments)
 from core.live_track import (TrackStamp, WholeVideoTrack, band_power_bytes,
                              coi_trim)
 from core.stream_buffer import MIN_CAPACITY, capacity_for_budget
@@ -66,6 +70,7 @@ from core.tensor_channels import plan_channel_stream
 from core.video import VideoSource
 from core.wavelet import default_freqs
 from gui.explorers.detection_timeline import DetectionNavigator
+from gui.explorers.scalogram_explorer import CHANNELS as _DISPLAY_CHANNELS
 from gui.explorers.scalogram_explorer import ScalogramExplorer
 # The worker base moved to gui/stream_worker.py so the continuous worker could
 # share it without importing this module. The base and Cancelled are re-bound to
@@ -73,6 +78,7 @@ from gui.explorers.scalogram_explorer import ScalogramExplorer
 from gui.stream_worker import Cancelled as _Cancelled
 from gui.stream_worker import LiveStreamWorker
 from gui.stream_worker import StreamWorker as _StreamWorker
+from gui.track_store import load_track, save_track
 from gui.tuning_store import load_tuning, save_tuning
 
 # Downsampling is opt-in and off by default (todo.md Batch K), so there is no
@@ -159,6 +165,16 @@ _RING_BUDGET_FRACTION = 0.25
 _RING_BUDGET_FLOOR = 512 * 1024 ** 2
 _RING_BUDGET_CAP = 8 * 1024 ** 3
 
+# The one channel a live pass ALWAYS computes, whatever is selected.
+#
+# ScalogramExplorer.set_channel_data refuses a window without it -- self.T is
+# read off it and every scope/threshold path assumes it -- so it is not a
+# preference but a precondition. It is also the cheapest tensor channel there
+# is: `change` is J_tt alone, one product and one blur (_COMPONENTS in
+# core/tensor_channels), so carrying it costs almost nothing even when the
+# selection is something else.
+_ALWAYS_STREAM = "change"
+
 # Longest side of the source crop the render strip works from. A replicate box
 # can be the whole frame, and squeezing 5312 px into a ~108 px tile makes every
 # scale look identical -- the display becomes the bottleneck instead of the
@@ -166,6 +182,28 @@ _RING_BUDGET_CAP = 8 * 1024 ** 3
 # to a centre window keeps the comparison at a magnification where the
 # difference between scales is visible.
 _RENDER_MAX_PX = 420
+
+
+def _uncovered_runs(covered, a: int, b: int) -> list[tuple[int, int]]:
+    """The ``[start, stop)`` sub-spans of ``[a, b)`` where ``covered`` is False.
+
+    Used to subtract already-examined footage from a planned segment. Kept as a
+    free function over the boolean mask rather than a WholeVideoTrack method
+    because it says nothing about tracks: ``gaps()`` already answers the
+    whole-clip version, and this is the intersection of that idea with one
+    arbitrary span, which is the schedule's business rather than the
+    accumulator's.
+    """
+    a, b = max(0, int(a)), min(len(covered), int(b))
+    if b <= a:
+        return []
+    free = ~np.asarray(covered[a:b], bool)
+    if not free.any():
+        return []
+    edges = np.diff(np.concatenate([[0], free.view(np.int8), [0]]))
+    return [(int(s) + a, int(e) + a)
+            for s, e in zip(np.flatnonzero(edges == 1),
+                            np.flatnonzero(edges == -1))]
 
 
 class _Busy(Enum):
@@ -205,60 +243,184 @@ class _RenderWorker(_StreamWorker):
         self.done.emit(renders)
 
 
+class _PreviewWorker(_StreamWorker):
+    """Decode ONE bounded window at a seek point, off the GUI thread.
+
+    This is the seek-while-paused preview. Clicking the timeline with no pass
+    running loads the window at that point, so a paused seek shows the footage
+    there instead of sitting on wherever the last pass stopped. It is
+    deliberately NOT the live pass and never becomes one: it decodes a fixed
+    ``[start, start+n)`` span through ``live_channel_source``, emits a single
+    ChannelData and ends, holding the decoder only for that one bounded
+    seek+solve. The surface's ``one pass, Play runs it`` design retired the old
+    windowed *extract*; this brings a bounded decode back for exactly the case
+    that motivated keeping it -- a paused seek that would otherwise show a
+    different part of the clip than the strip's cursor claims -- and nothing
+    else.
+
+    Like ``_RenderWorker`` it opens its OWN ``VideoSource`` (inside
+    ``live_channel_source``), so it does not contend for the shared decoder the
+    streaming passes hold; it is only ever started while none of them runs.
+    """
+
+    def __init__(self, video_path, cfg, replicates, dims, start, n, channels,
+                 focus, parent=None):
+        super().__init__(parent)
+        self._args = (video_path, cfg, replicates, dims, int(start), int(n),
+                      list(channels))
+        # The clicked absolute frame, carried back so the done handler lands the
+        # cursor exactly where the user clicked rather than at a window edge.
+        self.focus = int(focus)
+
+    def _run(self):
+        video_path, cfg, reps, dims, start, n, channels = self._args
+        w, h, fps, fc = dims
+        cd = live_channel_source(
+            video_path, cfg, reps, start=start, n=n, width=w, height=h,
+            fps=fps, frame_count=fc, channels=channels, progress=self._tick)
+        self.done.emit(cd)
+
+
 class _ProcessWorker(_StreamWorker):
-    """The whole-video commit: stream the WHOLE clip's channels once, then run the
-    tuned detector over the selected region. No flow, no cache -- just the
-    detection track. This is the one expensive pass, paid after tuning."""
+    """The whole-video commit: stream the tuned channel and detect on it.
+
+    **Segmented, not monolithic.** It used to be one decode of the whole clip
+    followed by one detect, which is still what a ``continuous`` plan produces --
+    a single segment spanning the video. The generalization is what lets the
+    other strategies exist (see ``core/process_plan``): the worker walks an
+    ordered list of spans and emits a result per span, so a plan that samples the
+    clip, fills only its gaps, or refines by bisection is the same loop with a
+    different list. Nothing here knows which strategy it is running.
+
+    Results are emitted **per segment**, as ``segment_done``, rather than
+    accumulated and returned at the end. Two reasons. The track is an
+    accumulator with a coverage mask, so a segment written the moment it lands
+    is visible on the strip while the rest of the pass runs -- which is the
+    whole point of a sampling strategy, that you can watch the clip fill in and
+    stop when you have seen enough. And a cancelled pass then KEEPS every
+    segment it finished, instead of throwing away an hour of decode because the
+    last span was interrupted.
+
+    Each segment is decoded with ``coi`` frames of padding at both ends and the
+    padding is trimmed off the write, so a span's cut edges are never recorded
+    as examined. Without it every segment boundary would leave a permanently
+    contaminated seam -- the same reasoning as ``_DETECT_OVERLAP_COI`` on the
+    live path, arriving here for the same reason and fixed the same way.
+    """
     phase = pyqtSignal(str)          # a coarse phase change (e.g. detection start)
+    # (DetectionResult, trim_head, trim_tail, segment index, total segments)
+    segment_done = pyqtSignal(object, int, int, int, int)
 
     def __init__(self, video_path, cfg, replicates, dims, region_index, params,
-                 parent=None):
+                 segments, coi: int = 0, parent=None):
         super().__init__(parent)
         self._args = (video_path, cfg, replicates, dims, region_index, params)
-        # ``(covered, requested)`` when the decode ended early, else None. Read by
+        self._segments = list(segments)
+        self._coi = max(0, int(coi))
+        # ``(covered, requested)`` when a decode ended early, else None. Read by
         # the done handler; see _run.
         self.short: tuple[int, int] | None = None
+        # Frames actually recorded, so the done handler can report what the pass
+        # examined rather than what it set out to examine.
+        self.covered = 0
+
+    def total_frames(self) -> int:
+        """Frames this plan will decode, padding included -- the denominator the
+        progress readout needs. Computed here because the padding is this
+        class's business and the surface should not have to reproduce it."""
+        return sum(self._padded(s)[1] for s in self._segments)
+
+    def _padded(self, seg) -> tuple[int, int]:
+        """``(start, n)`` to DECODE for ``seg``: the span plus a cone at each end,
+        clamped to the clip. The clamp is what makes the trim asymmetric at the
+        clip's true edges, where the data genuinely begins and ends and there is
+        no contamination to discard."""
+        _v, _c, _r, dims, _ri, _p = self._args
+        fc = int(dims[3])
+        start = max(0, seg.start - self._coi)
+        stop = min(fc, seg.stop + self._coi)
+        return start, max(0, stop - start)
 
     def _run(self):
         video_path, cfg, reps, dims, region_index, params = self._args
         w, h, fps, fc = dims
-        # ONLY the channel being detected on. The whole-clip pass used to compute
-        # all four regardless, and the other three were pure waste -- nothing
-        # downstream of here reads them, since detect_channel_region takes a
-        # single channel_attr. On the detection default (``change``) this skips
-        # the flow solve, the appearance residual and the min-eigen; the live
-        # preview deliberately still computes all four, because there a channel
-        # toggle must stay instant instead of triggering a replan.
-        cd = live_channel_source(
-            video_path, cfg, reps, start=0, n=None, width=w, height=h,
-            fps=fps, frame_count=fc, channels=[params["channel_attr"]],
-            progress=self._tick)
-        # A decode that ended early yields a SHORT track, not a padded one, so
-        # the detector below runs over less video than the user asked for and
-        # every "no detection here" past the cut point is unexamined rather than
-        # examined-and-clear. The result object carries no notion of coverage, so
-        # the shortfall is recorded on the worker for the done handler to report
-        # -- silently returning a partial pass as a whole-video pass is the exact
-        # false negative the truncation trim exists to prevent, and trimming
-        # without reporting only moves where it hides.
-        self.short = (int(cd.n_frames), int(fc)) if cd.meta.get("truncated") \
-            else None
-        # Extraction (the whole-clip per-pixel tensor stream) is done; the band
-        # power + gate that follow are a much smaller slice of the wall time,
-        # but the phase note keeps the status honest across the handoff.
-        # detect_channel_region has no progress hook, so this is the last cancel
-        # point -- a stop during detection lands here rather than mid-detector.
-        if self._cancel:
-            raise _Cancelled
-        self.phase.emit("running detector")
-        res = detect_channel_region(
-            cd, region_index, params["channel_attr"],
-            freqs=default_freqs(fps), freq_band_hz=params["freq_band_hz"],
-            value_band=params["value_band"], count_band=params["count_band"],
-            detect_window=params["detect_window"], centered=params["centered"])
-        if self._cancel:
-            raise _Cancelled
-        self.done.emit(res)
+        total = len(self._segments)
+        done_frames = 0
+        grand_total = max(1, self.total_frames())
+        # The frequency bank depends only on fps, so build it once rather than
+        # per segment: a sampling plan can be dozens of segments, and
+        # default_freqs rebuilds the whole geometric bank each call.
+        freqs = default_freqs(fps)
+        for k, seg in enumerate(self._segments):
+            if self._cancel:
+                raise _Cancelled
+            start, n = self._padded(seg)
+            if n < 2:
+                continue
+            self.phase.emit(
+                f"segment {k + 1}/{total} at {seg.start / max(fps, 1e-6):.0f} s")
+
+            # Progress is reported across the WHOLE plan, not per segment: a bar
+            # that restarts at zero every span would make a 40-segment sampling
+            # pass look like forty passes and give no usable estimate of any of
+            # them. The offset advances by the PADDED n grand_total was built
+            # from, not by the frames actually returned -- a segment whose decode
+            # truncates returns fewer, and crediting only those would leave the
+            # bar permanently short of 100% on exactly the clips (mis-reported
+            # frame counts) the truncation handling exists for. The offset is
+            # closed over rather than passed, because _tick is the base class's
+            # cancel poll and its signature is fixed.
+            offset = done_frames
+            done_frames += n
+
+            def tick(i, _n, _off=offset, _gt=grand_total):
+                if self._cancel:
+                    raise _Cancelled
+                self.progress.emit(min(_off + int(i), _gt), _gt)
+
+            # ONLY the channel being detected on. The commit used to compute all
+            # four regardless, and the other three were pure waste -- nothing
+            # downstream reads them, since detect_channel_region takes a single
+            # channel_attr. On the detection default (``change``) this skips the
+            # flow solve, the appearance residual and the min-eigen.
+            cd = live_channel_source(
+                video_path, cfg, reps, start=start, n=n, width=w, height=h,
+                fps=fps, frame_count=fc, channels=[params["channel_attr"]],
+                progress=tick)
+            got = int(cd.n_frames)
+            # A decode that ended early yields a SHORT span, not a padded one, so
+            # the detector below runs over less video than was asked for and
+            # every "no detection here" past the cut point is unexamined rather
+            # than examined-and-clear. The result object carries no notion of
+            # coverage, so the shortfall is recorded for the done handler --
+            # silently returning a partial pass as a whole one is the exact false
+            # negative the truncation trim exists to prevent, and trimming
+            # without reporting only moves where it hides.
+            if cd.meta.get("truncated"):
+                self.short = (int(start + got), int(seg.stop))
+            if got < 2:
+                continue
+            if self._cancel:
+                raise _Cancelled
+            res = detect_channel_region(
+                cd, region_index, params["channel_attr"],
+                freqs=freqs, freq_band_hz=params["freq_band_hz"],
+                value_band=params["value_band"],
+                count_band=params["count_band"],
+                detect_window=params["detect_window"],
+                centered=params["centered"])
+            # Trim exactly the padding that was added, so what is recorded as
+            # covered is [seg.start, seg.stop) and nothing else. At the clip's
+            # true ends the clamp above added none, and none is removed: those
+            # frames are edges of the DATA, where the transform is as trustworthy
+            # as it will ever be.
+            head = seg.start - start
+            tail = (start + got) - seg.stop
+            self.covered += max(0, got - max(0, head) - max(0, tail))
+            self.segment_done.emit(res, max(0, head), max(0, tail), k, total)
+            if self._cancel:
+                raise _Cancelled
+        self.done.emit(None)
 
 
 class _SweepWorker(_StreamWorker):
@@ -354,6 +516,28 @@ class LiveScalogramSurface(QWidget):
         # Progress-readout timing/context, set when each pass starts.
         self._proc_t0 = 0.0
         self._proc_ctx = ""
+        self._proc_strategy = DEFAULT_STRATEGY
+        # Segment write outcomes for the running commit; see _on_segment_done.
+        self._proc_wrote = 0
+        self._proc_refused = 0
+        # How the whole-video pass covers the clip (the ⚙ beside Process). Kept
+        # in the tuning sidecar with the rest of the strip: it is a decision
+        # about this clip, and re-picking "binary splits at 10%" on every reopen
+        # is exactly the kind of re-placement that store exists to prevent.
+        self._process_settings = {
+            "strategy": DEFAULT_STRATEGY, "chunk_s": DEFAULT_CHUNK_S,
+            "budget": DEFAULT_BUDGET, "skip_covered": True}
+        self._process_settings.update(self._saved.get("process") or {})
+        # Frames per second the last live pass actually achieved on THIS footage
+        # and machine, or None. The process dialog projects wall time from it and
+        # says so; with nothing measured it declines to estimate rather than
+        # quoting a constant, which on an hours-long decision would read as a
+        # measurement and be believed.
+        self._measured_rate: float | None = None
+        # (start, n, focus) of the preview currently being decoded, or None.
+        # Lets a click's release skip re-decoding the window its press already
+        # started -- see _load_preview_at.
+        self._preview_key: tuple[int, int, int] | None = None
 
         # Timed passes, feeding the downsample dialog's cost model. Keyed by
         # (scale, block) because the two are not interchangeable costs: a pass at
@@ -377,6 +561,12 @@ class LiveScalogramSurface(QWidget):
         # The dialog's render strip. Its own decoder handle, so it does not
         # contend with the passes above and is not tracked by _Busy.
         self._render_worker: _RenderWorker | None = None
+        # A bounded decode loading the window at a seek made while paused; see
+        # _load_preview_at. Its own decoder handle (like the render strip's), so
+        # it is not tracked by _Busy -- but it IS cancelled the moment any pass
+        # that owns the shared decoder starts, since it would otherwise draw a
+        # stale span over one.
+        self._preview_worker: _PreviewWorker | None = None
         self._dlg = None
 
         # -- the continuous pass (todo.md Batch Q) ---------------------------
@@ -402,6 +592,9 @@ class LiveScalogramSurface(QWidget):
         self._stream_token = 0
         self._stream_plan_obj = None
         self._stream_meta: dict | None = None
+        # Channels the RUNNING pass computes; see _channels_wanted. Empty while
+        # nothing runs, which is why every reader guards on _stream_worker first.
+        self._stream_want: frozenset = frozenset()
         # Where a live pass should resume after a seek stopped it. Consumed by
         # _on_stream_cancelled; None means the stop was a real stop.
         self._restart_stream_at: int | None = None
@@ -420,8 +613,25 @@ class LiveScalogramSurface(QWidget):
         # than on the first pass so the strip is a working seeker the moment the
         # tab opens, and so a stamp change never has to reconcile "no track yet"
         # with "a track under other settings".
-        self._track = WholeVideoTrack(n_frames=self.frame_count, fps=self.fps)
-        self._track_grid = None          # (dy, dx, gy, gx) for the clump pass
+        # Restored from the sidecar when there is one for THIS clip at this
+        # length and rate. A whole-video pass is minutes of decode; keeping it
+        # only in memory meant a tab switch or a replicate edit threw it away.
+        # Anything restored under settings no longer in force comes back marked
+        # stale rather than current -- see gui/track_store.
+        self._track, self._track_note = load_track(
+            video_path, self.frame_count, self.fps)
+        if self._track is None:
+            self._track = WholeVideoTrack(n_frames=self.frame_count,
+                                          fps=self.fps)
+        self._track_grid = self._track.region_grid
+        # One write per burst of detection windows, not one per window: a live
+        # pass lands a window every ~2 s and the payload can be tens of MB.
+        # Long, because nothing waits on it and the terminal saves (hide, close,
+        # commit done) are unconditional.
+        self._track_save_debounce = QTimer(self)
+        self._track_save_debounce.setSingleShot(True)
+        self._track_save_debounce.setInterval(5000)
+        self._track_save_debounce.timeout.connect(self._save_track)
         # Coalesces value-band drags. Unlike the count band, a value-band change
         # re-runs the per-frame connected-components loop over every retained
         # row -- the one part of a re-tune that is not free at clip length.
@@ -490,8 +700,18 @@ class LiveScalogramSurface(QWidget):
         self.navigator.set_span(self.frame_count, self.fps)
         self.navigator.focus_requested.connect(self._focus_frame)
         self.navigator.scrubbed.connect(self._on_scrubbed)
+        self.navigator.pressed.connect(self._on_strip_pressed)
         self.navigator.seek_committed.connect(self._on_seek_committed)
         root.addWidget(self.navigator)
+        # A restored track is put on the strip immediately, before anything runs.
+        # That IS the feature: the clip opens showing the coverage and detections
+        # an earlier session paid for, rather than an empty bar that has to be
+        # re-earned. The note says so out loud -- coverage appearing with no pass
+        # having run would otherwise look like a bug.
+        if self._track.covered.any():
+            self._repaint_track()
+        if self._track_note:
+            self.status_lbl.setText(self._track_note)
         # Nothing runs on show. The old windowed extract auto-fired here because
         # it was bounded -- seconds, then done. A live pass runs to the end of
         # the clip and holds the decoder, so starting one just because a tab
@@ -584,6 +804,26 @@ class LiveScalogramSurface(QWidget):
         row.addWidget(self.block_spin)
         self._sync_block_auto_text()
 
+        # Opt back in to computing every channel. OFF by default, and the default
+        # is the point: with it on, a pass computes appearance and tensor_speed
+        # -- the two that force the flow solve -- on every frame regardless of
+        # what is being read, which measured 76 fps against 349 fps for the same
+        # footage computing only what was selected.
+        self.all_chan_chk = QCheckBox("All channels")
+        self.all_chan_chk.setToolTip(
+            "Compute every channel each pass instead of only the one you are "
+            "detecting on.\n\n"
+            "Off (default): the pass computes the selected channel, and "
+            "switching channels replans it — one restart.\n"
+            "On: all four stay filled so their density heatmaps can be compared "
+            "side by side, and a channel switch is instant.\n\n"
+            "Measured cost of On, at block 4 / scale 1.0: 76 fps against 349. "
+            "appearance and tensor_speed each force all six structure-tensor "
+            "components, six full-resolution blurs and the per-pixel flow solve; "
+            "change alone needs one component and one blur.")
+        self.all_chan_chk.toggled.connect(self._on_all_channels_toggled)
+        row.addWidget(self.all_chan_chk)
+
         row.addWidget(QLabel("Normalize"))
         self.norm_combo = QComboBox()
         self.norm_combo.addItems(["off", "zscore", "clahe"])
@@ -620,6 +860,7 @@ class LiveScalogramSurface(QWidget):
         # schedule a write of what it just read.
         for sig in (self.start_slider.valueChanged, self.len_spin.valueChanged,
                     self.ds_spin.valueChanged, self.block_spin.valueChanged,
+                    self.all_chan_chk.toggled,
                     self.norm_combo.currentTextChanged):
             sig.connect(lambda *_: self._save_debounce.start())
 
@@ -659,6 +900,19 @@ class LiveScalogramSurface(QWidget):
             "flow, no cache) and navigate the detections below.")
         self.process_btn.clicked.connect(self._on_process_clicked)
         row.addWidget(self.process_btn)
+        # The gear sits on the Process button's own edge, not out with the
+        # knobs: it configures that action and nothing else, and the strip's
+        # left-hand run is about how a frame is measured rather than which
+        # frames get measured at all.
+        self.process_cfg_btn = QPushButton("⚙")
+        self.process_cfg_btn.setFixedWidth(28)
+        self.process_cfg_btn.setToolTip(
+            "How to process the video: continuously from the start, from here "
+            "on, only the gaps, or a spread sample of the whole clip that "
+            "refines as it runs (binary splits). Shows what each plan will and "
+            "will not examine before you commit to it.")
+        self.process_cfg_btn.clicked.connect(self._open_process_dialog)
+        row.addWidget(self.process_cfg_btn)
         outer.addLayout(row)
 
         self._sync_window_label()
@@ -685,6 +939,22 @@ class LiveScalogramSurface(QWidget):
         spin = self.sender()
         if spin is not None and spin.hasFocus():
             self.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _on_all_channels_toggled(self, _checked: bool):
+        """Immediate, not debounced: this is a single click with one meaning, and
+        the whole point of it is that the user is deciding what the pass spends
+        its time on. Making them wait 500 ms to find out would hide the very
+        thing the control exists to expose."""
+        self._save_debounce.start()
+        if self._stream_worker is None:
+            self.status_lbl.setText(
+                f"next pass will compute "
+                f"{', '.join(sorted(self._channels_wanted()))}")
+            return
+        if self._channels_wanted() != self._stream_want:
+            self.restart_stream(
+                f"restarting to compute "
+                f"{', '.join(sorted(self._channels_wanted()))}…")
 
     def _on_window_changed(self, *_):
         self._sync_window_label()
@@ -726,6 +996,7 @@ class LiveScalogramSurface(QWidget):
                 "length_s": float(self.len_spin.value()),
                 "downsample": float(self.ds_spin.value()),
                 "block": int(self.block_spin.value()),
+                "all_channels": bool(self.all_chan_chk.isChecked()),
                 "normalize": self.norm_combo.currentText()}
 
     def _apply_strip(self, values: dict) -> None:
@@ -741,7 +1012,7 @@ class LiveScalogramSurface(QWidget):
         file on disk and may not have been written by this version.
         """
         widgets = (self.start_slider, self.len_spin, self.ds_spin,
-                   self.block_spin, self.norm_combo)
+                   self.block_spin, self.all_chan_chk, self.norm_combo)
         for w in widgets:
             w.blockSignals(True)
         try:
@@ -753,6 +1024,8 @@ class LiveScalogramSurface(QWidget):
                 self.ds_spin.setValue(float(values["downsample"]))
             if "block" in values:
                 self.block_spin.setValue(int(values["block"]))
+            if "all_channels" in values:
+                self.all_chan_chk.setChecked(bool(values["all_channels"]))
             norm = values.get("normalize")
             if norm is not None and self.norm_combo.findText(str(norm)) >= 0:
                 self.norm_combo.setCurrentText(str(norm))
@@ -793,6 +1066,7 @@ class LiveScalogramSurface(QWidget):
             region = self._pending_region
         save_tuning(self.video_path, {"strip": self._strip_values(),
                                       "view": self._saved_view,
+                                      "process": self._process_settings,
                                       "region_index": region})
 
     # -- config assembly -----------------------------------------------------
@@ -916,8 +1190,12 @@ class LiveScalogramSurface(QWidget):
         # n=None: forward to the end of the clip. A live pass has no window --
         # that is the point of it -- and the ring, not
         # the plan, is what bounds memory.
+        #
+        # ``want`` is the selection, not every channel: see _channels_wanted for
+        # the measured 4.6x this is worth. It also shrinks the ring's per-frame
+        # footprint proportionally, so the same budget holds more seconds.
         plan = plan_channel_stream(meta, start=start, n=None,
-                                   want=frozenset(LIVE_CHANNELS))
+                                   want=self._channels_wanted())
         capacity = capacity_for_budget(self._ring_budget, len(plan.want),
                                        plan.ny, plan.nx)
         return meta, plan, capacity
@@ -926,6 +1204,10 @@ class LiveScalogramSurface(QWidget):
         if (self._proc_worker is not None or self._sweep_worker is not None
                 or self._stream_worker is not None):
             return                          # another pass owns the decoder
+        # A preview loading from an earlier paused seek would otherwise land its
+        # static span while this pass runs; drop it now (its done handler guards
+        # too, but freeing its decoder immediately is cleaner).
+        self._stop_preview()
         self._debounce.stop()
         self._block_debounce.stop()
         start = int(self.start_slider.value())
@@ -941,6 +1223,10 @@ class LiveScalogramSurface(QWidget):
             self._pending_state = self._explorer.capture_view_state()
         self._stream_meta = meta
         self._stream_plan_obj = plan
+        # The channel set this pass is FIXED on. Read back by _request_live_window
+        # and by the replan check in _on_retune_settled, both of which have to
+        # compare against what is running rather than against the current knobs.
+        self._stream_want = frozenset(plan.want)
         self._stream_token += 1
         self._live_window = None
         self._stream_truncated = False
@@ -990,6 +1276,51 @@ class LiveScalogramSurface(QWidget):
             # stream worker, so arming it without one would tick against None.
             self._detect_timer.start()
 
+    # -- what a live pass actually computes -----------------------------------
+    def _selected_channel_attr(self) -> str:
+        """The channel the detector is tuned on, resolvable BEFORE an explorer
+        exists.
+
+        The first pass of a session has to plan its channel set with no explorer
+        to ask, so the remembered view state is consulted as the fallback --
+        which is also the right answer, since ``_swap_explorer`` is about to
+        apply that same state. Anything unrecognised falls back to
+        ``_ALWAYS_STREAM``, which the pass carries regardless.
+        """
+        if self._explorer is not None:
+            return str(self._explorer.detection_params()["channel_attr"])
+        view = self._pending_state or self._saved_view or {}
+        entry = _DISPLAY_CHANNELS.get(view.get("channel"))
+        return entry[0] if entry else _ALWAYS_STREAM
+
+    def _channels_wanted(self) -> frozenset:
+        """Which channels the next live pass should compute.
+
+        **This is the live surface's single biggest cost knob.** Measured on
+        rep3_intermittent_crop at block 4, scale 1.0 (462x456 crop, 113x115
+        grid), frames per second through ``stream_channel_planes``:
+
+            all four (change+appearance+tensor_speed+intensity)    76 fps
+            change + intensity                                    349 fps
+            change alone                                          435 fps
+            tensor_speed + intensity                               93 fps
+
+        The cliff is ``need_flow``. ``appearance`` and ``tensor_speed`` are both
+        in ``_NEEDS_FLOW``, so wanting either forces all six tensor components,
+        six full-resolution Gaussian blurs and the per-pixel LK solve -- and the
+        pass then pays for them on every frame whether or not anything on screen
+        reads them. Wanting only ``change`` needs one component and one blur.
+
+        So the default is to compute the SELECTED channel and nothing else. The
+        cost of that is a replanned pass when the selection changes; the cost of
+        the alternative is 4.6x on every frame of every pass, to make a toggle
+        that happens a few times a session instant. ``all_chan_chk`` buys the
+        old behaviour back for side-by-side comparison, priced in its tooltip.
+        """
+        if self.all_chan_chk.isChecked():
+            return frozenset(LIVE_CHANNELS)
+        return frozenset({_ALWAYS_STREAM, self._selected_channel_attr()})
+
     def _request_live_window(self):
         """Ask for the trailing window the scalogram is recomputed over.
 
@@ -1005,7 +1336,11 @@ class LiveScalogramSurface(QWidget):
         # actually asked for, rather than against the knob's value now -- the two
         # differ if the knob moved while the request was in flight.
         self._live_request_n = n
-        self._stream_worker.request_latest(n, sorted(LIVE_CHANNELS),
+        # What the RUNNING pass computes, not what the knobs now say: the plan is
+        # fixed at start_stream, and asking a buffer for a channel it was not
+        # built to hold raises KeyError on the worker thread (StreamBuffer.latest).
+        # The two differ for exactly as long as a pending replan takes to land.
+        self._stream_worker.request_latest(n, sorted(self._stream_want),
                                            self._stream_token)
 
     def _on_advanced(self, start: int, frontier: int, rate: float):
@@ -1022,6 +1357,11 @@ class LiveScalogramSurface(QWidget):
         """
         if self._stream_worker is None or self._stream_worker.is_cancelled():
             return          # keep the "stopping…" note
+        if rate > 0:
+            # The one honest throughput number this surface has: measured on this
+            # machine, this footage, and these knobs. The process dialog projects
+            # a wall time from it rather than from a constant.
+            self._measured_rate = float(rate)
         plan = self._stream_plan_obj
         ratio = rate / max(self.fps, 1e-6)
         behind = " — behind playback" if rate > 0 and ratio < 1.0 else ""
@@ -1096,7 +1436,15 @@ class LiveScalogramSurface(QWidget):
             self.status_lbl.setText("live pass moved — restarting here")
             self.start_stream()
             return
-        self.status_lbl.setText("live pass stopped")
+        # A stop leaves the window start where the pass BEGAN, so the next Play
+        # would throw away everything just watched and jump back to the last
+        # click -- the playhead visibly snapping backwards. Park the window at
+        # the playhead instead, so Play resumes from where it stopped. Only on a
+        # real stop: a restart already carries its own position.
+        self._park_window_at_playhead()
+        self.status_lbl.setText(
+            f"live pass stopped at "
+            f"{self.start_slider.value() / self.fps:.2f} s")
 
     def _end_stream(self):
         """One place the three terminal signals converge, so the timer cannot
@@ -1193,6 +1541,19 @@ class LiveScalogramSurface(QWidget):
         has to be visible. Threshold moves take the other branch and say
         nothing, because nothing was lost -- they re-derived.
         """
+        # A channel switch changes what the PASS has to compute, not just what
+        # is stamped -- and the running pass was planned against the old set, so
+        # its ring holds no rows for the newly-selected channel and never will.
+        # Replan before anything else: without it the selection silently reverts
+        # to whatever the pass carries, which is the "control that does nothing"
+        # failure this surface keeps designing against.
+        if (self._stream_worker is not None
+                and self._channels_wanted() != self._stream_want):
+            self._sync_track(repaint=True)
+            self.restart_stream(
+                f"detecting on {self._selected_channel_attr()} — restarting the "
+                f"pass to compute it…")
+            return
         moved = self._sync_track()
         if not moved:
             return
@@ -1205,6 +1566,22 @@ class LiveScalogramSurface(QWidget):
 
     def _repaint_track(self) -> None:
         self.navigator.set_track(self._track)
+
+    def _save_track(self) -> None:
+        """Write the detection track's sidecar, and SAY when something was lost.
+
+        Louder than ``_save_tuning``, which fails silently by design. The two
+        are not comparable: a lost tuning sidecar costs one re-drag, a lost
+        track costs the whole-video pass again. So a declined band power or a
+        failed write is reported -- but only when the strip is not already
+        carrying something more urgent, since this fires from a debounce and
+        must not overwrite a live progress readout.
+        """
+        self._track_save_debounce.stop()
+        wrote, note = save_track(self.video_path, self._track)
+        if note and self._stream_worker is None and self._proc_worker is None:
+            self.status_lbl.setText(note)
+        return wrote
 
     def _track_write(self, first: int, band_power, **trim) -> bool:
         """Write into the track, refusing a geometry that does not match.
@@ -1287,6 +1664,9 @@ class LiveScalogramSurface(QWidget):
             return
         self._detect_drops = 0
         self._repaint_track()
+        # Coverage grew, so the sidecar is now behind. Debounced: a live pass
+        # lands one of these every ~2 s and the payload can be tens of MB.
+        self._track_save_debounce.start()
 
     # -- the strip as the clip's seeker --------------------------------------
     def _on_scrubbed(self, frame: int):
@@ -1321,6 +1701,46 @@ class LiveScalogramSurface(QWidget):
         must not be silent either -- the plots still show the last span, so
         without the readout the strip looks broken rather than parked.
         """
+        if self._stream_worker is not None:
+            n = max(2, int(round(self.len_spin.value() * self.fps)))
+            start = int(np.clip(frame, 0, max(0, self.frame_count - n)))
+            self.start_slider.blockSignals(True)
+            self.start_slider.setValue(start)
+            self.start_slider.blockSignals(False)
+            self._sync_window_label()
+            self.navigator.set_cursor(frame)
+            self.restart_stream("live pass moving…")
+        else:
+            # Load the window here so the paused view shows THIS point, not
+            # wherever the last pass stopped. Play still commits the decoder;
+            # this preload does not run the clip. A plain click already fired
+            # this on press (see _on_strip_pressed); the preview-key guard in
+            # _load_preview_at makes this release a no-op unless the frame moved.
+            self._park_and_preview(frame)
+
+    def _on_strip_pressed(self, frame: int):
+        """Mouse-DOWN on the strip: jump there the instant it is pressed.
+
+        A click used to wait for the release before it began decoding, so the
+        view lagged the pointer by the whole press. Firing the paused preview on
+        press removes that wait. Only while paused: a running pass owns the
+        decoder and the release is what restarts it, so committing on press would
+        fire one restart at the grab point of every drag. During a pass, press
+        moves the cursor (via _on_scrubbed) and the release does the work.
+        """
+        if (self._stream_worker is not None or self._proc_worker is not None
+                or self._sweep_worker is not None):
+            return
+        self._park_and_preview(frame)
+
+    def _park_and_preview(self, frame: int):
+        """Park the window on ``frame`` and decode the view there, while paused.
+
+        The clicked frame is the window start (clamped near the clip's end), so
+        the cursor lands on it. Shared by the press-time jump and the release
+        commit; the preview-key guard downstream collapses the two into one
+        decode when the frame has not moved between them.
+        """
         n = max(2, int(round(self.len_spin.value() * self.fps)))
         start = int(np.clip(frame, 0, max(0, self.frame_count - n)))
         self.start_slider.blockSignals(True)
@@ -1328,12 +1748,32 @@ class LiveScalogramSurface(QWidget):
         self.start_slider.blockSignals(False)
         self._sync_window_label()
         self.navigator.set_cursor(frame)
-        if self._stream_worker is not None:
-            self.restart_stream("live pass moving…")
-        else:
-            self.status_lbl.setText(
-                f"parked at {start / self.fps:.2f} s · press Play ▶ to run "
-                f"from here")
+        self._load_preview_at(start, n, focus=int(frame))
+
+    def _park_window_at_playhead(self) -> None:
+        """Move the window start to where the playhead actually is.
+
+        The playhead advances with the pass while the start spin-box does not --
+        it is the position the pass was LAUNCHED from. Stopping without
+        reconciling the two leaves Play meaning "go back to the last click",
+        which is the yellow cursor jumping backwards on resume.
+
+        Silently (blockSignals): this reflects a move that already happened on
+        screen, and _on_window_changed would read it as a knob edit and print a
+        settings-changed status over the stop message.
+        """
+        if self._explorer is None:
+            return
+        n = max(2, int(round(self.len_spin.value() * self.fps)))
+        start = int(np.clip(self._explorer.absolute_frame(), 0,
+                            max(0, self.frame_count - n)))
+        self.start_slider.blockSignals(True)
+        self.start_slider.setValue(start)
+        self.start_slider.blockSignals(False)
+        self._sync_window_label()
+        # The cursor is deliberately NOT touched: it is already at the playhead,
+        # and near the end of the clip the clamp above pulls `start` back off it,
+        # which would drag the yellow bar backwards -- the thing this fixes.
 
     def _live_channel_data(self, win: dict) -> ChannelData:
         """Wrap a served trailing window as the ChannelData the explorer and the
@@ -1386,8 +1826,7 @@ class LiveScalogramSurface(QWidget):
         that is up to 500x slower and feeds none of them.
         """
         cd = self._live_channel_data(win)
-        if self._explorer is None:
-            self._swap_explorer(cd)
+        if self._put_on_screen(cd, live=not force):
             # Pinned to the MIDDLE of the served window, and it stays there: the
             # playhead is a fixed landmark with computed footage on both sides
             # of it, rather than a marker riding the ragged right edge. See
@@ -1403,13 +1842,131 @@ class LiveScalogramSurface(QWidget):
             # produces no drops to count. Stamping here closes it.
             self._arm_detection()
             return
-        self._explorer.set_channel_data(cd, live=not force)
         # The strip's cursor is driven by the explorer's frame_moved, which only
         # fires when the frame CHANGES. Under follow_center the centre index is
         # constant while the window slides, so the absolute frame moves without
         # the index moving -- and the strip would sit still through the whole
         # pass. Push it explicitly.
         self.navigator.set_cursor(self._explorer.absolute_frame())
+
+    def _put_on_screen(self, cd, *, live: bool) -> bool:
+        """Build the explorer on the first window, rebuild it when the grid
+        moved, or update it in place. Returns whether it was (re)built.
+
+        The grid moves when a Block/Downsample change replans the pass onto a
+        new geometry: ``set_channel_data`` refuses that outright, because the
+        explorer derives its regions, block snap and cube budget from the grid
+        at construction and cannot remap them in place. Routing BOTH the live
+        pass and the seek-while-paused preview through here is what guarantees
+        neither reaches ``set_channel_data`` with a grid the explorer was not
+        built for -- the crash this replaced was a restart at a new block
+        handing the old (8×8) explorer a (113×115) window it could not take.
+
+        A rebuild consumes ``_pending_state``, which the caller must have
+        captured off the outgoing explorer first (``start_stream`` does; the
+        preview does not need to, since it never changes the tuning).
+        """
+        ny, nx = map(int, cd.meta["grid"])
+        if self._explorer is None or (ny, nx) != (self._explorer.ny,
+                                                   self._explorer.nx):
+            self._swap_explorer(cd)
+            return True
+        self._explorer.set_channel_data(cd, live=live)
+        return False
+
+    # -- seek-while-paused preview -------------------------------------------
+    def _load_preview_at(self, start: int, n: int, focus: int) -> None:
+        """Decode and show the window at a seek made while paused.
+
+        The seeker parks the window start regardless; this fills the view with
+        the footage there, so a paused click on the timeline shows the clip at
+        that point instead of wherever the last pass stopped. Superseding, not
+        queued: dragging through several detections must not wait out a decode
+        per stop.
+
+        Only ever while the shared decoder is free. A live/commit/sweep pass
+        owns it, and starting a second decode of the same span under one would
+        waste it at best; the callers already take the pass branch in that case,
+        and this guards too so it cannot be reached otherwise.
+        """
+        if (self._stream_worker is not None or self._proc_worker is not None
+                or self._sweep_worker is not None):
+            return
+        # A click fires this twice -- once on press, once on release -- with
+        # identical args. Skip the release while the press's decode is still in
+        # flight so a click is one decode, not two (the second would cancel and
+        # restart the first, throwing away the head start the press bought).
+        key = (int(start), int(n), int(focus))
+        if key == self._preview_key and self._preview_worker is not None:
+            return
+        self._preview_key = key
+        self._stop_preview()
+        # Carry the tuning across a possible rebuild, as start_stream does: a
+        # Block change made while paused leaves the explorer on the old grid, so
+        # the preview's cfg can differ and _put_on_screen will rebuild. Capturing
+        # here is what keeps the bands from reverting to defaults on that rebuild.
+        if self._explorer is not None:
+            self._pending_state = self._explorer.capture_view_state()
+        self._preview_worker = _PreviewWorker(
+            self.video_path, self._build_cfg(), self.replicates, self._dims,
+            start, n, sorted(self._channels_wanted()), focus, self)
+        self._preview_worker.done.connect(self._on_preview_done)
+        self._preview_worker.failed.connect(self._on_preview_failed)
+        self._preview_worker.finished.connect(self._preview_worker.deleteLater)
+        self.status_lbl.setText(f"loading {focus / self.fps:.2f} s…")
+        self._preview_worker.start()
+
+    def _stop_preview(self, wait: bool = False) -> None:
+        """Drop the in-flight preview, if any. ``wait`` blocks it out on
+        teardown rather than leaving a thread decoding into a dead widget."""
+        w = self._preview_worker
+        if w is None:
+            return
+        w.cancel()
+        self._preview_worker = None
+        if wait:
+            w.wait()
+
+    def _on_preview_done(self, cd) -> None:
+        """A preview window decoded. Show it and land the cursor where clicked.
+
+        Identity check first, like ``_on_render_done``: a superseded worker
+        still runs to its next cancel point and still emits, and ``_stop_preview``
+        has already cleared the slot -- without this a fast second click is
+        overwritten by whichever decode finishes first.
+        """
+        if self.sender() is not self._preview_worker:
+            return
+        focus = int(self._preview_worker.focus)
+        self._preview_worker = None
+        # Play or a commit may have seized the decoder mid-decode. Its window is
+        # authoritative; drop this one rather than paint a static span over a
+        # running pass.
+        if self._stream_worker is not None or self._proc_worker is not None:
+            return
+        built = self._put_on_screen(cd, live=False)
+        # A static preview reads at the frame the user CLICKED, not half a window
+        # ahead of it: no pass is running ahead of the cursor, so follow_center's
+        # trailing offset would place the playhead where they did not click.
+        # hold_at clears any follow left by an earlier pass and lands there.
+        self._explorer.hold_at(focus)
+        self.navigator.set_cursor(self._explorer.absolute_frame())
+        if built:
+            # First explorer of the session: stamp the track so a later commit
+            # knows what it would be measured under. Idempotent when one already
+            # exists, and it never starts the detect timer here -- that gates on
+            # a running pass, and none is.
+            self._arm_detection()
+        trunc = " · decode ended early" if cd.meta.get("truncated") else ""
+        self.status_lbl.setText(
+            f"loaded {focus / self.fps:.2f} s{trunc} · press Play ▶ to run "
+            f"from here")
+
+    def _on_preview_failed(self, msg: str) -> None:
+        if self.sender() is not self._preview_worker:
+            return
+        self._preview_worker = None
+        self.status_lbl.setText(f"could not load this position: {msg}")
 
     def _cost_model(self) -> tuple[CostModel | None, int | None]:
         """Fit within one regime; returns ``(model, fixed block or None)``.
@@ -1635,6 +2192,7 @@ class LiveScalogramSurface(QWidget):
             return
         self._debounce.stop()               # an armed knob edit must not cut in
         self._block_debounce.stop()
+        self._stop_preview()                # the sweep needs the decoder to itself
         start, n = self._window()
         cfg = self._build_cfg()
         # Every row of this sweep runs under one block intent, so record it once
@@ -1729,7 +2287,8 @@ class LiveScalogramSurface(QWidget):
         old = self._explorer
         new = ScalogramExplorer.from_channel_data(
             cd, video_path=self.video_path, own_shortcuts=False,
-            own_status=False, parent=self._host)
+            own_status=False, on_demand_channels=LIVE_CHANNELS,
+            parent=self._host)
         self._host_lay.addWidget(new)
         self._explorer = new
         # The explorer no longer renders its own status line; mirror it into the
@@ -1766,10 +2325,68 @@ class LiveScalogramSurface(QWidget):
             old.deleteLater()
 
     # -- whole-video commit --------------------------------------------------
+    def _open_process_dialog(self):
+        """Configure the Process action. Never launches it -- see the dialog's
+        own note on why there is only one way to start an expensive pass."""
+        from gui.process_dialog import ProcessSettingsDialog
+        dlg = ProcessSettingsDialog(
+            n_frames=self.frame_count, fps=self.fps,
+            cursor=int(self.start_slider.value()),
+            gaps=self._track.gaps(), settings=self._process_settings,
+            rate_fps=self._measured_rate, parent=self)
+        try:
+            if dlg.exec():
+                self._process_settings = dlg.settings
+                self._save_debounce.start()
+                segments = self._plan_segments()
+                self.status_lbl.setText(
+                    f"Process ▶ will now run: "
+                    f"{coverage_note(self._process_settings['strategy'], segments, self.frame_count, self.fps)}")
+        finally:
+            dlg.deleteLater()
+
+    def _plan_segments(self) -> list:
+        """The spans the next Process press will cover, under the current plan.
+
+        The whole point is that skip_covered targets the UNEXAMINED space no
+        matter the strategy. Only CURRENT coverage counts as done: a stale frame
+        was examined under settings that no longer apply, so treating it as done
+        would leave the strip permanently gray with no way to refresh it. No
+        stamp means nothing has been examined AND ``current`` is unusable (its id
+        is UNCOVERED, which every unwritten frame also carries, so the mask reads
+        all-True), so coverage is off in that case regardless.
+        """
+        s = self._process_settings
+        strategy = s["strategy"]
+        skip = bool(s.get("skip_covered", True))
+        cov = (self._track.current
+               if skip and self._track.stamp is not None else None)
+        # The sampling strategies spend their budget on uncovered space INSIDE
+        # plan_segments (a post-hoc intersection would cancel the budget against
+        # work already done and could plan nothing). GAPS is already only what is
+        # left. So coverage is handed to the planner for those.
+        segments = plan_segments(
+            strategy, n_frames=self.frame_count, fps=self.fps,
+            cursor=int(self.start_slider.value()), chunk_s=s["chunk_s"],
+            budget=s["budget"], gaps=self._track.gaps(),
+            covered=cov if strategy in BUDGETED else None)
+        if cov is None or strategy in BUDGETED or strategy == GAPS:
+            return segments
+        # Continuous / from-here cover one solid span, so their skip is a plain
+        # subtraction of current coverage -- run it here, where the track lives,
+        # so a re-run continues into the gaps instead of redoing the front.
+        out = []
+        for seg in segments:
+            for a, b in _uncovered_runs(cov, seg.start, seg.stop):
+                if b - a >= 2:
+                    out.append(Segment(a, b))
+        return out
+
     def process_whole_video(self):
         if (self._proc_worker is not None or self._sweep_worker is not None
                 or self._stream_worker is not None):
             return                                  # a pass is already running
+        self._stop_preview()                        # free its decoder for the commit
         if self._explorer is None:
             self.status_lbl.setText(
                 "press Play ▶ and tune the detector first")
@@ -1778,24 +2395,69 @@ class LiveScalogramSurface(QWidget):
         if params["region_index"] < 0:
             self.status_lbl.setText("select a replicate before processing")
             return
+        # Stamp BEFORE the pass, not after: the worker's segments arrive one at a
+        # time and each is written on arrival, so the track has to already know
+        # what they were computed under. The old single-shot path could stamp in
+        # the done handler because there was exactly one write.
+        self._sync_track(repaint=False)
+        if self._track.stamp is None:
+            self.status_lbl.setText("select a replicate before processing")
+            return
+        segments = self._plan_segments()
+        if not segments:
+            self.status_lbl.setText(
+                "nothing to process under this plan — every span it would "
+                "cover is already examined under the current settings "
+                "(⚙ to change the plan)")
+            return
         cfg = self._build_cfg()
+        strategy = self._process_settings["strategy"]
+        coi = coi_trim(self._track.stamp.freq_band_hz, self.fps)
         self._set_busy(_Busy.PROCESS)
+        self._proc_wrote = self._proc_refused = 0
         flo, fhi = params["freq_band_hz"]
         self._proc_t0 = time.monotonic()
         self._proc_ctx = (f"{flo:.2f}–{fhi:.2f} Hz on {params['channel_attr']}")
+        self._proc_strategy = strategy
         self.status_lbl.setText(
-            f"processing whole video ({self.frame_count} frames) · "
-            f"{self._proc_ctx}… starting the one expensive pass")
+            f"processing · "
+            f"{coverage_note(strategy, segments, self.frame_count, self.fps)}"
+            f" · {self._proc_ctx}…")
         self._proc_worker = _ProcessWorker(
             self.video_path, cfg, self.replicates, self._dims,
-            params["region_index"], params, self)
+            params["region_index"], params, segments, coi=coi, parent=self)
         self._proc_worker.done.connect(self._on_processed)
+        self._proc_worker.segment_done.connect(self._on_segment_done)
         self._proc_worker.failed.connect(self._on_process_failed)
         self._proc_worker.cancelled.connect(self._on_process_cancelled)
         self._proc_worker.progress.connect(self._on_proc_progress)
         self._proc_worker.phase.connect(self._on_proc_phase)
         self._proc_worker.finished.connect(self._proc_worker.deleteLater)
         self._proc_worker.start()
+
+    def _on_segment_done(self, res, head: int, tail: int, k: int, total: int):
+        """One segment landed. Write it and repaint, mid-pass.
+
+        Written as it arrives rather than banked to the end: the strip filling
+        in while the pass runs is the point of a sampling plan, and a pass
+        stopped partway then keeps every segment it finished instead of
+        discarding the lot.
+        """
+        if self._proc_worker is None:
+            return
+        if not self._track_write(int(getattr(res, "window_start", 0)),
+                                 res.band_power, trim_head=head,
+                                 trim_tail=tail):
+            # Counted separately from the live path's _detect_drops, which is
+            # about a request racing a geometry change and resets itself. Here a
+            # refused write means the plan and the stamp disagree, which cannot
+            # fix itself mid-pass -- and mixing the two counters would let a
+            # stale live drop make a perfectly good commit report that nothing
+            # was recorded.
+            self._proc_refused += 1
+            return
+        self._proc_wrote += 1
+        self._repaint_track()
 
     def _on_proc_progress(self, done: int, total: int):
         if self._proc_worker is None or self._proc_worker.is_cancelled():
@@ -1812,58 +2474,85 @@ class LiveScalogramSurface(QWidget):
         self.status_lbl.setText(
             f"processing whole video · {phase} · {self._proc_ctx}…")
 
-    def _on_processed(self, res):
+    def _on_processed(self, _res):
+        """The plan ran out of segments. Every one of them was already written by
+        ``_on_segment_done``; this reports what the whole pass amounts to."""
         # Read before the worker reference is dropped.
         short = getattr(self._proc_worker, "short", None)
+        refused, wrote = self._proc_refused, self._proc_wrote
         self._proc_worker = None
         self._set_busy(None)
-        # Into the SAME accumulator the live pass fills, not a parallel result
-        # object: one data structure with one coverage mask, so a commit and the
-        # live passes around it compose instead of overwriting each other. The
-        # commit's band power spans the whole clip and its edges are the clip's
-        # own, so nothing is trimmed -- there is no arbitrary cut to protect
-        # against here.
-        self._sync_track(repaint=False)
-        wrote = self._track_write(int(getattr(res, "window_start", 0)),
-                                  res.band_power, trim=0)
-        self._repaint_track()
-        if not wrote:
-            # The pass succeeded but its geometry does not match what the strip
-            # is stamped with, so nothing was recorded. Said out loud: a commit
-            # that silently produced no coverage would look identical to a clip
-            # with no detections in it.
+        # Immediately, not debounced. This is the most expensive result the tool
+        # produces, and the window between "the pass finished" and "the pass is
+        # on disk" is exactly where a crash or a quit would cost the most.
+        self._save_track()
+        if refused and not wrote:
+            # The pass succeeded but its geometry did not match what the strip is
+            # stamped with, so nothing was recorded. Said out loud: a commit that
+            # silently produced no coverage would look identical to a clip with
+            # no detections in it.
             self.status_lbl.setText(
-                "whole-video pass finished but its block geometry does not "
-                "match the current selection — nothing was recorded; "
-                "restart the live pass and process again")
+                "the pass finished but its block geometry does not match the "
+                "current selection — nothing was recorded; restart the live "
+                "pass and process again")
             return
+        summary = self._pass_summary(short)
+        if refused:
+            # Some segments landed and some did not. Partial coverage presented
+            # as a finished plan is the one thing the strip must never imply.
+            summary += (f" · WARNING: {refused} of {refused + wrote} segments "
+                        f"were refused for a geometry mismatch and are NOT in "
+                        f"the coverage above")
+        self.status_lbl.setText(summary)
+
+    def _pass_summary(self, short=None) -> str:
+        """What the completed plan examined and what it did not.
+
+        The coverage fraction leads, and for a sampling plan it is the whole
+        point: a detection count is only interpretable against how much of the
+        clip was looked at, and this tool's standing rule is that "nobody looked
+        here" must never read as "nothing happened here".
+        """
         n = len(self._track.detected_intervals())
+        hits = f"{n} detection{'s' if n != 1 else ''}"
+        pct = 100.0 * self._track.coverage_fraction()
         if short is not None:
             # Never call this a whole-video pass. Past the cut point there is no
-            # evidence either way, and a detection count presented without that
-            # caveat reads as "this is what the video contains".
+            # evidence either way, and a count presented without that caveat
+            # reads as "this is what the video contains".
             covered, requested = short
-            self.status_lbl.setText(
-                f"PARTIAL pass · decode ended at frame {covered} of {requested} "
-                f"· {n} detection{'s' if n != 1 else ''} in the part that was "
-                f"read — the rest of the video was NOT examined")
-            return
-        self.status_lbl.setText(
-            f"whole-video pass done · {n} detection{'s' if n != 1 else ''} — "
-            f"click one (or step strongest) to verify in a window")
+            return (f"PARTIAL pass · a decode ended at frame {covered} of "
+                    f"{requested} · {hits} in what was read — the rest was "
+                    f"NOT examined")
+        if pct >= 99.5:
+            return (f"whole-video pass done · {hits} — click one (or step "
+                    f"strongest) to verify in a window")
+        return (f"pass done · {hits} across the {pct:.0f}% of the clip now "
+                f"examined · the remaining {100 - pct:.0f}% was NOT looked at "
+                f"— ⚙ Fill gaps to continue")
 
     def _on_process_failed(self, msg: str):
         self._proc_worker = None
         self._set_busy(None)
+        # Segments that landed before the failure are real and already written;
+        # keep them rather than losing an hour of decode to the last span.
+        self._save_track()
         self.status_lbl.setText(f"process failed: {msg}")
 
     def _on_process_cancelled(self):
-        """Stopped mid-commit: the navigator keeps whatever earlier result it
-        holds rather than being cleared by a pass that never finished."""
+        """Stopped mid-plan. Every segment that finished is KEPT -- that is the
+        reason the worker emits per segment rather than banking to the end, and
+        it is what makes a bisecting plan stoppable at any point instead of
+        all-or-nothing."""
         self._proc_worker = None
         self._set_busy(None)
+        self._save_track()
+        pct = 100.0 * self._track.coverage_fraction()
+        n = len(self._track.detected_intervals())
         self.status_lbl.setText(
-            "whole-video pass stopped — settings are free to change")
+            f"pass stopped · the {pct:.0f}% examined so far is kept "
+            f"({n} detection{'s' if n != 1 else ''}) · settings are free to "
+            f"change")
 
     @staticmethod
     def _eta(done: int, total: int, t0: float) -> str:
@@ -1903,9 +2592,10 @@ class LiveScalogramSurface(QWidget):
             self.restart_stream(f"moving to the detection at "
                                 f"{center / self.fps:.2f} s…")
         else:
-            self.status_lbl.setText(
-                f"detection at {center / self.fps:.2f} s · press Play ▶ to "
-                f"run from here")
+            # Load the window centred on the event so the paused view shows it
+            # for verification, rather than only parking the slider. The window
+            # starts half a length before the event, so the cursor lands on it.
+            self._load_preview_at(start, n, focus=int(center))
 
     def toggle_playback(self):
         """Space handler the main window's focus-walk finds.
@@ -1921,12 +2611,18 @@ class LiveScalogramSurface(QWidget):
         # close, and the app can be quit from any tab. Cheap enough (one small
         # JSON write) to take unconditionally rather than track dirtiness.
         self._save_tuning()
+        # The track is NOT cheap, but it is the thing worth keeping: hiding the
+        # tab stops the pass below, so whatever it had accumulated would
+        # otherwise be the last thing this session ever knew about it.
+        self._save_track()
         # Disarm before stopping. A knob or seek that armed a restart moments
         # ago is still pending, and _on_stream_cancelled consumes that flag
         # WITHOUT checking visibility -- so the stop below would unwind the
         # worker and immediately start another full-clip pass on a tab nobody
         # is looking at, which is the exact thing the stop exists to prevent.
         self._restart_stream_at = None
+        # A preview decoding into this tab has nothing to show once it is hidden.
+        self._stop_preview()
         # A live pass runs to the END OF THE CLIP: left running on a hidden tab
         # it holds the decoder and a full ring for minutes, and blocks the
         # whole-video commit when the user comes back. Stopped rather than
@@ -1940,23 +2636,29 @@ class LiveScalogramSurface(QWidget):
         # replicate edit that rebuilds the surface) is the most common way a
         # session ends, and an armed debounce would be dropped with the widget.
         self._save_tuning()
+        # A replicate edit rebuilds this surface outright, which is the single
+        # most likely way an accumulated track gets discarded without anyone
+        # meaning to. The next surface reads it back from the sidecar.
+        self._save_track()
         self._restart_stream_at = None
         # A knob edited just before the close leaves a debounce armed; let it fire
         # and it restarts a pass on a surface that is on its way out.
         self._debounce.stop()
         self._block_debounce.stop()
         self._retune_debounce.stop()
+        self._track_save_debounce.stop()     # already flushed by _save_track above
         self._detect_timer.stop()
         # Before the workers: this one parks requests on the stream worker, and a
         # tick between the cancel and the wait would touch a thread on its way out.
         self._stream_timer.stop()
-        for w in (self._proc_worker, self._sweep_worker,
-                  self._render_worker, self._stream_worker):
+        for w in (self._proc_worker, self._sweep_worker, self._render_worker,
+                  self._stream_worker, self._preview_worker):
             if w is not None:
                 w.cancel()      # unwind at the next tick instead of waiting it out
                 w.wait()
         self._proc_worker = self._sweep_worker = None
         self._render_worker = self._stream_worker = None
+        self._preview_worker = None
         if self._explorer is not None:
             self._explorer.close()
         super().closeEvent(e)

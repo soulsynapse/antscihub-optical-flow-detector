@@ -80,7 +80,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (QDialog, QDoubleSpinBox, QFormLayout, QFrame,
-                             QGridLayout, QHBoxLayout, QLabel, QPushButton,
+                             QHBoxLayout, QLabel, QPushButton,
                              QScrollArea, QSpinBox, QVBoxLayout, QWidget)
 
 from core.config import FlowConfig

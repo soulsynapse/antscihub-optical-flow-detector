@@ -1,10 +1,9 @@
 """Shared application state.
 
-One object owns the video, the config, the open cache, the filter state, the ROI
-list and the behavior library. The three tabs talk to each other only through its
-signals -- no tab holds a reference to another tab. That is what keeps "expand the
-cache in Preprocessing & Flow and refresh downstream" from turning into a web of
-cross-tab calls.
+One object owns the video, the config, the open cache and the ROI/replicate
+list. Tabs talk to each other only through its signals -- no tab holds a
+reference to another tab. That is what keeps "expand the cache in Preprocessing
+& Flow and refresh downstream" from turning into a web of cross-tab calls.
 """
 from __future__ import annotations
 
@@ -14,11 +13,9 @@ import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from core import cache as cache_mod
-from core.behavior import Behavior, BehaviorLibrary
 from core.config import PipelineConfig
 from core.features import FeatureContext
-from core.filters import FeatureSampler, FilterState
-from core.roi import ROI, ROIParams
+from core.roi import ROI
 from core.video import VideoSource
 
 # Width at which frames are decoded down for display. See display_frame().
@@ -28,9 +25,7 @@ DISPLAY_MAX_W = 1280
 class AppState(QObject):
     video_loaded = pyqtSignal()
     cache_opened = pyqtSignal()
-    filter_changed = pyqtSignal()
     rois_changed = pyqtSignal()
-    behaviors_changed = pyqtSignal()
     frame_changed = pyqtSignal(int)
     status = pyqtSignal(str)
     request_tab = pyqtSignal(int)
@@ -48,23 +43,12 @@ class AppState(QObject):
         self.cfg = PipelineConfig()
         self.cache = None
         self.ctx: FeatureContext | None = None
-        self.sampler: FeatureSampler | None = None
 
-        self.filter = FilterState()
-        self.roi_params = ROIParams()
         self.rois: list[ROI] = []
         # Geometry-only replicate specs are shared so Preprocessing & Flow can run
         # ROI-first cache before any cache-backed ROI objects exist.
         self.replicate_specs: list[dict] = []
         self.selected_roi: int | None = None
-
-        self.library = BehaviorLibrary(os.path.join(project_dir, "behaviors"))
-        self.behaviors: list[Behavior] = []
-        self.selected_behavior: str | None = None
-        # (roi_id, behavior_name) -> cleaned boolean trace
-        self.traces: dict[tuple[int, str], np.ndarray] = {}
-        # (roi_id, behavior_name) -> per-frame strength (fraction of blocks), 0..1
-        self.strengths: dict[tuple[int, str], np.ndarray] = {}
 
         self.current_frame = 0
         # Keep the most recently decoded source frame as well as its cheap
@@ -76,8 +60,6 @@ class AppState(QObject):
         self._disp_idx: int = -1
         # (roi_id, feature) -> full-length mean time series over the ROI's blocks.
         self._ts_cache: dict[tuple[int, str], np.ndarray] = {}
-        # (roi_id, feature) -> per-block value matrix (T, k) over the ROI.
-        self._block_cache: dict[tuple[int, str], np.ndarray] = {}
 
     # How band power is aggregated over a replicate box: "max" preserves a
     # small, localized oscillation (a wing occupying a few blocks in a big box);
@@ -112,21 +94,8 @@ class AppState(QObject):
             self._ts_cache[key] = hit
         return hit
 
-    def roi_blocks(self, roi, feature: str) -> np.ndarray:
-        """Memoized per-block value matrix (T, k) for a box+feature. This is what
-        the range editor plots and what detection thresholds -- one source, so the
-        plot and the ethogram cannot disagree."""
-        from core.roi import roi_block_values
-        key = (roi.roi_id, feature)
-        hit = self._block_cache.get(key)
-        if hit is None:
-            hit = roi_block_values(self.cache, self.ctx, roi, feature)
-            self._block_cache[key] = hit
-        return hit
-
     def invalidate_series(self) -> None:
         self._ts_cache.clear()
-        self._block_cache.clear()
 
     # -- video ---------------------------------------------------------------
 
@@ -149,7 +118,6 @@ class AppState(QObject):
             self.cache.close()
         self.cache = None
         self.ctx = None
-        self.sampler = None
 
         # ROIs and manual marks are scoped to a specific video (they live in
         # sidecar files next to it, see video_sidecar). Switching videos must
@@ -159,8 +127,6 @@ class AppState(QObject):
         self.rois = []
         self.replicate_specs = []
         self.selected_roi = None
-        self.traces = {}
-        self.strengths = {}
         self.invalidate_series()
 
         # Propose a band the footage can actually resolve. A 15-30 Hz default on
@@ -214,10 +180,7 @@ class AppState(QObject):
                 self.cache.close()
                 self.cache = None
                 self.ctx = None
-                self.sampler = None
                 self.rois = []
-                self.traces = {}
-                self.strengths = {}
                 self.invalidate_series()
                 self.status.emit(
                     "Replicate geometry changed; run Test/Full again to build "
@@ -250,7 +213,6 @@ class AppState(QObject):
             self.cache.close()
         self.cache = None
         self.ctx = None
-        self.sampler = None
         cache = cache_mod.open_cache(self.cache_root, key)
         try:
             if cache.meta.get("processing_scope") == "replicate":
@@ -288,16 +250,11 @@ class AppState(QObject):
             raise
         self.cache = cache
         self.ctx = ctx
-        self.sampler = FeatureSampler(self.cache, self.ctx)
 
         self.rois = []
-        self.traces = {}
         self.selected_roi = None
         self.current_frame = 0
         self._ts_cache.clear()
-        # Filter ranges are keyed by feature name; a band from a previously opened
-        # cache would reference a feature this cache does not have. Drop them.
-        self.filter.ranges.clear()
 
         self.cache_opened.emit()
         self.status.emit(
@@ -312,39 +269,6 @@ class AppState(QObject):
         if not self.cache:
             return []
         return [n for n in self.cache.feature_names if n.startswith("bandpower_")]
-
-    def available_features(self) -> list[str]:
-        """Everything the current cache can serve, cached or derived."""
-        from core.features import REGISTRY
-        from core.roi import roi_feature_available
-        if not self.cache:
-            return []
-        out = list(self.cache.feature_names)
-        available = set(out)
-
-        # Add derived features only when all of their cache-time dependencies are
-        # actually present. This keeps texture_percentile out of old caches that
-        # have no texture map, while ordinary u/v/speed derivatives remain free.
-        changed = True
-        while changed:
-            changed = False
-            for name, spec in REGISTRY.items():
-                if spec.kind != "derived" or name in available:
-                    continue
-                if all(dep in available for dep in spec.deps):
-                    out.append(name)
-                    available.add(name)
-                    changed = True
-
-        for name, spec in REGISTRY.items():
-            if spec.kind == "roi" and roi_feature_available(name, self.rois):
-                out.append(name)
-        seen, uniq = set(), []
-        for n in out:
-            if n not in seen:
-                seen.add(n)
-                uniq.append(n)
-        return uniq
 
     # -- frame ---------------------------------------------------------------
 
@@ -412,38 +336,6 @@ class AppState(QObject):
         if idx != self.current_frame:
             self.current_frame = idx
             self.frame_changed.emit(idx)
-
-    def time_s(self) -> float:
-        return self.current_frame / self.fps
-
-    # -- behaviors -----------------------------------------------------------
-
-    def reload_behaviors(self) -> None:
-        self.behaviors = self.library.load_all()
-        self.behaviors_changed.emit()
-
-    def recompute_traces(self) -> None:
-        """Evaluate every behavior against every replicate, per block.
-
-        Detection now runs over the blocks inside each box (min-clump / merge /
-        fraction spatial criteria), not just the box's aggregate series, so both
-        the binary trace and a per-frame strength (fraction of blocks passing)
-        are produced. Strength drives the graded ethogram.
-        """
-        from core.roi import roi_detection
-        if not self.has_cache:
-            return
-        self.traces = {}
-        self.strengths = {}
-        for b in self.behaviors:
-            for roi in self.rois:
-                try:
-                    detected, strength = roi_detection(self.cache, self.ctx, b, roi)
-                except (KeyError, ValueError):
-                    continue
-                self.traces[(roi.roi_id, b.name)] = detected
-                self.strengths[(roi.roi_id, b.name)] = strength
-        self.behaviors_changed.emit()
 
     def roi_by_id(self, roi_id: int) -> ROI | None:
         return next((r for r in self.rois if r.roi_id == roi_id), None)

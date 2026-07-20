@@ -180,6 +180,15 @@ class WholeVideoTrack:
     def current_id(self) -> int:
         return self._current_id
 
+    @property
+    def region_grid(self):
+        """The ``(dy, dx, gy, gx)`` the clump pass runs over, or None.
+
+        Exposed for the restore path: a track rebuilt from a sidecar carries one,
+        and its owner mirrors it. Everything else sets it through
+        :meth:`set_stamp`, which is why there is no setter here."""
+        return self._region_grid
+
     def set_stamp(self, stamp: TrackStamp, region_grid=None) -> bool:
         """Declare what subsequent writes are computed under.
 
@@ -391,6 +400,100 @@ class WholeVideoTrack:
         return [(int(s), int(e)) for s, e in
                 zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))]
 
+    # -- persistence ---------------------------------------------------------
+    #
+    # A whole-video pass is the expensive thing this surface does -- minutes of
+    # decode -- and until now its result lived only in this object, so hiding the
+    # tab, changing the block size, or reopening the clip threw it away and the
+    # only way back was to run it again. These two methods are the round trip;
+    # ``gui/track_store`` is the file layer over them.
+    #
+    # They deliberately live HERE rather than in the store, because every
+    # invariant they have to preserve is private to this class: which stamp id
+    # means which settings, that ``stamp_id`` is the sole authority on coverage,
+    # and that ``count``/``clump`` were computed under a specific value band. A
+    # store reaching in for those would have to be revised in step with every
+    # change here, and the failure mode of getting it wrong is a restored track
+    # that claims coverage it does not have.
+    def to_state(self) -> dict:
+        """Everything needed to reconstruct this track, as plain values.
+
+        Band power rides along when it is retained. It is by far the largest
+        piece and the only optional one: without it a restored track still
+        navigates, still gates, and still reports coverage honestly -- only a
+        *value band* re-tune needs a fresh pass, which is exactly the documented
+        ``retain_band_power=False`` degradation rather than a new failure mode.
+        """
+        stamps = sorted(self._stamps.items(), key=lambda kv: kv[1])
+        return {
+            "n_frames": int(self.n_frames),
+            "fps": float(self.fps),
+            "n_blocks": int(self.n_blocks),
+            "retain_band_power": bool(self.retain_band_power),
+            "count": self.count, "clump": self.clump,
+            "gate": self.gate, "stamp_id": self.stamp_id,
+            "stamps": [(_stamp_fields(s), int(i)) for s, i in stamps],
+            "current": None if self._current is None
+            else _stamp_fields(self._current),
+            "value_band": list(self._value_band),
+            "count_band": list(self._count_band),
+            "detect_window": int(self._detect_window),
+            "centered": bool(self._centered),
+            "region_grid": self._region_grid,
+            "band_power": self._bp,
+            "bp_valid": self._bp_valid,
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "WholeVideoTrack":
+        """Rebuild a track from :meth:`to_state`. Raises on anything malformed.
+
+        Raising rather than salvaging: a partially-restored track is the one
+        outcome worse than no restore at all, because the arrays it does carry
+        would be presented as examined footage. The caller catches and falls back
+        to an empty track, which is honest and costs a re-pass.
+        """
+        t = cls(n_frames=int(state["n_frames"]), fps=float(state["fps"]))
+        for name in ("count", "clump", "gate"):
+            arr = np.asarray(state[name], np.float32)
+            if arr.shape != (t.n_frames,):
+                raise ValueError(f"{name} is {arr.shape}, expected ({t.n_frames},)")
+            setattr(t, name, arr)
+        stamp_id = np.asarray(state["stamp_id"], np.int32)
+        if stamp_id.shape != (t.n_frames,):
+            raise ValueError(f"stamp_id is {stamp_id.shape}, "
+                             f"expected ({t.n_frames},)")
+        t.stamp_id = stamp_id
+        t._stamps = {TrackStamp(**f): int(i) for f, i in state["stamps"]}
+        cur = state.get("current")
+        t._current = None if cur is None else TrackStamp(**cur)
+        t._current_id = t._stamps.get(t._current, UNCOVERED)
+        t.n_blocks = int(state["n_blocks"])
+        t.retain_band_power = bool(state["retain_band_power"])
+        t._value_band = (float(state["value_band"][0]),
+                         float(state["value_band"][1]))
+        t._count_band = (float(state["count_band"][0]),
+                         float(state["count_band"][1]))
+        t._detect_window = max(1, int(state["detect_window"]))
+        t._centered = bool(state["centered"])
+        t._region_grid = state.get("region_grid")
+        bp = state.get("band_power")
+        if bp is not None:
+            bp = np.asarray(bp, np.float32)
+            valid = np.asarray(state["bp_valid"], bool)
+            # Both dimensions checked, and this is not paranoia: B moves with the
+            # block size and the region, so a sidecar written at block 64 and
+            # read at block 16 would otherwise hand `write` rows of the wrong
+            # width and raise from inside a Qt signal handler.
+            if bp.shape != (t.n_frames, t.n_blocks):
+                raise ValueError(f"band_power is {bp.shape}, expected "
+                                 f"({t.n_frames}, {t.n_blocks})")
+            if valid.shape != (t.n_frames,):
+                raise ValueError(f"bp_valid is {valid.shape}, "
+                                 f"expected ({t.n_frames},)")
+            t._bp, t._bp_valid = bp, valid
+        return t
+
     def gaps(self, a: int = 0, b: int | None = None) -> list[tuple[int, int]]:
         """Uncovered-or-stale spans within ``[a, b)`` -- what still needs a pass.
         The complement of :attr:`current`, in the form a scheduler wants."""
@@ -401,6 +504,26 @@ class WholeVideoTrack:
             return []
         return [(int(s + a), int(e + a))
                 for s, e in _runs(np.flatnonzero(~self.current[a:b]))]
+
+
+def _stamp_fields(stamp: TrackStamp) -> dict:
+    """A stamp as JSON-able plain values.
+
+    Hand-written rather than ``dataclasses.asdict``, which would leave the
+    tuples as tuples: JSON turns those into lists on the way out and cannot turn
+    them back, so the round trip would only work by accident of
+    ``__post_init__`` re-normalizing them. Being explicit here means the store
+    never has to know which fields are tuples.
+    """
+    return {"channel": str(stamp.channel),
+            "freq_band_hz": [float(stamp.freq_band_hz[0]),
+                             float(stamp.freq_band_hz[1])],
+            "grid": [int(stamp.grid[0]), int(stamp.grid[1])],
+            "region_index": int(stamp.region_index),
+            "region_blocks": int(stamp.region_blocks),
+            "downsample": float(stamp.downsample),
+            "block_size": None if stamp.block_size is None
+            else int(stamp.block_size)}
 
 
 def _runs(idx: np.ndarray) -> list[tuple[int, int]]:

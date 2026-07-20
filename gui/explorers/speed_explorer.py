@@ -219,8 +219,7 @@ class MiniPlot(QWidget):
     the plot's own Y units) whose rejected strips (outside the band) are shaded.
     The lines extend a few pixels past the plot's right edge into a handle
     margin so they read as pull handles, mirroring the sketch. Detection is
-    ``lo <= value <= hi`` -- the same
-    band primitive the real pipeline uses (:class:`core.behavior.RangeLeaf`).
+    ``lo <= value <= hi`` -- a simple inclusive band on the plotted value.
 
     A handle dragged to (or past) the plot's edge sets that side to +/-inf --
     "no limit on this side" -- and the readout shows an infinity sign. This is
@@ -282,6 +281,13 @@ class MiniPlot(QWidget):
         # being measured, not a change in the data.
         self._sticky = False
         self._sticky_range: tuple[float, float] | None = None
+        # Widen the drawn value range to always cover the band endpoints. For a
+        # per-window autoscaling threshold plot: when the window's own data max
+        # falls below the threshold, a plain 0..data_max axis stops reaching the
+        # band and the handle vanishes off the top -- so the one control you came
+        # to read leaves the plot exactly when the window goes quiet. Including
+        # the band keeps it anchored at its true value on every window.
+        self._include_band_in_range = False
         self.band_active = False
         self.band_lo: float | None = None
         self.band_hi: float | None = None
@@ -479,23 +485,48 @@ class MiniPlot(QWidget):
         self._bump_series_version()
         self._repaint_unless_collapsed()
 
+    def set_include_band_in_range(self, on: bool) -> None:
+        """Keep the drawn axis wide enough to show the band endpoints. See the
+        ``_include_band_in_range`` note; used by the windowed-count threshold plot
+        so its handle stays visible as the live window autoscales beneath it."""
+        if bool(on) == self._include_band_in_range:
+            return
+        self._include_band_in_range = bool(on)
+        self._bump_series_version()          # the drawn geometry depends on it
+        self._repaint_unless_collapsed()
+
+    def _widen_for_band(self, lo: float, hi: float) -> tuple[float, float]:
+        """Union the range with the finite band endpoints. Endpoints are ``None``
+        (unset) or +/-inf (a half-open threshold) when a side is unbounded, and
+        neither belongs on the axis -- only a placed, finite handle does."""
+        if not self._include_band_in_range:
+            return lo, hi
+        for edge in (self.band_lo, self.band_hi):
+            if edge is not None and np.isfinite(edge):
+                lo, hi = min(lo, float(edge)), max(hi, float(edge))
+        if hi <= lo:
+            hi = lo + 1.0
+        return lo, hi
+
     def _data_range(self) -> tuple[float, float]:
         """The drawn value bounds: the raw per-series range, or its running
-        union when sticky. Subclasses override :meth:`_raw_data_range`, so the
-        sticky layer applies to every plot kind without being reimplemented."""
+        union when sticky, widened to include the band when asked. Subclasses
+        override :meth:`_raw_data_range`, so the sticky layer applies to every
+        plot kind without being reimplemented."""
         lo, hi = self._raw_data_range()
         if not self._sticky:
-            return lo, hi
+            return self._widen_for_band(lo, hi)
         if self._is_empty():
             # An empty plot's raw range is the 0..1 placeholder, not a
             # measurement. Folding it in would permanently pull the accumulated
             # floor to 0 the first time a window arrives short.
-            return self._sticky_range if self._sticky_range else (lo, hi)
+            base = self._sticky_range if self._sticky_range else (lo, hi)
+            return self._widen_for_band(*base)
         if self._sticky_range is not None:
             slo, shi = self._sticky_range
             lo, hi = min(lo, slo), max(hi, shi)
         self._sticky_range = (lo, hi)
-        return self._sticky_range
+        return self._widen_for_band(lo, hi)
 
     def _raw_data_range(self) -> tuple[float, float]:
         if self._range_memo is not None:

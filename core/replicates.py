@@ -135,7 +135,6 @@ def build_layout(replicates: list[dict], src_width: int, src_height: int,
 
     pending = []
     for rep in sorted(replicates, key=lambda r: int(r["id"])):
-        rid = int(rep["id"])
         frac = tuple(float(v) for v in rep["frac"])
         x0, y0, x1, y1 = frac
         # Round both sides so adjacent fractional boxes share an integer edge
@@ -195,8 +194,6 @@ def in_tile_order(replicates: list[dict]) -> list[dict]:
     return sorted(replicates, key=lambda r: int(r.get("id", 0)))
 
 
-def tiles_from_meta(meta: dict) -> list[dict]:
-    return list(meta.get("replicate_tiles", []))
 
 
 def block_weight_plane(meta: dict) -> np.ndarray:

@@ -582,5 +582,62 @@ class StickyRangeTests(unittest.TestCase):
         self.assertEqual(pl._line_ys()[:2], before)
 
 
+class BandInRangeTest(unittest.TestCase):
+    """The windowed-count threshold plot autoscales to the current window (it is
+    NOT sticky), so a quiet window whose own max sits below the threshold would
+    leave the count band off the top of the axis -- the one control the plot
+    exists to read, gone exactly when the window goes silent. Including the band
+    in the drawn range keeps it anchored at its true value on every window."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_off_by_default_so_the_band_never_widens_the_axis(self):
+        pl = MiniPlot("x")
+        pl.set_band_active(True)
+        pl.band_lo, pl.band_hi = 0.0, 500.0
+        pl.set_series(np.array([0.0, 10.0], np.float32))
+        self.assertEqual(pl._data_range(), (0.0, 10.0))       # band ignored
+
+    def test_a_threshold_above_the_window_max_stays_on_the_axis(self):
+        pl = MiniPlot("x")
+        pl.set_include_band_in_range(True)
+        pl.set_band_active(True)
+        pl.band_lo, pl.band_hi = 50.0, float("inf")           # a lower threshold
+        pl.set_series(np.array([0.0, 10.0], np.float32))      # quiet window
+        lo, hi = pl._data_range()
+        self.assertEqual(lo, 0.0)
+        self.assertGreaterEqual(hi, 50.0)                     # reaches the band
+
+    def test_infinite_and_unset_endpoints_do_not_touch_the_range(self):
+        pl = MiniPlot("x")
+        pl.set_include_band_in_range(True)
+        pl.set_band_active(True)
+        pl.band_lo, pl.band_hi = float("-inf"), float("inf")  # both unbounded
+        pl.set_series(np.array([2.0, 8.0], np.float32))
+        self.assertEqual(pl._data_range(), (2.0, 8.0))
+        pl.band_lo, pl.band_hi = None, None                   # unset
+        self.assertEqual(pl._data_range(), (2.0, 8.0))
+
+    def test_the_handle_reads_its_true_value_when_the_window_drops_below_it(self):
+        """The re-anchor the design asks for. _line_ys clamps the band into the
+        drawn range, so a quiet window pins the handle to the top either way --
+        the difference is what the top MEANS. Without widening the axis top is the
+        window max (5), so the handle at the top misreports the threshold as 5;
+        widening makes the top the threshold itself, so the handle at the top
+        reads its true 40."""
+        pl = MiniPlot("x")
+        pl.resize(300, MiniPlot.BASE_H)
+        pl.set_include_band_in_range(True)
+        pl.set_band_active(True)
+        pl.band_lo, pl.band_hi = 40.0, float("inf")
+        pl.set_series(np.array([0.0, 5.0], np.float32))       # quiet window
+        ylo, _, r = pl._line_ys()
+        lo, hi = pl._data_range()
+        self.assertEqual(hi, 40.0)                            # axis reaches it
+        self.assertAlmostEqual(pl._val_of(ylo, r, lo, hi), 40.0, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()

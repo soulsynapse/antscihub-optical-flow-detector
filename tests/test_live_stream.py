@@ -22,9 +22,9 @@ os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
 import numpy as np
 from PyQt6.QtWidgets import QApplication
 
-from core.channel_source import ChannelData
+from core.channel_source import ChannelData, LIVE_CHANNELS
 from gui.explorers import live_scalogram_surface as lss
-from gui.explorers.live_scalogram_surface import _Busy, LiveScalogramSurface
+from gui.explorers.live_scalogram_surface import LiveScalogramSurface
 from gui.explorers.scalogram_explorer import ScalogramExplorer
 from tests.test_channel_source import _write_moving_square
 from tests.test_view_state import _channel_data
@@ -326,6 +326,48 @@ class SetChannelDataTests(_QtTestCase):
         self.assertEqual((ex.scalo_plot.band_lo, ex.scalo_plot.band_hi), (1.0, 5.0))
 
 
+class HostedPlaybackTests(_QtTestCase):
+    """Embedded in the live surface there is ONE play/pause on the tab and it
+    belongs to the live pass. The video underneath is not something you start
+    and stop -- it loops over whatever span is held, during a pass and after it.
+    """
+
+    def _explorer(self, own_shortcuts: bool):
+        ex = ScalogramExplorer.from_channel_data(
+            _channel_data(T=64), video_path=None,
+            own_shortcuts=own_shortcuts, own_status=False)
+        self.addCleanup(self._destroy, ex)
+        return ex
+
+    def _destroy(self, ex):
+        ex.close()
+        ex.deleteLater()
+        self.app.processEvents()
+
+    def test_hosted_playback_starts_itself_and_hides_its_button(self):
+        ex = self._explorer(own_shortcuts=False)
+        self.assertTrue(ex.playing)
+        self.assertTrue(ex._timer.isActive())
+        # isHidden, not isVisible: nothing here is ever shown, so isVisible is
+        # False for both cases and would pass without the change.
+        self.assertTrue(ex.play_btn.isHidden())
+
+    def test_standalone_still_starts_paused_with_a_button(self):
+        ex = self._explorer(own_shortcuts=True)
+        self.assertFalse(ex.playing)
+        self.assertFalse(ex._timer.isActive())
+        self.assertFalse(ex.play_btn.isHidden())
+
+    def test_hosted_declines_the_main_window_space_walk(self):
+        """Regression: the explorer sits between the focus widget and the
+        surface, so without the opt-out it wins the walk and Space toggles the
+        video instead of the live pass."""
+        self.assertFalse(self._explorer(own_shortcuts=False)
+                         .space_toggles_playback)
+        self.assertTrue(self._explorer(own_shortcuts=True)
+                        .space_toggles_playback)
+
+
 class _SurfaceTestCase(_QtTestCase):
     @classmethod
     def setUpClass(cls):
@@ -458,6 +500,11 @@ class StreamWiringTests(_SurfaceTestCase):
         del s._show_live_window                      # use the real one
         s._explorer = MagicMock()
         s._explorer.is_building.return_value = True
+        # The explorer's grid must match the served window's, or _show_live_window
+        # rebuilds instead of updating in place (a grid move can only be absorbed
+        # by a rebuild -- see _put_on_screen). A live pass's windows all share the
+        # explorer's grid, so the mock declares it.
+        s._explorer.ny, s._explorer.nx = 1, 1
         s._stream_meta = {"fps": 30.0, "grid": [1, 1]}
         s._show_live_window(self._win(64, token=1))
         s._explorer.set_channel_data.assert_called_once()
@@ -470,9 +517,30 @@ class StreamWiringTests(_SurfaceTestCase):
         del s._show_live_window
         s._explorer = MagicMock()
         s._explorer.is_building.return_value = True
+        s._explorer.ny, s._explorer.nx = 1, 1       # match the served grid
         s._stream_meta = {"fps": 30.0, "grid": [1, 1]}
         s._show_live_window(self._win(64, token=1), force=True)
         s._explorer.set_channel_data.assert_called_once()
+        s._explorer = None
+
+    def test_a_grid_change_rebuilds_rather_than_crashing(self):
+        """A Block/Downsample change replans the pass onto a new grid, and the
+        first window of the restarted pass then reaches an explorer built for the
+        OLD grid. set_channel_data refuses a grid move (it cannot remap regions
+        or the cube budget in place), so _show_live_window must REBUILD instead
+        -- the crash this replaced was that window hitting set_channel_data with
+        a (113,115) grid against an (8,8) explorer."""
+        s = self._surface()
+        del s._show_live_window                      # use the real one
+        s._explorer = MagicMock()
+        s._explorer.ny, s._explorer.nx = 8, 8        # the old geometry
+        s._stream_meta = {"fps": 30.0, "grid": [113, 115]}   # the new one
+        s._swap_explorer = MagicMock()
+        s._arm_detection = MagicMock()
+        s._show_live_window(self._win(64, token=1))
+        s._swap_explorer.assert_called_once()
+        s._explorer.set_channel_data.assert_not_called()
+        s._arm_detection.assert_called_once()
         s._explorer = None
 
     def test_a_truncated_pass_marks_the_span_it_left_on_screen(self):
@@ -482,6 +550,7 @@ class StreamWiringTests(_SurfaceTestCase):
         del s._show_live_window
         s._explorer = MagicMock()
         s._explorer.is_building.return_value = False
+        s._explorer.ny, s._explorer.nx = 1, 1       # match the served grid
         s._stream_meta = {"fps": 30.0, "grid": [1, 1]}
         s._stream_worker = MagicMock()
         s._live_window = self._win(64, token=1)
@@ -526,6 +595,65 @@ class StreamWiringTests(_SurfaceTestCase):
         self.assertNotIn("dropped", s.status_lbl.text())
         s._on_advanced(400, 5000, 90.0)
         self.assertIn("dropped", s.status_lbl.text())
+
+
+class OnDemandChannelSelectabilityTests(_QtTestCase):
+    """A live pass carries only the selected channel (+ _ALWAYS_STREAM), so the
+    others are absent until a replan. They must stay SELECTABLE anyway -- checking
+    one is what tells the surface to compute it -- rather than being grayed into a
+    catch-22 where a channel can never be picked because it is not carried and is
+    not carried because it was never picked."""
+
+    def _explorer(self, present, on_demand):
+        base = _channel_data()
+        cd = ChannelData(
+            meta=base.meta,
+            channels={k: v for k, v in base.channels.items() if k in present},
+            window_start=base.window_start)
+        ex = ScalogramExplorer.from_channel_data(
+            cd, video_path=None, own_shortcuts=False, own_status=False,
+            on_demand_channels=on_demand)
+        self.addCleanup(self._destroy, ex)
+        return ex, base   # the FULL data, for feeding a replan that lands a channel
+
+    def _destroy(self, ex):
+        ex.close()
+        ex.deleteLater()
+        self.app.processEvents()
+
+    def _name(self, attr):
+        from gui.explorers.scalogram_explorer import CHANNELS
+        return next(n for n, (a, _c) in CHANNELS.items() if a == attr)
+
+    def test_an_absent_on_demand_channel_stays_selectable(self):
+        ex, _ = self._explorer(present=("change",), on_demand=LIVE_CHANNELS)
+        cb = ex.chan_checks[self._name("appearance")]
+        self.assertTrue(cb.isEnabled())
+        self.assertIn("restarts the live pass", cb.toolTip())
+
+    def test_a_carried_channel_reads_as_ready_to_detect(self):
+        ex, _ = self._explorer(present=("change",), on_demand=LIVE_CHANNELS)
+        cb = ex.chan_checks[self._name("change")]
+        self.assertTrue(cb.isEnabled())
+        self.assertIn("builds its cube", cb.toolTip())
+
+    def test_a_channel_no_source_can_produce_stays_disabled(self):
+        """The guard is not gone, only narrowed: a channel that is neither carried
+        nor producible on demand is still a dead control and reads as one."""
+        ex, _ = self._explorer(present=("change",), on_demand=())
+        cb = ex.chan_checks[self._name("appearance")]
+        self.assertFalse(cb.isEnabled())
+        self.assertIn("not carried by this source", cb.toolTip())
+
+    def test_a_replan_landing_the_channel_flips_the_tooltip(self):
+        """The tooltip is a promise the pass has yet to keep; once the replanned
+        window carries the channel, it becomes the plain build hint."""
+        ex, base = self._explorer(present=("change",), on_demand=LIVE_CHANNELS)
+        name = self._name("appearance")
+        self.assertIn("restarts the live pass", ex.chan_checks[name].toolTip())
+        ex.set_channel_data(base, live=True)          # now carries appearance
+        self.assertTrue(ex.chan_checks[name].isEnabled())
+        self.assertIn("builds its cube", ex.chan_checks[name].toolTip())
 
 
 if __name__ == "__main__":

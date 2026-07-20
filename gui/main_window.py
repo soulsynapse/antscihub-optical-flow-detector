@@ -10,7 +10,6 @@ the artefact they were built around. See gui/_shelved/README.md.
 """
 from __future__ import annotations
 
-import os
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence, QShortcut
@@ -102,16 +101,25 @@ class MainWindow(QMainWindow):
         # Prefer the video the user actually clicked. Both VideoPanel and the
         # embeddable SpeedExplorer expose toggle_playback(), so this remains valid
         # when Speed Explorer becomes a preprocessing sub-tab.
+        # A widget can carry toggle_playback() for its own button and still
+        # decline Space -- the scalogram explorer embedded in the live surface
+        # does exactly that, because there Space means the live pass, and the
+        # explorer sits between the focus and the surface that owns it.
         widget = QApplication.focusWidget()
         while widget is not None:
             toggle = getattr(widget, "toggle_playback", None)
-            if callable(toggle):
+            if callable(toggle) and getattr(widget, "space_toggles_playback",
+                                            True):
                 toggle()
                 return
             widget = widget.parentWidget()
 
+        # Focus somewhere with no playback of its own (a knob, the tab bar):
+        # fall back to whatever the current tab plays.
         if self.tabs.currentIndex() == 0:
             self.tab2.video.toggle_playback()
+        else:
+            self.tab_live.toggle_playback()
 
     def _open_video(self):
         path, _ = QFileDialog.getOpenFileName(

@@ -13,7 +13,6 @@ shrink the budget for no reason.
 from __future__ import annotations
 
 import ctypes
-import os
 import re
 import sys
 

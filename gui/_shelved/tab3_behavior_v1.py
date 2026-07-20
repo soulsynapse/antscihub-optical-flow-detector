@@ -35,7 +35,7 @@ from core.features import REGISTRY
 from core.roi import behavior_block_mask, roi_psd
 from gui.inspector import ConstraintList, PSDPlot, RangePlot
 from gui.state import AppState
-from gui.timeline import TimelineStrip
+from gui._shelved.timeline import TimelineStrip
 from gui.video_panel import VideoPanel
 
 

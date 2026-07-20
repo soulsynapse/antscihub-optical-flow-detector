@@ -27,7 +27,7 @@ import unittest.mock
 
 import numpy as np
 
-from core.batch import (BatchError, BatchResult, load_params, load_replicates,
+from core.batch import (BatchError, BatchResult, load_replicates,
                         normalize_params, params_to_json, run_video,
                         write_result)
 from core.channel_source import live_channel_source

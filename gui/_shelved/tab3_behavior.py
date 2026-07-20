@@ -24,10 +24,10 @@ from core.export import (export_bouts, export_hdf5, export_roi_timeseries,
 from core.features import REGISTRY
 from core.filters import DEFAULT_BINS
 from core.roi import roi_psd, roi_time_series
-from gui.histogram_widget import RangeHistogram
+from gui._shelved.histogram_widget import RangeHistogram
 from gui.inspector import ConstraintList, PSDPlot, TimeSeriesPlot
 from gui.state import AppState
-from gui.timeline import TimelineStrip
+from gui._shelved.timeline import TimelineStrip
 from gui.video_panel import VideoPanel
 
 

@@ -135,24 +135,6 @@ def gpu_available() -> bool:
         return False
 
 
-def backend_status() -> dict[str, str]:
-    """Per-backend availability message for Preprocessing & Flow."""
-    status = {
-        "farneback": "Available (CPU). Fast; coarse motion.",
-        "dis": "Available (CPU). Better on subtle motion.",
-    }
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        status["raft"] = ("Unavailable: PyTorch is not installed. "
-                          "Install torch + torchvision with CUDA to enable.")
-        return status
-    if gpu_available():
-        status["raft"] = "Available (GPU). Best on fine motion."
-    else:
-        status["raft"] = ("Unavailable: PyTorch is installed but no CUDA GPU was "
-                          "detected. RAFT on CPU is too slow to be usable.")
-    return status
 
 
 def create_backend(cfg: FlowConfig) -> FlowBackend:

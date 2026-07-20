@@ -37,8 +37,7 @@ from dataclasses import replace
 
 from core.batch import BatchError, normalize_params, params_to_json
 from core.config import PipelineConfig
-from core.shard import (assign_output_names, expand_videos, find_manifest,
-                        is_current, output_path_for, parse_shard, partition,
+from core.shard import (assign_output_names, expand_videos, is_current, parse_shard, partition,
                         run_shard, skip_reason)
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None

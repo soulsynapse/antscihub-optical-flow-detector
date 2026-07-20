@@ -8,7 +8,6 @@ separate levers rather than one "quality" slider.
 """
 from __future__ import annotations
 
-import math
 
 import pytest
 

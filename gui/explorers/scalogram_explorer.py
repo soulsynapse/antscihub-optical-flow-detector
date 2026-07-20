@@ -36,12 +36,13 @@ from __future__ import annotations
 import os
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from functools import partial
 
 import cv2
 import numpy as np
 
-from PyQt6.QtCore import QEvent, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
                          QShortcut)
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
@@ -313,8 +314,16 @@ class ScalogramExplorer(QWidget):
     def __init__(self, cache=None, video_path: str | None = None, *,
                  state=None, sidecar_path: str | None = None,
                  channel_data=None, own_shortcuts: bool = True,
-                 own_status: bool = True, parent=None):
+                 own_status: bool = True,
+                 on_demand_channels: Iterable[str] | None = None, parent=None):
         super().__init__(parent)
+        # Channel ATTRIBUTES the host can produce on demand even when this data
+        # does not currently carry them -- the live surface's set is LIVE_CHANNELS,
+        # because a live pass computes only the selected channel (+ _ALWAYS_STREAM)
+        # and replans to add another. Such a channel is SELECTABLE though absent:
+        # checking it is what tells the host to compute it. Empty for a static
+        # cache explorer, which already carries every channel it lists.
+        self._on_demand = frozenset(on_demand_channels or ())
         if state is not None and cache is None and channel_data is None:
             cache = state.cache
         self.state = state
@@ -322,6 +331,13 @@ class ScalogramExplorer(QWidget):
         # When embedded in a host that owns Space (the live surface / main
         # window), skip our own Space shortcut so the two do not fight over it.
         self._own_shortcuts = own_shortcuts
+        # The main window's Space handler walks up from the focus widget looking
+        # for a toggle_playback(). Embedded in the live surface, Space belongs to
+        # the LIVE PASS, not to video playback -- and this widget sits between
+        # the focus and the surface, so without an explicit opt-out it wins the
+        # walk and Space silently means the wrong thing. Video playback needs no
+        # Space there because it never stops: see _build_ui.
+        self.space_toggles_playback = own_shortcuts
         # When embedded, the host displays the status line (in its own strip): skip
         # rendering our internal copy and mirror the text to the host-supplied
         # relay label instead (see set_status_relay).
@@ -507,6 +523,8 @@ class ScalogramExplorer(QWidget):
         self._sweep_debounce.setInterval(120)
         self._sweep_debounce.timeout.connect(self._recompute_counts)
         self._build_ui()
+        if not self._own_shortcuts:
+            self._toggle_play()
         self._wire_tuning_changed()
 
         # Shift-to-peek (hide the overlay to read the raw frame) rides an
@@ -543,13 +561,16 @@ class ScalogramExplorer(QWidget):
     @classmethod
     def from_channel_data(cls, channel_data, video_path: str | None = None,
                           own_shortcuts: bool = True, own_status: bool = True,
+                          on_demand_channels: Iterable[str] | None = None,
                           parent=None) -> "ScalogramExplorer":
         """Standalone explorer over a ChannelData (e.g. a live windowed source),
-        decoding its own video for the overlay."""
+        decoding its own video for the overlay. ``on_demand_channels`` names the
+        channel attributes a live host can compute on demand, so their checkboxes
+        stay selectable even while this window carries only a subset."""
         return cls(channel_data=channel_data,
                    video_path=video_path or channel_data.meta.get("video_path"),
                    own_shortcuts=own_shortcuts, own_status=own_status,
-                   parent=parent)
+                   on_demand_channels=on_demand_channels, parent=parent)
 
     def _sync_info_label(self) -> None:
         self._info_lbl.setText(
@@ -706,6 +727,9 @@ class ScalogramExplorer(QWidget):
         # _recompute_windowed_count before the new channels are in place).
         self._sync_labels()
         self._sync_info_label()
+        # A replan may have added or dropped a channel; keep each checkbox's
+        # enabled state and tooltip honest about what this window now carries.
+        self._sync_channel_checks()
         self._rebuild_scalograms(rescale_overlay=not live)
         self._redraw_video()
 
@@ -919,7 +943,11 @@ class ScalogramExplorer(QWidget):
         Returns a note describing any conversion the restore had to perform, for
         the caller to surface; None when the state transferred as-is."""
         ch = st.get("channel")
-        if ch in self.chan_checks and self._channel_available(ch):
+        # Selectable, not merely carried: restoring a view that detected on an
+        # on-demand channel this window has not computed yet must still select it
+        # (which fires _on_channel_toggled and, on a live host, the replan that
+        # computes it) rather than silently revert to whatever the pass carries.
+        if ch in self.chan_checks and self._channel_selectable(ch):
             self.channel = ch
             self.chan_checks[ch].setChecked(True)   # fires _on_channel_toggled
         sw = st.get("sweep_win")
@@ -986,12 +1014,37 @@ class ScalogramExplorer(QWidget):
         return self._regions_for_index(self.active_region_index)
 
     def _channel_available(self, name: str) -> bool:
-        """Whether this source carries the channel behind display name ``name``.
-
-        True for every listed channel on both source types today -- the guard is
-        kept because it is what a partially-populated source would trip, and a
-        checked-but-absent channel would otherwise read as an empty detection."""
+        """Whether this source carries the channel behind display name ``name``
+        RIGHT NOW. On a live surface the running pass carries only the selected
+        channel (+ _ALWAYS_STREAM), so the others are absent until a replan; use
+        :meth:`_channel_selectable` to decide whether a checkbox may be ticked."""
         return CHANNELS[name][0] in self._chan
+
+    def _channel_selectable(self, name: str) -> bool:
+        """Whether the channel behind display name ``name`` may be SELECTED --
+        either carried now, or producible on demand by a live host that will
+        replan the pass to compute it when it is checked. Only a channel that is
+        neither (nothing can ever produce it here) is a dead control."""
+        return self._channel_available(name) or CHANNELS[name][0] in self._on_demand
+
+    def _sync_channel_check(self, name: str) -> None:
+        """Set one channel checkbox's enabled state and tooltip from what the
+        source carries NOW. Re-run on every live update so the tooltip flips from
+        "check to compute it" to the plain build hint the moment a replan lands
+        that channel -- a selectable-but-absent channel is a promise the pass has
+        yet to keep, and saying so is the honest readout."""
+        cb = self.chan_checks[name]
+        cb.setEnabled(self._channel_selectable(name))
+        if self._channel_available(name):
+            cb.setToolTip(f"Detect on {name} (builds its cube on first check)")
+        elif self._channel_selectable(name):
+            cb.setToolTip(f"Detect on {name} — restarts the live pass to compute it")
+        else:
+            cb.setToolTip(f"{name} is not carried by this source")
+
+    def _sync_channel_checks(self) -> None:
+        for name in self.chan_checks:
+            self._sync_channel_check(name)
 
     def _chan_arr(self):
         attr = CHANNELS[self.channel][0]
@@ -1054,6 +1107,14 @@ class ScalogramExplorer(QWidget):
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self._toggle_play)
         trow.addWidget(self.play_btn)
+        # Embedded in the live surface the video is not a thing you start and
+        # stop: it loops over whatever span is currently held, running while the
+        # pass runs and continuing to loop while it is paused. There is one
+        # play/pause on this tab and it belongs to the pass, so the button goes
+        # and playback starts itself.
+        # (playback itself is started after the row is built, in __init__ --
+        # _toggle_play writes the rate label, which does not exist yet here.)
+        self.play_btn.setVisible(self._own_shortcuts)
         self.scrub = QSlider(Qt.Orientation.Horizontal)
         self.scrub.setRange(0, self.T - 1)
         self.scrub.setValue(self.frame)
@@ -1189,14 +1250,10 @@ class ScalogramExplorer(QWidget):
         for r, name in enumerate(CHANNELS):
             cb = QCheckBox()
             cb.setProperty("channel", name)
-            available = self._channel_available(name)
-            cb.setEnabled(available)
-            cb.setToolTip(
-                f"Detect on {name} (builds its cube on first check)" if available
-                else f"{name} is not carried by this source")
-            cb.setChecked(available and name == self.channel)
+            cb.setChecked(self._channel_available(name) and name == self.channel)
             self.chan_group.addButton(cb)
             self.chan_checks[name] = cb
+            self._sync_channel_check(name)
             grid.addWidget(cb, r, 0, Qt.AlignmentFlag.AlignCenter)
             dp = DensityPlot(name)
             dp.set_log_axis(True)
@@ -1294,8 +1351,18 @@ class ScalogramExplorer(QWidget):
         # threshold behind it has not moved. Accumulating instead means the axis
         # settles as the run covers the clip's range. The scalogram is excluded:
         # its Y is log FREQUENCY, fixed by the transform, not a data range.
+        #
+        # The windowed count is the ONE exception, and deliberately: accumulating
+        # here pins its axis to the loudest burst the whole run ever saw, so a
+        # quiet current window reads as a flat line crushed against the floor and
+        # the thing this plot exists to show -- how the window's count sits versus
+        # its threshold -- is unreadable. So it autoscales to the current window
+        # instead, and _widen_for_band keeps the count band on the axis so the
+        # threshold handle stays put at its true value rather than sliding off the
+        # top when the window goes quiet (set_include_band_in_range).
         for pl in self._value_axis_plots():
-            pl.set_sticky_range(True)
+            pl.set_sticky_range(pl is not self.count_w_plot)
+        self.count_w_plot.set_include_band_in_range(True)
 
         self._apply_selected_plot_ui()
         self._sync_labels()
@@ -1731,6 +1798,13 @@ class ScalogramExplorer(QWidget):
             self._settle_phase()
 
     def closeEvent(self, e):
+        # Before the source is released below. The timer is a child and dies
+        # with the widget, but deleteLater needs an event-loop turn, and hosted
+        # playback runs continuously -- so without this a tick can land on a
+        # released VideoSource in the gap. A live pass closes an explorer on
+        # every restart, so that gap is entered routinely.
+        self.playing = False
+        self._timer.stop()
         if self._event_filter_app is not None:
             self._event_filter_app.removeEventFilter(self)
             self._event_filter_app = None
@@ -2066,6 +2140,21 @@ class ScalogramExplorer(QWidget):
         self._update_frame(rel)
         return True
 
+    def hold_at(self, frame: int) -> bool:
+        """Park the cursor on an absolute frame and STOP following.
+
+        The seek-while-paused preview's reading position. A static window has no
+        pass running ahead of it, so neither follow mode applies: the cursor
+        sits exactly on the clicked frame rather than half a window ahead of it
+        (follow_center) or on the newest row (follow_latest). Clearing the mode
+        matters when the explorer is reused across a paused seek -- a "center"
+        left by an earlier live pass would otherwise re-assert itself on the next
+        window and walk the cursor off the click. Returns whether the frame was
+        in the current span (it is, for a window decoded around it).
+        """
+        self._follow = None
+        return self.seek_absolute(frame)
+
     def _stash_bands(self, index: int) -> None:
         """Freeze the outgoing scope's bands so revisiting it restores them.
 
@@ -2176,6 +2265,18 @@ class ScalogramExplorer(QWidget):
         # so the accumulated bounds are meaningless across a switch.
         self._reset_sticky_ranges()
         if self.active_region_index < 0:
+            return
+        # Selected an on-demand channel this window has not computed yet: _chan_arr
+        # would hand back zero-fill, so recomputing the sweep/overlay/cube would
+        # present a fake all-zero detection until the host's replan lands. Only the
+        # two field-independent calls are safe here -- an un-built channel's density
+        # blanks rather than reads zeros, and the plot UI keys off channel name.
+        # set_channel_data reruns the full recompute when the real data arrives, and
+        # the tuning_changed relay (already fired) is what triggers that replan.
+        if not self._channel_available(self.channel):
+            self._apply_selected_plot_ui()
+            self._refresh_densities()
+            self._set_phase(f"computing {self.channel}…")
             return
         self._rebuild_selected_views()
         self._apply_selected_plot_ui()

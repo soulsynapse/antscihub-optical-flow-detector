@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from core.live_track import (UNCOVERED, TrackStamp, WholeVideoTrack,
+from core.live_track import (TrackStamp, WholeVideoTrack,
                              band_power_bytes, coi_trim)
 
 

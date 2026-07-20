@@ -37,7 +37,6 @@ import stat
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Iterable
 
 import numpy as np
 

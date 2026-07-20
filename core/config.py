@@ -222,11 +222,6 @@ class PipelineConfig:
     def to_dict(self) -> dict:
         return asdict(self)
 
-    def to_json(self, video_hash: str | None = None) -> str:
-        payload = self.to_dict()
-        payload["_video_hash"] = video_hash
-        return json.dumps(payload, indent=2, sort_keys=True)
-
     @classmethod
     def from_dict(cls, d: dict) -> "PipelineConfig":
         d = {k: v for k, v in d.items() if not k.startswith("_")}

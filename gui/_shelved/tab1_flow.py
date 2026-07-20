@@ -26,7 +26,7 @@ from core.flow import backend_status
 from core.pipeline import (Cancelled, _flow_atlas_geometry,
                            _flow_support_pixels, run_pipeline)
 from core.replicates import build_layout, geometry_hash, validate_replicates
-from gui.help import HelpButton, labelled
+from gui._shelved.help import HelpButton, labelled
 from gui.state import AppState
 
 # Calibrated from the ROI-first FFmpeg input path on the reference clip. At
@@ -573,7 +573,7 @@ class Tab1Flow(QWidget):
         if not self.state.has_video:
             QMessageBox.warning(self, "No video", "Open a video first.")
             return
-        from gui.mask_dialog import MaskDrawDialog
+        from gui._shelved.mask_dialog import MaskDrawDialog
         frame = self.state.source.frame_at(self.state.current_frame)
         if frame is None:
             frame = self.state.source.frame_at(0)

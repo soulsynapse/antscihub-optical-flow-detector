@@ -23,7 +23,7 @@ from core.features import REGISTRY
 from core.filters import all_frame_masks, frame_mask
 from core.roi import (ROIParams, blocks_to_pixels, extract_rois, roi_psd,
                       roi_time_series, save_rois)
-from gui.histogram_widget import RangeHistogram
+from gui._shelved.histogram_widget import RangeHistogram
 from gui.inspector import PSDPlot, TimeSeriesPlot
 from gui.state import AppState
 from gui.video_panel import VideoPanel

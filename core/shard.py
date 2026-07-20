@@ -211,14 +211,6 @@ def partition(paths: list[str], index: int, count: int) -> list[str]:
 
 # -- per-video inputs --------------------------------------------------------
 
-def output_path_for(video_path: str, out_dir: str) -> str:
-    """The un-disambiguated output path for one video: ``<stem>.detections.json``,
-    matching ``cli/detect.py``'s default.
-
-    Only safe when the stem is unique across the run. Use ``assign_output_names``
-    for anything that processes a list -- see the collision it exists to stop.
-    """
-    return os.path.join(out_dir, output_stem(video_path) + ".detections.json")
 
 
 def output_stem(video_path: str) -> str:

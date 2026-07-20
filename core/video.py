@@ -198,9 +198,6 @@ class VideoSource:
     def time_to_frame(self, t_s: float) -> int:
         return int(round(t_s * self.info.fps))
 
-    def frame_to_time(self, frame_idx: int) -> float:
-        return frame_idx / self.info.fps
-
     def release(self) -> None:
         if self.cap is not None:
             self.cap.release()

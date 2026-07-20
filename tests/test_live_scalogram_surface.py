@@ -14,7 +14,6 @@ from PyQt6.QtGui import QHideEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
-from core.channel_source import live_channel_source
 from gui.explorers import live_scalogram_surface
 from core.scale_sweep import ScalePass
 from gui.explorers.live_scalogram_surface import (_Busy, _Cancelled,
@@ -245,11 +244,21 @@ class DetectionArmingTests(_SurfaceTestCase):
 
 
 class ParkedNavigationTests(_SurfaceTestCase):
-    """With no pass running the strip still navigates -- it parks the window and
-    says so. Play stays the only control that commits the decoder, but a control
-    that moves a slider and changes nothing else reads as broken."""
+    """With no pass running the strip still navigates -- and a committed seek now
+    LOADS the window there (a single bounded decode), so the paused view shows
+    that point rather than wherever the last pass stopped. Play stays the only
+    control that commits the decoder to a forward run to the end of the clip."""
 
-    def test_a_committed_seek_while_stopped_says_it_parked(self):
+    def _finish_preview(self, surface, timeout=120.0):
+        """Run the in-flight preview worker to completion and deliver its result
+        on the GUI thread. The `done` signal is queued, so it fires on the next
+        processEvents after the thread finishes."""
+        w = surface._preview_worker
+        self.assertIsNotNone(w, "a paused seek should start a preview load")
+        w.wait(int(timeout * 1000))
+        self.app.processEvents()
+
+    def test_a_committed_seek_while_stopped_loads_the_window(self):
         surface = self._surface()
         # The fixture clip is 40 frames at 20 fps, so the window length has to
         # leave somewhere to seek TO: at the 1 s default the start clamps to 0
@@ -257,14 +266,31 @@ class ParkedNavigationTests(_SurfaceTestCase):
         surface.len_spin.setValue(0.5)
         surface._on_seek_committed(20)
         self.assertEqual(surface.start_slider.value(), 20)
+        # Loads rather than merely parking: a preview worker starts, and the
+        # decoder is NOT committed to a forward run (that is Play's job).
+        self.assertIn("loading", surface.status_lbl.text())
+        surface.start_stream.assert_not_called()
+        self._finish_preview(surface)
+        # The window at the seek point is on screen, the cursor sits on the
+        # clicked frame, and the readout invites Play to run from here.
+        self.assertIsNotNone(surface._explorer)
+        self.assertEqual(surface._explorer.absolute_frame(), 20)
         self.assertIn("Play", surface.status_lbl.text())
         surface.start_stream.assert_not_called()
 
-    def test_focusing_a_detection_while_stopped_says_it_parked(self):
-        """'Next strongest' is a verb. Before this it moved the slider and the
-        strip cursor and left the plots on the previous span, with no readout."""
+    def test_focusing_a_detection_while_stopped_loads_the_window(self):
+        """'Next strongest' is a verb. It moves the slider AND loads the window
+        centred on the event, so the plots show it for verification rather than
+        staying on the previous span."""
         surface = self._surface()
-        surface._focus_frame(200)
+        surface.len_spin.setValue(0.5)
+        surface._focus_frame(20)
+        self.assertIn("loading", surface.status_lbl.text())
+        self._finish_preview(surface)
+        self.assertIsNotNone(surface._explorer)
+        # Centred on the event: the window starts half a length before it, so the
+        # cursor lands on the event itself.
+        self.assertEqual(surface._explorer.absolute_frame(), 20)
         self.assertIn("Play", surface.status_lbl.text())
         surface.start_stream.assert_not_called()
 
@@ -281,6 +307,59 @@ class ParkedNavigationTests(_SurfaceTestCase):
         # Stopped, the cursor is the only feedback there is, so it still moves.
         surface._on_scrubbed(300)
         surface._explorer.seek_absolute.assert_called_once_with(300)
+
+
+class ResumeWhereStoppedTests(_SurfaceTestCase):
+    """Stopping parks the window at the playhead, so Play resumes there instead
+    of snapping the cursor back to wherever the strip was last clicked."""
+
+    def _stopped_at(self, surface, playhead: int):
+        surface._explorer = MagicMock()
+        surface._explorer.absolute_frame.return_value = playhead
+        surface._stream_worker = MagicMock()
+        surface.stop_stream()
+        surface._on_stream_cancelled()
+
+    def test_a_stop_parks_the_window_at_the_playhead(self):
+        surface = self._surface()
+        surface.len_spin.setValue(0.5)
+        surface._on_seek_committed(4)             # the last click
+        self._stopped_at(surface, 24)
+        self.assertEqual(surface.start_slider.value(), 24)
+        self.assertIn("stopped", surface.status_lbl.text())
+
+    def test_parking_does_not_read_as_a_knob_edit(self):
+        """The write goes through blockSignals: _on_window_changed would print
+        a settings-changed status over the stop message in the same turn."""
+        surface = self._surface()
+        surface.len_spin.setValue(0.5)
+        with patch.object(surface, "_on_window_changed") as changed:
+            self._stopped_at(surface, 20)
+        changed.assert_not_called()
+
+    def test_a_restart_keeps_its_own_position(self):
+        """Only a real stop reconciles the two. A restart already wrote the
+        position it wants into the slider."""
+        surface = self._surface()
+        surface.len_spin.setValue(0.5)
+        surface._on_seek_committed(10)
+        surface._explorer = MagicMock()
+        surface._explorer.absolute_frame.return_value = 30
+        surface._stream_worker = MagicMock()
+        surface.restart_stream()
+        surface._on_stream_cancelled()
+        self.assertEqual(surface.start_slider.value(), 10)
+
+    def test_the_clamp_near_the_end_does_not_drag_the_cursor_back(self):
+        """The window start clamps to leave a window's worth of clip, so near
+        the end it lands behind the playhead -- the strip cursor must not follow
+        it backwards."""
+        surface = self._surface()
+        surface.len_spin.setValue(0.5)
+        surface.navigator.set_cursor(39)
+        self._stopped_at(surface, 39)
+        self.assertLess(surface.start_slider.value(), 39)
+        self.assertEqual(surface.navigator.strip.cursor, 39)
 
 
 class HiddenTabTests(_SurfaceTestCase):
@@ -825,6 +904,104 @@ class SweepTests(_SurfaceTestCase):
         self.assertEqual(dlg.add_sweep_row.call_count, 2)
         dlg.sweep_failed.assert_called_once()
         self.assertAlmostEqual(dlg.sweep_failed.call_args.args[0], 0.5)
+
+
+class ChannelGatingTests(_SurfaceTestCase):
+    """The live pass computes what is selected, not every channel -- the 4.6x the
+    'why is it slow' investigation turned up (see _channels_wanted)."""
+
+    def test_default_wants_only_change_when_no_explorer_yet(self):
+        surface = self._surface()
+        want = surface._channels_wanted()
+        self.assertIn("change", want)
+        # change is the always-on precondition and also the default selection, so
+        # a fresh surface with no view state computes exactly one channel.
+        self.assertEqual(want, frozenset({"change"}))
+
+    def test_selected_channel_from_saved_view_is_wanted(self):
+        surface = self._surface()
+        surface._pending_state = {"channel": "tensor speed"}
+        want = surface._channels_wanted()
+        self.assertIn("tensor_speed", want)
+        self.assertIn("change", want)      # always carried; explorer needs it
+        # But NOT the two flow-free channels nobody asked for.
+        self.assertNotIn("appearance", want)
+        self.assertNotIn("intensity", want)
+
+    def test_all_channels_checkbox_wants_everything(self):
+        surface = self._surface()
+        surface.all_chan_chk.setChecked(True)
+        self.assertEqual(surface._channels_wanted(),
+                         frozenset(live_scalogram_surface.LIVE_CHANNELS))
+
+    def test_all_channels_is_persisted_in_the_strip(self):
+        surface = self._surface()
+        surface.all_chan_chk.setChecked(True)
+        self.assertTrue(surface._strip_values()["all_channels"])
+        surface._apply_strip({"all_channels": False})
+        self.assertFalse(surface.all_chan_chk.isChecked())
+
+    def test_plan_wants_only_the_selected_channel(self):
+        """The whole point, at the seam that matters: the ChannelPlan a live pass
+        is built from carries the reduced set, so the stream never computes the
+        flow solve for a channel nobody is reading."""
+        surface = self._surface()
+        surface._pending_state = {"channel": "change energy Jtt"}
+        cfg = surface._build_cfg()
+        _meta, plan, _cap = surface._stream_plan(cfg, 0)
+        self.assertEqual(set(plan.want), {"change"})
+        self.assertFalse(plan.need_flow)
+
+
+class ProcessPlanTests(_SurfaceTestCase):
+    """The gear beside Process: which spans a commit covers."""
+
+    def test_default_plan_is_the_whole_clip_continuous(self):
+        surface = self._surface()
+        segs = surface._plan_segments()
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0].start, 0)
+        self.assertEqual(segs[0].stop, surface.frame_count)
+
+    def test_from_here_starts_at_the_window(self):
+        surface = self._surface()
+        surface._process_settings = {"strategy": "from_here", "chunk_s": 30.0,
+                                     "budget": 0.1, "skip_covered": False}
+        surface.start_slider.setValue(5)
+        segs = surface._plan_segments()
+        self.assertEqual(segs[0].start, 5)
+
+    def test_bisect_budget_samples_a_fraction(self):
+        surface = self._surface()
+        surface._process_settings = {"strategy": "bisect", "chunk_s": 0.2,
+                                     "budget": 0.25, "skip_covered": False}
+        segs = surface._plan_segments()
+        total = sum(s.n for s in segs)
+        self.assertLess(total, surface.frame_count)
+        self.assertGreater(total, 0)
+
+    def test_settings_round_trip_through_the_tuning_sidecar(self):
+        surface = self._surface()
+        surface._process_settings = {"strategy": "bisect", "chunk_s": 12.0,
+                                     "budget": 0.2, "skip_covered": True}
+        surface._save_tuning()
+        reborn = LiveScalogramSurface(
+            self.video, [{"id": 0, "label": "all", "frac": (0.0, 0.0, 1.0, 1.0)}])
+        self.addCleanup(self._destroy, reborn)
+        reborn.start_stream = MagicMock()
+        self.assertEqual(reborn._process_settings["strategy"], "bisect")
+        self.assertAlmostEqual(reborn._process_settings["budget"], 0.2)
+
+    def test_process_bails_without_a_selected_replicate(self):
+        """No stamp -> no idea what a segment would be computed under. The pass
+        must refuse rather than write coverage under settings nobody chose."""
+        surface = self._surface()
+        surface._explorer = MagicMock()
+        surface._explorer.detection_params.return_value = {"region_index": -1}
+        with patch.object(live_scalogram_surface, "_ProcessWorker") as W:
+            surface.process_whole_video()
+        W.assert_not_called()
+        self.assertIsNone(surface._proc_worker)
 
 
 if __name__ == "__main__":

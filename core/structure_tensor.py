@@ -205,19 +205,3 @@ def brightness_residual_field(prev: np.ndarray, curr: np.ndarray,
     return (it + ix * flow_uv[..., 0] + iy * flow_uv[..., 1]).astype(np.float32)
 
 
-def flow_coherence(J: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """How plane-like the local spatiotemporal energy is, in [0, 1].
-
-    Derived from the 2x2 spatial tensor's eigenvalue ratio: ~1 when one spatial
-    orientation dominates (a well-defined moving edge/texture -> trustworthy
-    flow), ~0 when spatial energy is isotropic (corner or noise). This is the
-    per-tensor sibling of the block flow's angular coherence.
-    """
-    xx, yy, tt, xy, xt, yt = _unpack(J)
-    tr = xx + yy
-    disc = np.sqrt(np.maximum((xx - yy) ** 2 + 4.0 * xy * xy, 0.0))
-    lam1 = 0.5 * (tr + disc)
-    lam2 = 0.5 * (tr - disc)
-    denom = lam1 + lam2
-    return np.where(denom > eps, (lam1 - lam2) / np.maximum(denom, eps),
-                    0.0).astype(np.float32)

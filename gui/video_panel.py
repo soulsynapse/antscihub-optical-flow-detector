@@ -497,17 +497,6 @@ class VideoPanel(QWidget):
 
     # -- overlays ------------------------------------------------------------
 
-    def set_overlay(self, mask: np.ndarray | None,
-                    color: tuple[int, int, int] = (60, 200, 255)) -> None:
-        self._overlay = mask
-        self._overlay_color = color
-        self.refresh()
-
-    def set_roi_boxes(self, boxes: list[tuple[int, tuple, str]]) -> None:
-        """[(roi_id, (y0,x0,y1,x1) in blocks, hex_color)]"""
-        self._roi_boxes = boxes
-        self.refresh()
-
     def set_draw_mode(self, on: bool) -> None:
         self.view.draw_enabled = on
         self.view.setCursor(QCursor(
@@ -527,12 +516,6 @@ class VideoPanel(QWidget):
 
     def clear_focus(self) -> None:
         self.set_focus_frac(None)
-
-    def set_focus_mode(self, mode: str) -> None:
-        if mode not in ("source", "flow"):
-            raise ValueError(f"Unknown focus mode: {mode}")
-        self._focus_mode = mode
-        self.refresh()
 
     # -- playback ------------------------------------------------------------
 

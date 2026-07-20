@@ -151,13 +151,18 @@ def largest_clump_per_frame(m: np.ndarray, lo: float, hi: float, dy: int, dx: in
     out = np.zeros(T, np.float32)
     if m.size == 0 or m.shape[1] != gy.size:
         return out
+    # One grid reused across frames rather than a fresh (dy, dx) allocation per
+    # frame: this loop runs once per frame over a whole clip, and gy/gx cover
+    # every cell, so each used frame overwrites the whole grid anyway. The
+    # per-frame connected-components call is the irreducible cost; the array
+    # churn around it is not.
+    grid = np.zeros((dy, dx), np.uint8)
+    passing_all = (m >= lo) & (m <= hi) & np.isfinite(m)
     for t in range(T):
-        cols = m[t]
-        passing = (cols >= lo) & (cols <= hi) & np.isfinite(cols)
+        passing = passing_all[t]
         if not passing.any():
             continue
-        grid = np.zeros((dy, dx), np.uint8)
-        grid[gy, gx] = passing.astype(np.uint8)
+        grid[gy, gx] = passing.view(np.uint8)
         n_lab, _, stats, _ = cv2.connectedComponentsWithStats(
             grid, connectivity=8)
         if n_lab > 1:

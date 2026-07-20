@@ -214,11 +214,6 @@ class Preprocessor:
         return cv2.add(out, 128.0 - mean * a, dst=out)
 
 
-def sample_frames_for_background(source, n: int) -> list[np.ndarray]:
-    """Evenly sample n frames across the clip for the median background model."""
-    total = source.info.frame_count
-    idxs = np.linspace(0, max(0, total - 1), num=min(n, total), dtype=int)
-    return [f for f in (source.frame_at(int(i)) for i in idxs) if f is not None]
 
 
 def flow_input_preview(bgr: np.ndarray, work_size: tuple[int, int],
