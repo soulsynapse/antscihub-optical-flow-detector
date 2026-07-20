@@ -34,7 +34,7 @@ to the relevant section rather than restating it.
 | ~~**T22**~~ | ~~New **viewer tab** consuming a fully-processed video.~~ **DROPPED** (2026-07-19) — scope, not value. A convenience shell over a `DetectionResult` that nothing else depends on; never started. Re-open only if day-to-day review actually stalls without it. |
 | ~~**T23**~~ | ~~**ROI pre-transcode**: cut each source once into per-replicate clips + manifest.~~ **DONE** — see Batch I. Works, and **the premise it was justified on turned out false**: the 25x isolated decode win is **1.06x end to end** (`FINDINGS.md` §16). Not the lever that moves the floor at scale 1.0. |
 | ~~**T24**~~ | ~~**Headless batch driver**: no-GUI entry point, file-level partitioning, N-worker throughput.~~ **DONE** — all three slices landed; throughput measured in `FINDINGS.md` §14 (**~130 fps / 5.4x realtime, ceiling at 8 workers**). |
-| **T29** | **Streaming live surface** — display immediately, process forward continuously, plots fill as frames arrive, instead of extract-a-window-then-block. Architecture decided 2026-07-20; see Batches P/Q. Foundations landed in `e11a4cb` (`core/stream_buffer.py`). |
+| **T29** | **Streaming live surface** — display immediately, process forward continuously, plots fill as frames arrive, instead of extract-a-window-then-block. Architecture decided 2026-07-20; see Batches P/Q. Foundations landed in `e11a4cb` (`core/stream_buffer.py`); **Batch P landed** (`stream_channel_planes` + `ChannelPlan`, `FINDINGS.md` §22, cost measured at nil). **Batch Q is what remains.** |
 | **T30** | **The mark corpus is not a corpus.** `marks.json` holds **one** 0.39 s span, and **no animal-absent spans at all** — so occupancy's whole claim (present-but-still ≠ empty) cannot be tested, and neither can any supervised channel comparison. Needs flying / still-with-animal / animal-absent / wingbeat, several each, across replicates. `rep6-no-flying` is a ready-made negative control. **This blocks T31 and T32, and no amount of channel-building substitutes for it.** |
 | **T31** | **Validate occupancy and the ratio channels against marked footage**, using the **tail statistic, not region means** (`FINDINGS.md` §20 — this was got wrong once already). Gates Batch S. |
 | **T32** | **Supervised signature fitting.** With a real corpus, fit LDA / L1-logistic per labelled behaviour over the (channel × spatial scale × temporal scale) grid. The weight vector *is* an interpretable, tunable signature and drops into a template detector with the existing `DetectionResult` shape. Cheap, and it tells you which channels earn their place before the unsupervised map is built around them. |
@@ -170,30 +170,29 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 17. Plot collapse | the 3.2x, why it does not scale with block size, and the detector the collapse nearly disarmed |
 | 18. Detection readout | why the gate moved onto the band's own plot, the 1 px floor, and the badge's shift-peek exemption |
 | 19. Replicate direct manipulation | where T20's dropdown actually lives, why right-click-to-delete was refused, and two silent-write drag bugs |
+| 22. Batch P streaming generator | the measured nil cost, why absolute fps is not comparable across sessions, and the three traps in the new seam |
 
 ---
 
 ## 5. Remaining batches
-### Batch P — streaming extraction generator · `core/tensor_channels.py`
+### ~~Batch P — streaming extraction generator~~ · `core/tensor_channels.py`
+**LANDED. Full write-up in `FINDINGS.md` §22.** What Batch Q needs to know:
 
-**Goal.** Let `_stream_channels` yield per-frame block planes instead of only
-filling a preallocated array, so a caller can consume frames as they arrive.
-
-The loop already fills `out[channel][oi]` in frame order and already ticks a
-progress callback every 20 frames — the partial data exists in memory during the
-pass and is simply never handed over. So this is an extraction of the loop body
-into a generator (`yield (index, {channel: plane})`), with the existing
-`_stream_channels` becoming a thin consumer that fills the array exactly as now.
-
-**The windowed API must not change.** `extract_channels`, `extract_channels_live`
-and `live_channel_source` keep their signatures and their return shapes; the
-sidecar and `CHANNEL_VERSION` are untouched, because the math is untouched.
-
-**Hazards.** This is the hot loop, and `FINDINGS.md` §1 and §11 both attach to it:
-the per-channel gating (`comps`, `need_flow`, `need_tensor`) is load-bearing and
-priced, and the timing spans are how throughput gets measured. Preserve both. Per-
-frame yield overhead is negligible against ~12 ms/frame of tensor work, but
-measure rather than assume.
+- **`stream_channel_planes(video_path, plan)`** yields
+  `(absolute_index, {channel: (ny, nx)})` per frame and RETURNS the pass
+  metadata (`StopIteration.value`) — `n_frames`, `truncated`, timing spans.
+  Absolute indices, contiguous, every wanted channel present on every frame:
+  the dict feeds `StreamBuffer.append` with no adapter, which is pinned by a
+  test rather than asserted here.
+- **`plan_channel_stream(meta, ...) -> ChannelPlan`** is decode-free and
+  resolves the window, geometry and gating. **Build this first and size the ring
+  from it** — that is the whole reason it exists, so the clamp of `start`/`n`
+  against `n_frames` is not computed a second time next to the buffer.
+- The windowed API did not change, and neither did `CHANNEL_VERSION`.
+- **The refactor cost nothing**, measured back-to-back against the pre-refactor
+  file: 79.5 fps either way. But §22's warning applies — absolute fps drifts ~15%
+  between sessions on this machine, so do not compare a Q measurement against a
+  number taken today.
 
 ---
 
@@ -206,6 +205,37 @@ forward continuously, plots fill in as frames arrive.
 and publishes `frontier` by queued signal; the GUI asks the worker for windows and
 never touches the buffer (the buffer is not internally synchronised, on purpose —
 see its module docstring).
+
+**Slice 1 of 3 LANDED (2026-07-20): the worker.** `gui/stream_worker.py` now holds
+`StreamWorker` (moved out of the surface so both files could share it without a
+cycle) and the new **`LiveStreamWorker`**, with `tests/test_stream_worker.py` (9).
+What the remaining slices can assume:
+
+- It owns the `StreamBuffer` and fills it from `stream_channel_planes`, emitting
+  `advanced(start, frontier, fps)` at ≤10 Hz plus **one unconditional final
+  emission** — the throttle must never blur "processing" into "done".
+- **`request_latest(n, channels, token)` parks a request; it does not return
+  data.** The GUI cannot read the buffer, by construction: servicing happens on
+  the worker thread between frames and comes back on `window_ready`. Newest
+  request replaces an unserved one — no queue, because the consumer is a repaint
+  timer and a backlog would redraw windows the user has already left.
+- `advanced` publishes **`start` as well as `frontier`**, because past capacity
+  the island is no longer `[0, frontier)`. A progress readout that assumes it is
+  will claim history the ring has already dropped.
+- `pass_meta` (with `truncated`) is readable after `done` — the difference
+  between "the clip ended" and "the decoder stopped early".
+- `capacity` is passed IN, computed by the caller from the plan via
+  `capacity_for_budget`. Keeping the geometry arithmetic out of the worker is
+  the whole reason `ChannelPlan` exists.
+
+**Trap found while testing, and it will bite the next slice too:** a synthetic
+clip runs a 400-frame pass in ~0.12 s, which is shorter than one publish
+interval — so any test that reacts to a mid-pass `advanced` is racing the pass,
+not testing it. Park the request before `start()` where determinism matters.
+
+**Slices 2 and 3 remain:** wiring the surface to the worker (replacing
+extract-then-block), and the ~1 Hz bounded-trailing-window CWT **with the cone of
+influence drawn**. The COI is still the one thing that must not ship wrong.
 
 **Decided (2026-07-20), do not relitigate without a reason:**
 
@@ -290,6 +320,31 @@ compression — a release that reads as a 150 px drag while the cached delta is
 zero, firing `_rebuild_rois` and a sidecar write for a no-op), and a chorded
 right-click mid-drag committed a partial drag under a coordinate mapping the
 un-zoom had already changed. `tests/test_replicate_tab.py`, 26 tests.
+
+**T34 — moving a PROCESSED replicate is now gated. LANDED (2026-07-20).**
+Leaving the Replicates tab latches every box then present as `processed`
+(persisted in the sidecar); dragging a latched box raises a confirmation whose
+button reads *"I recognize the existing replicate data will be lost"*, and
+accepting clears the flag so it does not warn twice about data already gone.
+
+Three choices worth not re-deriving:
+- **A gate, not a freeze.** Freezing would force delete-and-redraw for a small
+  correction, and redrawing loses the label, colour and standardization along
+  with the geometry — so the safe-looking option would cost *more* state than
+  the dangerous one.
+- **Latched on leaving the tab, and only there.** That is the only route to the
+  surfaces that consume the layout, so it strictly precedes any pass; a second
+  trigger on the pass itself would be redundant. Boxes drawn after a latch are
+  fresh until the next one — the flag is per replicate.
+- **`_load` strips the flag, `_load_sidecar` keeps it.** An imported plate layout
+  has not been processed against *this* clip, and carrying the lock across would
+  be the ghosting-between-videos failure `_load_sidecar` exists to prevent.
+
+*The regression it caused, since it is the T11 trap again:* the first cut called
+`_refresh_list` to update the badge. That clears the list and the selection with
+it, and `stamp_size` is **derived** from the selection — so every move silently
+emptied the stamp. Badges are now edited in place (`_sync_lock_badges`). Any
+future per-row indicator must do the same. `tests/test_replicate_tab.py`, 42.
 
 **Still open in this batch:**
 - **T20** — left the batch entirely; see the item above and §19. It is explorer
@@ -427,8 +482,10 @@ T11 and T12 landed, T20 left the batch, T21 is untouched.**
 This is what the last session was actually about, and it supersedes the throughput
 thread below as the near-term order.
 
-1. **Batch P** — streaming generator in `tensor_channels`. Enables everything else.
-2. **Batch Q** — continuous live surface on `core/stream_buffer.py`.
+1. ~~**Batch P** — streaming generator in `tensor_channels`.~~ **DONE**, §22.
+2. **Batch Q** — continuous live surface on `core/stream_buffer.py`. **Slice 1
+   (the worker) landed; slices 2 (surface wiring) and 3 (CWT + cone of
+   influence) are next.**
 3. **Batch R + T30** — marking rehomed, and **an actual corpus laid down**. The
    widget without the corpus unblocks nothing.
 4. **T31** — validate occupancy/ratios against that corpus, on the tail statistic.

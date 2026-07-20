@@ -26,7 +26,7 @@ from dataclasses import replace
 from enum import Enum
 
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel,
                              QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
@@ -48,6 +48,12 @@ from core.video import VideoSource
 from core.wavelet import default_freqs
 from gui.explorers.detection_timeline import DetectionNavigator
 from gui.explorers.scalogram_explorer import ScalogramExplorer
+# The worker base moved to gui/stream_worker.py so the new continuous worker
+# (LiveStreamWorker, not yet wired here -- Batch Q slice 2) could share it
+# without importing this module. Re-bound to the private names the rest of this
+# file, and its tests, already use.
+from gui.stream_worker import Cancelled as _Cancelled
+from gui.stream_worker import StreamWorker as _StreamWorker
 from gui.tuning_store import load_tuning, save_tuning
 
 # Downsampling is opt-in and off by default (todo.md Batch K), so there is no
@@ -100,53 +106,6 @@ class _Busy(Enum):
     EXTRACT = "extract"
     PROCESS = "process"
     SWEEP = "sweep"
-
-
-class _Cancelled(Exception):
-    """Raised inside a worker's progress callback to unwind a cancelled pass."""
-
-
-class _StreamWorker(QThread):
-    """Base for the two streaming passes, giving both a uniform cancel path.
-
-    ``cancel()`` is called from the GUI thread and only sets a flag; the worker
-    notices at its next progress tick (every 20 frames in ``_stream_channels``)
-    and raises, which unwinds through that function's ``finally`` and releases
-    the decoder. Each pass therefore ends on exactly one of ``done`` / ``failed``
-    / ``cancelled``, so the GUI has a single place to restore its buttons.
-    """
-    done = pyqtSignal(object)
-    failed = pyqtSignal(str)
-    cancelled = pyqtSignal()
-    progress = pyqtSignal(int, int)  # (frames done, total) during extraction
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._cancel = False
-
-    def cancel(self):
-        self._cancel = True
-
-    def is_cancelled(self) -> bool:
-        return self._cancel
-
-    def _tick(self, done: int, total: int):
-        """Progress callback handed to the extractor; doubles as the cancel poll
-        since it is the only place the long pass calls back into us."""
-        if self._cancel:
-            raise _Cancelled
-        self.progress.emit(done, total)
-
-    def run(self):
-        try:
-            self._run()
-        except _Cancelled:
-            self.cancelled.emit()
-        except Exception as e:                     # surface any extraction error
-            self.failed.emit(f"{type(e).__name__}: {e}")
-
-    def _run(self):
-        raise NotImplementedError
 
 
 class _LiveExtractWorker(_StreamWorker):
