@@ -76,12 +76,23 @@ _EXTRACT_TEXT = "Extract"
 _PROCESS_TEXT = "Process whole video ▶"
 _LIVE_TEXT = "Live ▶"
 
-# How often the GUI asks the stream worker for a trailing window. This is the
-# tick the ~1 Hz scalogram recompute hangs off (todo.md Batch Q slice 3), and it
-# is deliberately NOT the worker's own publish rate: `advanced` is a number to
-# paint and can run at 10 Hz, while a window is a copy of hundreds of block
-# frames whose consumer is an O(T log T) transform.
-_WINDOW_REQUEST_HZ = 1.0
+# How often the GUI asks the stream worker for a trailing window.
+#
+# 10 Hz, raised from 1.0 once the per-plot costs were actually measured
+# (FINDINGS §24). The old value assumed the consumer was an O(T log T) transform
+# over the window; it is not. The plots this tick drives are all per-FRAME --
+# pooled mean ~3 ms, pooled Morlet ~8 ms, trace and sweep ~1 ms, together ~12 ms
+# at T=30k -- because the Morlet here transforms a single (T,) pooled series and
+# carries none of the B factor. The genuinely expensive thing, the per-BLOCK
+# (F,T,B) cube at 0.4-6 s, is NOT driven by this tick: it runs at its own pace on
+# its own thread and its density heatmap is drawn at whatever span it has
+# actually covered.
+#
+# The ~8x headroom is deliberate and load-bearing: §24's budget holds only while
+# the per-block window stays bounded. If a future change lets it grow toward clip
+# length the fast path reaches ~155 ms and this rate fails SILENTLY -- no error,
+# just a surface that stops keeping up.
+_WINDOW_REQUEST_HZ = 10.0
 
 # Fewest frames a served window may have before it is put on screen.
 #
@@ -1386,18 +1397,20 @@ class LiveScalogramSurface(QWidget):
         discard the scalogram cube cache, reset the selected replicate, and
         replace the widget under the user's cursor once a second.
 
-        Skipped while the explorer is still transforming the LAST window it was
-        given. The cube worker cannot be cancelled and refuses to relaunch while
-        one is in flight, so pushing updates faster than the transform runs makes
-        every cube arrive stale, get dropped, and relaunch -- a scalogram that
-        never appears rather than one that lags. Dropping the window instead lets
-        the display settle to the rate the transform sustains; the next tick asks
-        again. ``force`` is for the terminal update, which must land whatever the
-        display is doing.
+        NO LONGER gated on ``is_building()``. That gate existed because a cube
+        arriving after its span had moved was DISCARDED, so updating faster than
+        the transform meant every cube was dropped and relaunched and the
+        scalogram never appeared at all (§23 trap 3). The discard is what has
+        gone: a cube is now retained with the span it was transformed over, and
+        its density heatmap is drawn at that span with the uncovered remainder
+        hatched. A cube landing late is therefore late data correctly placed
+        rather than wrong data, and there is nothing left to protect against.
+
+        Dropping the gate is the point of the change. It was throttling the
+        per-FRAME plots -- trace, pooled scalogram, detection sweep, ~12 ms
+        together at whole-clip length -- to the rate of a per-BLOCK transform
+        that is up to 500x slower and feeds none of them.
         """
-        if (not force and self._explorer is not None
-                and self._explorer.is_building()):
-            return
         cd = self._live_channel_data(win)
         if self._explorer is None:
             self._swap_explorer(cd)
@@ -1405,7 +1418,7 @@ class LiveScalogramSurface(QWidget):
             # see ScalogramExplorer.follow_latest.
             self._explorer.follow_latest()
             return
-        self._explorer.set_channel_data(cd)
+        self._explorer.set_channel_data(cd, live=not force)
 
     def _record_cost_sample(self, cd, block_intent: int | None = _INFER):
         """Keep one timing sample per (scale, block) for the cost model.

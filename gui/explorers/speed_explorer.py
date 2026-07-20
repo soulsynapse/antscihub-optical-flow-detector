@@ -80,6 +80,11 @@ TXT = QColor(210, 210, 210)
 TXT_DIM = QColor(140, 140, 140)
 BAND = QColor(255, 95, 95)          # detection min/max lines drawn on the plot
 DETECT = QColor(60, 220, 110)       # positive-detection spans shaded behind it
+# "Nothing has covered this column yet." A cool blue-grey, deliberately off both
+# heatmap ramps, and carried by a hatch rather than a flat fill -- see
+# DensityPlot._hatch_unexamined for why a tone could not work.
+_UNEXAMINED_BG = np.array([22, 24, 30], np.float64)
+_UNEXAMINED_FG = np.array([44, 48, 60], np.float64)
 DISPLAY_MAX_W = 1280
 
 
@@ -730,6 +735,11 @@ class DensityPlot(MiniPlot):
     def __init__(self, title: str, unit: str = "", color: QColor = LINE):
         super().__init__(title, unit, color)
         self.matrix = np.zeros((0, 0), np.float32)
+        # The matrix covers axis frames [axis_off, axis_off + T) of an axis
+        # axis_total long. They differ once this heatmap's source lags the
+        # per-frame plots stacked beside it -- see set_matrix.
+        self.axis_off = 0
+        self.axis_total = 0
         self._img: QImage | None = None
         self._img_key: tuple | None = None
         self._ver = 0
@@ -769,18 +779,51 @@ class DensityPlot(MiniPlot):
     def _inv(self, t):
         return np.expm1(t) if self._log_axis else t
 
-    def set_matrix(self, m: np.ndarray) -> None:
+    def set_matrix(self, m: np.ndarray, axis_off: int = 0,
+                   axis_total: int | None = None) -> None:
+        """Set the (T, K) matrix, optionally placing it on a LONGER axis.
+
+        ``axis_off``/``axis_total`` serve the continuous-plots split, where the
+        per-frame plots refresh at 10 Hz while this heatmap's per-block cube
+        takes seconds to transform (measured: 6 s at T=30k, B=377). This matrix
+        is then over an older, shorter span than the plots stacked above it --
+        and because they share a widget width and are read down a column, a
+        matrix drawn edge-to-edge over its OWN length would put its frame 7800
+        directly above their frame 8300. That is an x-axis misregistration, not
+        merely stale data: it invites reading a burst against the wrong value.
+        A staleness label does not fix it.
+
+        So the matrix is drawn at its true position on the shared axis and the
+        uncovered tail is hatched as UNEXAMINED, reusing the coverage vocabulary
+        `_Strip` established. Registration is exact everywhere and the lag reads
+        as a visibly short frontier instead of a badge to be believed.
+
+        Defaults reproduce the previous behaviour exactly, so every non-live
+        caller is unaffected.
+        """
         self.matrix = np.asarray(m, np.float32)          # (T, K)
+        T = self.matrix.shape[0] if self.matrix.size else 0
+        self.axis_off = max(0, int(axis_off))
+        self.axis_total = max(int(axis_total) if axis_total is not None else T,
+                              self.axis_off + T)
         # A per-frame max feeds the cursor readout: for a distribution the
         # single most telling number is the fastest block right now, not a mean.
         # NaN cells mean "this block is not part of the frame's distribution"
         # (e.g. the tensor explorer's gated appearance-fraction blocks); an
         # all-NaN frame reads 0 rather than leaking NaN into the readout.
+        #
+        # y spans the whole AXIS, not the matrix. It positions the cursor
+        # (paintEvent divides by y.size), so leaving it at matrix length would
+        # put the cursor at the wrong frame the moment the two differ. Uncovered
+        # frames are NaN rather than 0: nothing computed a value there, and 0 is
+        # the examined-and-quiet reading.
         if self.matrix.size:
-            y = np.zeros(self.matrix.shape[0], np.float32)
+            y = np.full(self.axis_total, np.nan, np.float32)
+            seg = np.zeros(T, np.float32)
             has = np.isfinite(self.matrix).any(1)
             if has.any():
-                y[has] = np.nanmax(self.matrix[has], 1)
+                seg[has] = np.nanmax(self.matrix[has], 1)
+            y[self.axis_off:self.axis_off + T] = seg
             self.y = y
         else:
             self.y = np.zeros(0, np.float32)
@@ -822,14 +865,59 @@ class DensityPlot(MiniPlot):
         self._range = (lo, hi)
         return self._range
 
+    def _hatch_unexamined(self, rgb, w):
+        """Hatch the columns lying OUTSIDE the span this matrix covers.
+
+        It has to be a hatch, not a tone. ``_RAMP[0]`` is (12, 12, 12), i.e.
+        exactly ``PLOT_BG`` -- so "a bin with zero blocks in it" and "no data has
+        covered this column yet" would render as identical dark pixels. That is
+        the §10 traps 7/8 failure: nobody looked, wearing the appearance of
+        nothing happened. A hatch is not producible by any colormap value, so it
+        reads as absence rather than as an empty bin.
+
+        The mask comes from the covered SPAN, not from which columns happened to
+        receive a frame. Deriving it from the frames -- ``np.unique(col)`` -- was
+        the first cut and is wrong whenever the covered region holds fewer frames
+        than it spans pixels: 64 frames over 300 columns leave 236 covered
+        columns frameless, and they were painted as unexamined, shredding real
+        data into stripes. That is this method's own failure inverted, and it is
+        the normal case for any live window shorter than the plot is wide.
+        """
+        T = self.matrix.shape[0]
+        total = max(int(self.axis_total), T)
+        if total <= T:
+            return rgb                       # matrix spans the axis: nothing to mark
+        h = rgb.shape[0]
+        # Columns whose axis range intersects the covered frames
+        # [axis_off, axis_off + T). Column c spans axis positions
+        # [c*total/w, (c+1)*total/w), so the right edge needs a CEILING: flooring
+        # it drops the last partial column, leaving a few columns of real data
+        # hatched at the frontier -- the same lie as the bug above, just narrower.
+        c_lo = (self.axis_off * w) // total
+        c_hi = -(-((self.axis_off + T) * w) // total)      # ceil, exclusive
+        gap = np.ones(w, bool)
+        gap[max(0, c_lo):min(w, c_hi)] = False
+        if not gap.any():
+            return rgb
+        # Broadcast rather than mgrid: two 1-D aranges give the same stripe mask
+        # without materializing two full (h, w) index arrays per rebuild.
+        stripe = ((np.arange(w)[None, :] + np.arange(h)[:, None]) % 8) < 2
+        out = np.where(gap[None, :, None], _UNEXAMINED_BG, rgb)
+        return np.where((gap[None, :] & stripe)[..., None], _UNEXAMINED_FG, out)
+
     def _density_image(self, w: int, h: int, lo: float, hi: float):
         if w <= 0 or h <= 0 or self.matrix.size == 0:
             return None
-        key = (w, h, float(lo), float(hi), self._ver, self._log_axis)
+        key = (w, h, float(lo), float(hi), self._ver, self._log_axis,
+               self.axis_off, self.axis_total)
         if self._img is not None and self._img_key == key:
             return self._img
         T, K = self.matrix.shape
-        col = np.clip((np.arange(T) * w) // max(1, T), 0, w - 1)
+        total = max(int(self.axis_total), T)
+        # Frames are placed by their AXIS index, so the heatmap lands under the
+        # matching column of every plot stacked with it.
+        col = np.clip(((np.arange(T) + self.axis_off) * w) // max(1, total),
+                      0, w - 1)
         col_idx = np.repeat(col, K).astype(np.int64)
         vals = self.matrix.ravel()
         ok = np.isfinite(vals)
@@ -846,8 +934,9 @@ class DensityPlot(MiniPlot):
         x = np.clip(norm, 0, 1) * (len(self._RAMP) - 1)
         i = np.clip(x.astype(int), 0, len(self._RAMP) - 2)
         f = (x - i)[..., None]
-        rgb = (self._RAMP[i] * (1 - f) + self._RAMP[i + 1] * f).astype(np.uint8)
-        rgb = np.ascontiguousarray(rgb)
+        rgb = (self._RAMP[i] * (1 - f) + self._RAMP[i + 1] * f)
+        rgb = np.ascontiguousarray(self._hatch_unexamined(rgb, w)
+                                   .astype(np.uint8))
         img = QImage(rgb.data, w, h, 3 * w,
                      QImage.Format.Format_RGB888).copy()
         self._img, self._img_key = img, key
@@ -886,8 +975,12 @@ class DensityPlot(MiniPlot):
         p.setPen(TXT)
         p.drawText(self._title_x(), 12,
                    self.title + (" [log axis]" if self._log_axis else ""))
-        val_txt = f"max {cur:.4g} {self.unit}".strip()
-        p.setPen(QColor(self.color))
+        # NaN means the cursor sits past this matrix's span while the per-frame
+        # plots have run further ahead. Say so: "max nan" reads as a broken
+        # number, and any finite stand-in would be a value nothing computed.
+        val_txt = ("unexamined here" if not np.isfinite(cur)
+                   else f"max {cur:.4g} {self.unit}".strip())
+        p.setPen(TXT_DIM if not np.isfinite(cur) else QColor(self.color))
         p.drawText(int(r.right()) - 7 * len(val_txt) - 2, 12, val_txt)
         p.setPen(TXT_DIM)
         p.drawText(int(r.left()), int(r.bottom()) + 8, f"{lo:.3g}")

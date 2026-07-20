@@ -120,29 +120,165 @@ class SetChannelDataTests(_QtTestCase):
         ex.set_channel_data(_slid(cd, window_start=200))   # 10 is long gone
         self.assertEqual(ex.frame, 0)
 
-    def test_the_cube_cache_is_dropped_and_the_generation_bumped(self):
-        """Cubes are keyed by (region, channel) and carry no span, so one built
-        over the previous window is indistinguishable from a current one."""
+    def test_the_cube_cache_is_kept_across_the_update(self):
+        """Cubes now OUTLIVE the span they were built over.
+
+        They used to be cleared here, on the reasoning that a cube keyed only by
+        (region, channel) cannot be told apart from a current one. That was right
+        about the hazard and wrong about the remedy: once the per-frame plots run
+        at 10 Hz against a transform that takes seconds, clearing means no cube
+        ever survives long enough to be drawn and the densities stay empty for
+        the whole pass. The span travels with the cube instead.
+        """
         ex, cd = self._explorer(T=64)
-        ex._sg_cache[(0, ex.channel)] = np.zeros((4, 64, 4), np.float32)
+        key = (0, ex.channel)
+        ex._sg_cache[key] = np.zeros((4, 64, 4), np.float32)
+        ex._sg_span[key] = (0, 64)
         gen = ex._data_gen
         ex.set_channel_data(_slid(cd, window_start=8))
-        self.assertEqual(len(ex._sg_cache), 0)
+        self.assertIn(key, ex._sg_cache)
+        self.assertEqual(ex._sg_span[key], (0, 64))   # its OWN span, not the new one
         self.assertGreater(ex._data_gen, gen)
 
-    def test_a_cube_from_before_the_update_is_dropped_not_cached(self):
-        """The race the generation exists for: a worker launched against the old
-        span returns after the new one is in place. Caching it would serve a
-        scalogram of a span the user has already left, for as long as the
-        selection stays put -- and it would be blamed on the transform."""
+    def test_a_cube_from_before_the_update_is_tagged_with_its_own_span(self):
+        """The race: a worker launched against the old span returns after the new
+        one is in place. It is kept, but it must be recorded as covering the span
+        it was actually transformed over -- that is what lets the density heatmap
+        draw it in the right place instead of stretching it over the new span,
+        which would misalign every column against the per-frame plots above it.
+        """
         ex, cd = self._explorer(T=64)
         ex.active_region_index = 0
         ex._cube_gen = ex._data_gen                 # as _launch_worker stamps it
+        ex._cube_span = (0, 64)                     # ...and the span it stamps
         ex.set_channel_data(_slid(cd, window_start=8))
         stale = np.zeros((len(ex.freqs), 64, 4), np.float32)
         with patch.object(ex, "_request_cube"):
             ex._on_cube_ready((0, ex.channel), stale)
-        self.assertNotIn((0, ex.channel), ex._sg_cache)
+        self.assertIn((0, ex.channel), ex._sg_cache)
+        self.assertEqual(ex._sg_span[(0, ex.channel)], (0, 64))
+
+    def test_a_lagging_cube_is_placed_at_its_own_span_not_stretched(self):
+        """The registration the whole split turns on.
+
+        These plots are stacked, share a widget width and are read down a
+        column. A cube covering [0, 64) drawn edge-to-edge over a span that has
+        grown to 128 would put its frame 40 above the traces' frame 80 -- an
+        x-axis misregistration that invites reading a burst against the wrong
+        value. It must be placed at its true offset with the rest hatched.
+        """
+        ex, cd = self._explorer(T=128)
+        ex.active_region_index = 0
+        key = (0, ex.channel)
+        # A cube over only the first 64 frames of a 128-frame span.
+        ex._sg_cache[key] = np.zeros((len(ex.freqs), 64, 4), np.float32)
+        ex._sg_span[key] = (0, 64)
+        ex._refresh_densities()
+        dp = ex.density_plots[ex.channel]
+        self.assertEqual(dp.matrix.shape[0], 64)     # not stretched to 128
+        self.assertEqual(dp.axis_off, 0)
+        self.assertEqual(dp.axis_total, 128)         # ...on the FULL axis
+
+    def test_the_hatch_marks_the_span_not_the_frames_that_landed(self):
+        """Coverage is a property of the SPAN, not of which columns happened to
+        receive a frame.
+
+        Deriving it from the frames breaks whenever the covered region holds
+        fewer frames than it spans pixels -- 64 frames over 300 columns leave 236
+        of them frameless -- and those columns were painted as unexamined,
+        shredding real data into stripes. That is the hatch's own purpose
+        inverted, and it is the normal case for any live window shorter than the
+        plot is wide (~600 px), so a dense-span test cannot see it.
+        """
+        from gui.explorers.speed_explorer import DensityPlot
+        w, h = 600, 120
+        T, K, total = 64, 20, 128          # covers exactly the left half
+        dp = DensityPlot("d")
+        dp.set_matrix(np.random.default_rng(0).random((T, K), np.float32),
+                      0, total)
+        lo, hi = dp._data_range()
+        img = dp._density_image(w, h, lo, hi)
+        ptr = img.constBits()
+        ptr.setsize(h * w * 3)
+        a = np.frombuffer(ptr, np.uint8).reshape(h, w, 3).astype(int)
+        # The hatch is blue-dominant; both the ramp and an empty bin are not.
+        hatched = (a[:, :, 2] > a[:, :, 0] + 4).mean(axis=0) > 0.5
+        self.assertEqual(hatched[:300].sum(), 0, "covered columns hatched")
+        self.assertGreater(hatched[300:].sum(), 290, "uncovered columns bare")
+
+    def test_a_cube_the_ring_has_partly_evicted_is_trimmed_not_slid(self):
+        """window_start advances as the ring drops oldest frames, so a cube built
+        earlier can start BEFORE the current span. Clamping that negative offset
+        to zero would slide the whole matrix forward and draw old data over newer
+        frames -- silently, and looking perfectly plausible."""
+        ex, cd = self._explorer(T=64)
+        ex.active_region_index = 0
+        ex.set_channel_data(_slid(cd, window_start=32, T=64))
+        key = (0, ex.channel)
+        ex._sg_cache[key] = np.zeros((len(ex.freqs), 64, 4), np.float32)
+        ex._sg_span[key] = (0, 64)          # covers absolute [0, 64); span is [32, 96)
+        ex._refresh_densities()
+        dp = ex.density_plots[ex.channel]
+        # Only absolute [32, 64) overlaps: 32 frames, sitting at offset 0.
+        self.assertEqual(dp.matrix.shape[0], 32)
+        self.assertEqual(dp.axis_off, 0)
+        self.assertEqual(dp.axis_total, 64)
+
+    def test_a_retained_cube_does_not_stop_the_next_one_being_built(self):
+        """Retention's own trap: once cubes outlive their span, "already cached"
+        stops meaning "current". If a cache HIT short-circuits the request, the
+        first cube of a live pass is the only one ever built and the density
+        freezes at the opening window behind a forever-growing hatch -- which
+        reads as slow progress, not as a stuck cache."""
+        ex, cd = self._explorer(T=64)
+        ex.active_region_index = 0
+        key = (0, ex.channel)
+        ex._sg_cache[key] = np.zeros((len(ex.freqs), 64, 4), np.float32)
+        ex._sg_span[key] = (0, 64)
+        self.assertTrue(ex._cube_is_current(key))
+        # Patched across the update: set_channel_data rebuilds, which launches a
+        # real worker, and _request_cube then serialises correctly against it --
+        # so an unpatched probe afterwards measures the in-flight guard rather
+        # than the staleness check this test is about.
+        with patch.object(ex, "_launch_worker") as lw:
+            # No build in flight: the constructor starts one, and _request_cube
+            # serialises against it, so leaving it set would make this measure
+            # the in-flight guard rather than the staleness check.
+            ex._worker = None
+            # The span moves on: the cached cube is now history, not the answer.
+            ex.set_channel_data(_slid(cd, window_start=8, T=64))
+            self.assertFalse(ex._cube_is_current(key))
+            lw.assert_called_once_with(key)
+
+    def test_the_live_path_does_not_re_percentile_the_overlay(self):
+        """np.percentile is a full sort of T*B floats -- 53 ms at T=30k, B=377,
+        on its own more than three times the rest of the fast path. Running it at
+        10 Hz reintroduces exactly what _rebuild_selected_views froze it to
+        avoid. A drifting normalization also makes the channel non-comparable by
+        eye across time."""
+        ex, cd = self._explorer(T=64)
+        ex.active_region_index = 0
+        ex.set_channel_data(_slid(cd, window_start=0, T=64))   # seeds it
+        before = ex._ov_scale
+        with patch("gui.explorers.scalogram_explorer.np.percentile") as pc:
+            ex.set_channel_data(_slid(cd, window_start=8, T=64), live=True)
+            pc.assert_not_called()
+        self.assertEqual(ex._ov_scale, before)
+        # ...but a non-live update still rescales.
+        with patch("gui.explorers.scalogram_explorer.np.percentile",
+                   return_value=1.0) as pc:
+            ex.set_channel_data(_slid(cd, window_start=16, T=64))
+            pc.assert_called()
+
+    def test_the_first_live_update_still_sets_the_overlay_scale(self):
+        """_ov_scale starts at EPS, so a pass whose every update took the live
+        path would normalize the overlay by epsilon and saturate every block."""
+        ex, cd = self._explorer(T=64)
+        ex.active_region_index = 0
+        ex._ov_scale_set = False
+        ex.set_channel_data(_slid(cd, window_start=0, T=64), live=True)
+        self.assertTrue(ex._ov_scale_set)
+        self.assertGreater(ex._ov_scale, 0.0)
 
     def test_the_frame_count_readout_is_not_left_on_the_first_window(self):
         ex, cd = self._explorer(T=64)
@@ -277,22 +413,29 @@ class StreamWiringTests(_SurfaceTestCase):
         s._on_advanced(0, 300, 200.0)
         self.assertNotIn("behind playback", s.status_lbl.text())
 
-    def test_an_update_is_skipped_while_the_last_cube_is_still_building(self):
-        """The livelock this backpressure exists for: the cube worker cannot be
-        cancelled and will not relaunch while one is in flight, so pushing a new
-        span every tick makes every cube arrive against a newer generation, get
-        dropped, and relaunch -- the scalogram then never appears AT ALL, rather
-        than appearing late."""
+    def test_an_update_is_no_longer_skipped_while_a_cube_builds(self):
+        """The backpressure is GONE, and this pins why removing it was safe.
+
+        It existed for a livelock: the cube worker cannot be cancelled, and a
+        cube arriving after its span had moved used to be DISCARDED, so pushing a
+        new span every tick meant every cube was dropped and relaunched and the
+        scalogram never appeared at all. The discard is what has gone -- a cube
+        is retained and tagged with the span it covers -- so a late cube is now
+        late data correctly placed, and there is nothing to protect against.
+
+        The gate was throttling the per-FRAME plots (~12 ms together at
+        whole-clip length) to the rate of a per-BLOCK transform up to 500x slower
+        that feeds none of them.
+        """
         s = self._surface()
         del s._show_live_window                      # use the real one
         s._explorer = MagicMock()
         s._explorer.is_building.return_value = True
         s._stream_meta = {"fps": 30.0, "grid": [1, 1]}
         s._show_live_window(self._win(64, token=1))
-        s._explorer.set_channel_data.assert_not_called()
-        s._explorer.is_building.return_value = False
-        s._show_live_window(self._win(64, token=1))
         s._explorer.set_channel_data.assert_called_once()
+        # ...and it goes down the live path, which skips the overlay percentile.
+        self.assertIs(s._explorer.set_channel_data.call_args.kwargs["live"], True)
         s._explorer = None
 
     def test_the_terminal_update_lands_even_while_a_cube_builds(self):

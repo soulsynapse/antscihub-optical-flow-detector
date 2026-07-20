@@ -1853,3 +1853,148 @@ keep parking requests across that gap.
 `False` during the run and the final window is re-rendered once the answer is in.
 The status line alone was not enough: anything reading `cd.meta` — detection
 included — would have seen a clean window. Same obligation as §15.
+
+## 24. Batch Q slice 5: the continuous-plots split, and the constant it disturbs
+
+The remaining half of the user's ask: the scalogram may refresh at ~1 Hz, but
+the selected-channel trace and the detection sweep should be **continuous**.
+They cannot simply be ungated — `_show_live_window`'s `is_building()` gate is
+what stops every cube arriving stale (§23 trap 3). The shape is a split of
+`set_channel_data` into a fast path and the cube rebuild. This section records
+the measurement that sized the fast path, because it landed somewhere other than
+where the plan (and this author) expected.
+
+### The measured tiers
+
+`F` = 24 scales, fps 24, best-of-N, synthetic `(T, B)` float32. `B` = 377 is
+block 16 on a replicate; `B` = 29 is block 64.
+
+| | T=5000, B=377 | T=30000, B=377 |
+|---|---|---|
+| pooled mean `blocks.mean(axis=1)` | 0.34 ms | 3.2 ms |
+| **`np.percentile(blocks, 99)`** | **15.4 ms** | **53.0 ms** |
+| pooled Morlet `morlet_power((T,))` | 1.9 ms | 8.1 ms |
+| density band sum `cube[i:j].sum(0)` | 5.9 ms | 91.2 ms |
+| **per-block cube `morlet_power((T,B))`** | **444 ms** | **6020 ms** |
+
+### The pooled Morlet is NOT the expensive thing, contrary to the obvious read
+
+`_rebuild_selected_views` is docstringed as "cheap per-frame views (no cube
+needed)" while visibly calling `morlet_power`, which invites the inference that
+the transform is the hidden cost on the fast path. It is not: **8 ms at 30k
+frames**, the cheapest non-trivial item measured. It transforms a single `(T,)`
+pooled series, so it carries none of the `B` factor that makes the cube 6
+seconds. The docstring is accurate and the suspicion was wrong. Recorded because
+it is a natural mistake to make twice — `morlet_power` appears in both the fast
+path and the slow one, and only the `(T, B)` call site is expensive.
+
+(The pooled-Morlet row is also the noisiest in the table: repeated runs at
+identical `T` spread ~2.5x, which is §22's session-drift warning showing up
+within a single session. It does not matter here — every reading is under 25 ms
+— but do not quote that row to two significant figures.)
+
+### The cost is `np.percentile`, and it re-opens a closed decision
+
+`_ov_scale = max(float(np.percentile(blocks, 99)), EPS)` is **6-45x the pooled
+mean** and dominates the fast path, because it is a full sort of `T*B` floats.
+It is also the line at `scalogram_explorer.py:1366` carrying the comment that it
+is frozen at rebuild time *"so scrubbing (which redraws every frame) never
+re-percentiles the array in the hot path"* — i.e. §20's lesson. **Running the
+fast path at 10 Hz re-percentiles 10x/sec and reintroduces exactly what that
+comment exists to prevent**, one layer up.
+
+So `_ov_scale` stays on the SLOW cadence. It is an overlay colour scale, not
+data, and holding it steady is independently the better behaviour: a
+normalization that drifts every tick makes the same channel non-comparable by
+eye across time — the same argument that refused Batch G's zoom margin (§19).
+Same-looking pixels must mean the same value, or the overlay is decoration.
+
+### 10 Hz holds, but only because per-block data stays WINDOWED
+
+Fast path windowed (`T~5000`, minus the percentile): **~8 ms, 10 Hz with wide
+headroom.** With the percentile: ~24 ms, still 10 Hz. But at whole-video
+`T=30000` the same path is ~155 ms — **6.5 Hz, and the target fails silently.**
+
+This makes the plan's per-frame/per-block split (todo.md, Batch Q REDESIGN) a
+**precondition of the cadence, not just of memory**. It was justified there on
+footprint alone: per-frame series are ~120 KB at 30k frames while the `(F,T,B)`
+cube is several GB. The timing is a second, independent reason for the same
+boundary, and the more fragile one — a future change that lets the density
+window grow toward clip length would break the frame rate long before it broke
+the budget, and would do it without any error.
+
+### The registration hazard, which is what the design call was actually about
+
+todo.md framed the split's risk as "a scalogram from an older span beside traces
+from a newer one … must be visibly marked". That understates it. `ScalogramPlot`
+and the trace plots map their columns across the **same widget width**, stacked,
+and are read down a column — so a cube over `[0, 8000)` beside traces over
+`[0, 9500)` puts **frame 7800 directly above frame 8300**. That is an x-axis
+misregistration, not staleness, and a badge does not fix it: it yields a
+correctly-labelled plot that still invites reading a burst against the wrong
+trace value.
+
+Decided with the user: **pad the cube onto the new span's axis and paint the
+uncovered tail as unexamined**, reusing slice 4's three-state coverage
+vocabulary rather than inventing a staleness marker. Registration is then exact
+everywhere, and the lag becomes a geometric fact — the scalogram's frontier
+visibly trailing the traces' — instead of a claim in a badge. This is the same
+remedy class as slice 4's coverage mask and §10 traps 7/8: make "nobody looked"
+a distinct painted state instead of letting it borrow the appearance of a
+computed zero.
+
+Cost of that choice, both real: `_sg_cache` is keyed `(region, channel)` with no
+span, which is exactly why `set_channel_data` clears it wholesale — keeping a
+cube across a span change means storing its span alongside it. And
+`set_scalogram` derives its axis from `matrix.shape[1]`, so the pad needs
+handling in `_heatmap`'s normalization and in the `matrix.sum(axis=0)` cursor
+readout.
+
+### The 10 Hz rate was justified on the wrong half, then measured on the right one
+
+Raising `_WINDOW_REQUEST_HZ` from 1.0 to 10.0 was argued from the table above —
+the GUI-side plot cost. But the comment being replaced was not about that. It
+said *"a window is a copy of hundreds of block frames"*: a claim about the
+PRODUCER, on the worker thread, which is also the decode thread of a pass
+already measured at 0.75x realtime once `appearance` is enabled. Answering a
+different question than the one the old comment asked is how a regression gets
+argued into place, so it was measured too.
+
+`StreamBuffer.window` is a deliberate copy (contiguity for the transform) and
+takes the `np.concatenate` seam branch whenever the span wraps the ring. Two
+channels per request, filled past capacity so every read wraps:
+
+| trailing window | block grid | MB/request | ms/request | worker duty at 10 Hz |
+|---|---|---|---|---|
+| 600 | 19x19 | 1.7 | 0.04 | 0.0% |
+| 2000 | 19x19 | 5.8 | 1.09 | 1.1% |
+| 5000 | 19x19 | 14.4 | 1.81 | **1.8%** |
+
+**Negligible, and the estimate that worried about it was right on volume and
+wrong on impact**: ~144 MB/s of copy at the worst case, against a memcpy rate
+near 8 GB/s. 10 Hz costs the decode loop under 2% even at the largest window and
+finest grid measured. The old comment's instinct was sound and the number is
+simply small.
+
+### The hatch's first cut inverted its own purpose, and a dense test could not see it
+
+`_hatch_unexamined` first derived the uncovered columns from `np.unique(col)` —
+the columns that actually RECEIVE a frame. That is wrong whenever the covered
+span holds fewer frames than it spans pixels: **64 frames over 300 columns leave
+236 covered columns frameless**, and every one of them was painted as
+unexamined. Real per-block data rendered as "nobody looked" — this mechanism's
+own failure mode, inverted, and strictly worse than the state it was built to
+prevent, because it destroys signal rather than merely flattering it.
+
+Coverage is a property of the SPAN, so it is now computed from
+`[axis_off, axis_off + T)` mapped into column space, with a **ceiling on the
+right edge** — flooring it drops the last partial column and leaves a few
+columns of real data hatched at the frontier, the same lie made narrower.
+
+**Two things worth carrying forward.** The bug passed the whole suite: both
+registration tests used spans far longer than the render width (3000 frames into
+~450 columns), where every covered column happens to receive a frame. A test
+whose data is denser than the failure requires cannot see it, and "covered" and
+"received a frame" are only the same question in that regime. And the reachable
+case is not exotic — any live window shorter than the plot is wide (~600 px),
+which is every window early in a pass.

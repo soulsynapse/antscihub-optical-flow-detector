@@ -410,6 +410,11 @@ class ScalogramExplorer(QWidget):
         # Bounded by the number of distinct replicate tile sizes on screen.
         self._tint_cache: dict[tuple, np.ndarray] = {}
         self._ov_scale = EPS       # replaced by a real percentile in _rebuild
+        # Whether _ov_scale has ever been set from actual data. A live pass skips
+        # the percentile (see _rebuild_selected_views), and the FIRST rebuild of
+        # a pass must not be allowed to skip it too -- the overlay would then
+        # normalize by EPS and render every block saturated.
+        self._ov_scale_set = False
         # Detection-window D (frames): the binary gate reads the centered mean of
         # "# blocks in band" over D, so a 1-frame spike of N blocks dilutes to
         # N/D and cannot fake a sustained event. Centered by default (offline, so
@@ -425,7 +430,17 @@ class ScalogramExplorer(QWidget):
         # than by count: a full-length clip may hold only the current one, a
         # short clip many -- degrades correctly instead of running out of RAM.
         self._sg_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        # The (window_start, T) each cached cube was transformed over. A cube now
+        # OUTLIVES the span it was built on -- that is what lets the per-frame
+        # plots run at 10 Hz while the cube takes seconds -- so the span has to
+        # travel with it, or the density heatmap it feeds cannot be drawn at the
+        # right place on the shared time axis. See DensityPlot.set_matrix.
+        self._sg_span: dict[tuple, tuple[int, int]] = {}
         self._worker = None
+        # The span the in-flight cube is being transformed over, captured at
+        # launch: self.window_start/self.T may both have moved by the time it
+        # lands, which is the normal case on a live pass.
+        self._cube_span: tuple[int, int] = (0, 0)
         # Bumped by every set_channel_data. The cube cache is keyed by
         # (region, channel) and NOT by the data, so on a live surface -- where
         # the channels are replaced under a fixed geometry once a second -- that
@@ -542,13 +557,21 @@ class ScalogramExplorer(QWidget):
     def is_building(self) -> bool:
         """Whether a per-block cube is still being transformed off-thread.
 
-        A live producer must gate its updates on this. The cube worker cannot be
-        cancelled and ``_request_cube`` refuses to launch while one is running,
-        so replacing the channels faster than a cube builds means every cube
-        arrives against a newer generation, is dropped, and is relaunched only to
-        be dropped again -- the scalogram then never appears at all, silently.
-        Gating instead makes the display refresh at the rate the transform can
-        actually sustain, which is the honest behaviour anyway.
+        DO NOT gate live updates on this. That is what it was for, and the
+        reason is gone: a cube arriving after its span had moved used to be
+        DISCARDED, so updating faster than the transform ran meant every cube
+        was dropped and relaunched and the scalogram never appeared at all.
+        Cubes are now retained and tagged with the span they cover
+        (``_sg_span``), drawn at that span with the remainder hatched, so a late
+        cube is late data correctly placed rather than wrong data.
+
+        Gating on it now costs what it used to buy: it throttles the per-FRAME
+        plots -- ~12 ms together even at whole-clip length -- to the rate of a
+        per-block transform up to 500x slower that feeds none of them
+        (FINDINGS §24).
+
+        Kept as a status predicate: it is what ``_set_busy`` and any
+        "still working" readout should ask. Nothing in the update path reads it.
         """
         return self._worker is not None
 
@@ -563,8 +586,16 @@ class ScalogramExplorer(QWidget):
         """
         self._update_frame(self.T - 1)
 
-    def set_channel_data(self, channel_data) -> None:
+    def set_channel_data(self, channel_data, live: bool = False) -> None:
         """Replace the channels in place, keeping the tuning and the geometry.
+
+        ``live=True`` selects the 10 Hz path used by a streaming pass: it skips
+        the overlay re-percentile (see _rebuild_selected_views). Everything else
+        is shared, because everything else is per-frame and measured cheap
+        enough to run at that rate even on a whole clip (§24). The per-BLOCK
+        cube is NOT on this path -- it takes seconds, keeps running at its own
+        pace, and its density heatmap is drawn at the span it actually covers
+        with the remainder hatched.
 
         This is the streaming counterpart to rebuilding the explorer from a
         fresh ChannelData. A rebuild is right when the GEOMETRY moves (a
@@ -615,7 +646,13 @@ class ScalogramExplorer(QWidget):
         # Every cube was transformed over the previous span. Keyed by (region,
         # channel) only, so they cannot be told apart from current ones -- drop
         # them wholesale rather than trying to salvage the overlapping frames.
-        self._sg_cache.clear()
+        # Cubes are RETAINED across the span change, each tagged with the span it
+        # was transformed over (_sg_span). Clearing them here was right when this
+        # was the only update path and wrong once the per-frame plots refresh
+        # faster than a cube builds: at 10 Hz against a multi-second transform,
+        # every cube would be discarded before it could ever be drawn and the
+        # density heatmaps would stay empty for the entire pass. _refresh_densities
+        # now places each cube at its true position and hatches the remainder.
         self._density_dirty = set(CHANNELS)
 
         # A cursor that was riding the newest frame keeps riding it; otherwise
@@ -637,7 +674,7 @@ class ScalogramExplorer(QWidget):
         # _recompute_windowed_count before the new channels are in place).
         self._sync_labels()
         self._sync_info_label()
-        self._rebuild_scalograms()
+        self._rebuild_scalograms(rescale_overlay=not live)
         self._redraw_video()
 
     # -- view-state carry-over (survives a live re-extract rebuild) ----------
@@ -1334,8 +1371,32 @@ class ScalogramExplorer(QWidget):
         for name, dp in self.density_plots.items():
             if name not in wanted:
                 continue
-            cube = self._sg_cache.get((self.active_region_index, name))
-            dp.set_matrix(cube[i:j].sum(axis=0) if cube is not None else empty)
+            key = (self.active_region_index, name)
+            cube = self._sg_cache.get(key)
+            if cube is None:
+                dp.set_matrix(empty)
+                continue
+            # Place the cube on the CURRENT span's axis. A cube may have been
+            # transformed over an older, shorter span -- that is the normal case
+            # on a live pass, where the per-frame plots refresh at 10 Hz and this
+            # takes seconds -- and drawing it edge to edge would misalign every
+            # column against the plots stacked above it.
+            c_start, c_T = self._sg_span.get(key,
+                                             (self.window_start, cube.shape[1]))
+            mat = cube[i:j].sum(axis=0)                  # (T_cube, B)
+            # Intersect the cube's absolute span with the current one. The
+            # offset can go NEGATIVE -- the ring drops oldest frames, so
+            # window_start advances past the start of a cube built earlier -- and
+            # clamping it to 0 would slide the whole matrix forward, drawing old
+            # data over newer frames. Trim to the overlap instead.
+            lo = max(0, self.window_start - c_start)
+            hi = min(c_T, self.window_start + self.T - c_start)
+            if hi <= lo:
+                dp.set_matrix(empty)         # cube is entirely off the axis now
+                continue
+            dp.set_matrix(mat[lo:hi],
+                          axis_off=(c_start + lo) - self.window_start,
+                          axis_total=self.T)
         # The off-range check needs a MATRIX, and cubes arrive asynchronously --
         # at region-change time every matrix is still (0,0), so checking there
         # silently never fires. This is the one funnel every matrix lands in
@@ -1344,9 +1405,19 @@ class ScalogramExplorer(QWidget):
         self._sync_band_note()
 
     # -- scalogram computation ----------------------------------------------
-    def _rebuild_selected_views(self):
+    def _rebuild_selected_views(self, rescale_overlay: bool = True):
         """Cheap per-frame views of the selected channel (no cube needed): the
-        replicate-mean trace and the pooled-mean scalogram + overlay scale."""
+        replicate-mean trace and the pooled-mean scalogram + overlay scale.
+
+        Everything here is per-FRAME, and measured cheap enough to run at 10 Hz
+        on a live pass even at whole-clip length (FINDINGS §24): the pooled mean
+        is ~3 ms at T=30k, B=377 and the pooled Morlet ~8 ms. The Morlet looks
+        like the expensive call and is not -- it transforms one (T,) series,
+        carrying none of the B factor that makes the per-BLOCK cube take
+        seconds.
+
+        ``rescale_overlay=False`` is what makes that budget hold: see below.
+        """
         arr = self._chan_arr()
         blocks = self._scope_blocks(arr, self.active_region_index)   # (T, B)
         pooled = blocks.mean(axis=1)
@@ -1363,9 +1434,21 @@ class ScalogramExplorer(QWidget):
         # Overlay color scale is a whole-clip percentile of this channel/scope;
         # freeze it here so scrubbing (which redraws every frame) never
         # re-percentiles the array in the hot path.
-        self._ov_scale = max(float(np.percentile(blocks, 99)), EPS)
+        #
+        # A live pass skips it, because a 10 Hz caller re-percentiles 10x/sec and
+        # reintroduces exactly what the line above avoids: it is a full sort of
+        # T*B floats and measured 53 ms at T=30k, B=377 -- on its own more than
+        # three times the rest of this method (§24). Holding it steady is also
+        # the better picture. A normalization that drifts every tick makes the
+        # same channel non-comparable by eye across time, which is the argument
+        # that refused Batch G's zoom margin (§19): same-looking pixels must mean
+        # the same value or the overlay is decoration. It is refreshed on the
+        # slow cadence instead, alongside the cube.
+        if rescale_overlay or not self._ov_scale_set:
+            self._ov_scale = max(float(np.percentile(blocks, 99)), EPS)
+            self._ov_scale_set = True
 
-    def _rebuild_scalograms(self):
+    def _rebuild_scalograms(self, rescale_overlay: bool = True):
         """React to a replicate or channel change: refresh the cheap views, then
         serve the selected channel's per-block cube from the memo cache or a
         background build. Other channels' densities fill in only if their cube is
@@ -1386,26 +1469,49 @@ class ScalogramExplorer(QWidget):
             return
 
         self._block_snap = self._make_snap(self.active_region_index)
-        self._rebuild_selected_views()
+        self._rebuild_selected_views(rescale_overlay=rescale_overlay)
         self._apply_selected_plot_ui()
         self._refresh_densities()
         self._recompute_sweep()
-        # Build the selected channel's cube if it isn't cached yet.
-        if self._sg_cache.get((self.active_region_index, self.channel)) is None:
+        # Build the selected channel's cube unless the cached one already covers
+        # the span on screen (see _cube_is_current -- "cached" is not the same
+        # question once cubes outlive their span).
+        key = (self.active_region_index, self.channel)
+        if not self._cube_is_current(key):
             self._request_cube()
         else:
-            self._sg_cache.move_to_end((self.active_region_index, self.channel))
+            self._sg_cache.move_to_end(key)
             self._set_busy(False)
 
+    def _cube_is_current(self, key) -> bool:
+        """Whether the cached cube for ``key`` covers the span now on screen.
+
+        "Cached" stopped being the same question as "current" when cubes began
+        outliving their span. Treating the two as one means that on a live pass
+        the FIRST cube is the only one ever built -- it is present, so every
+        later request returns early -- and the density heatmap freezes at the
+        opening window behind a hatch that grows for the rest of the clip. That
+        failure looks like slow progress rather than a stuck cache, which is why
+        it is worth a named predicate.
+
+        A static explorer never moves its span, so this stays true and nothing
+        rebuilds; a live one falls through to a fresh build on every tick, with
+        the in-flight check in _request_cube serialising them.
+        """
+        if self._sg_cache.get(key) is None:
+            return False
+        return self._sg_span.get(key) == (self.window_start, self.T)
+
     def _request_cube(self):
-        """Build the SELECTED channel's cube unless it is already cached or a
-        build is in flight. Only the selected channel is ever built (lazy): the
-        running worker re-checks the current selection when it ends, so a rapid
-        channel/region switch coalesces onto the latest target."""
+        """Build the SELECTED channel's cube unless the cached one already
+        covers the current span, or a build is in flight. Only the selected
+        channel is ever built (lazy): the running worker re-checks the current
+        selection when it ends, so a rapid channel/region switch coalesces onto
+        the latest target."""
         if self.active_region_index < 0 or self._worker is not None:
             return
         key = (self.active_region_index, self.channel)
-        if self._sg_cache.get(key) is not None:
+        if self._cube_is_current(key):
             return
         self._launch_worker(key)
 
@@ -1423,6 +1529,7 @@ class ScalogramExplorer(QWidget):
                         f"{len(self.freqs)}×{self.T}×{b} (~{self._fmt_bytes(est)})…",
                         paint=True)
         self._cube_gen = self._data_gen
+        self._cube_span = (self.window_start, self.T)
         self._worker = _ScalogramWorker(key, blocks, self.fps, self.freqs, self)
         self._worker.done.connect(self._on_cube_ready)
         # Free the finished thread (and its private (T, B) blocks copy) instead
@@ -1432,21 +1539,45 @@ class ScalogramExplorer(QWidget):
         self._worker.start()
 
     def _on_cube_ready(self, key, cube):
-        if self._cube_gen != self._data_gen:
-            # The channels were replaced while this built, so the cube's T axis
-            # belongs to a window that is gone. Caching it under (region,
-            # channel) would serve it as current for as long as the selection
-            # stays put. Drop it and rebuild against what is on screen now.
-            self._worker = None
-            self._request_cube()
-            if self._worker is None:
-                self._set_busy(False)
-            return
+        stale = self._cube_gen != self._data_gen
+        # Kept either way, tagged with the span it was actually transformed over.
+        # It used to be DROPPED when stale, on the reasoning that a cube whose T
+        # axis belongs to a gone window would be served as current. That reasoning
+        # was right about the hazard and wrong about the remedy: on a live pass
+        # the channels are replaced far faster than a cube builds, so every cube
+        # was stale on arrival and the densities stayed empty for the whole run.
+        # Recording the span lets DensityPlot draw it in its true position with
+        # the uncovered remainder hatched, which answers the same hazard without
+        # throwing away seconds of completed work.
         self._sg_cache[key] = cube
+        self._sg_span[key] = self._cube_span
         self._sg_cache.move_to_end(key)
         self._worker = None
         region_idx, channel = key
         self._evict_cache(protect=(self.active_region_index, self.channel))
+        if stale:
+            # Show what just landed, then start the next one against the current
+            # span. Without the refresh the newly cached cube waits for some
+            # other event to draw it.
+            #
+            # The sweep and the overlay refresh here too, exactly as on the
+            # non-stale path below. The selected channel's density matrix is the
+            # DETECTOR'S input (see _refresh_densities), so updating the heatmap
+            # without them leaves the detection readout reading an older cube.
+            # A live pass takes this branch for every cube, and while
+            # set_channel_data would recompute the sweep within 100 ms anyway,
+            # that masking is incidental -- it disappears the moment the fast
+            # path is slowed or gated, and then the asymmetry is a silent stale
+            # detector rather than a visible lag.
+            self._refresh_densities()
+            if region_idx == self.active_region_index and \
+                    channel == self.channel:
+                self._recompute_sweep()
+                self._redraw_video()
+            self._request_cube()
+            if self._worker is None:
+                self._set_busy(False)
+            return
         if region_idx == self.active_region_index and region_idx >= 0:
             # Fold the new cube into its channel's density (and, if it is the
             # selected one, the sweep + overlay).
@@ -1469,6 +1600,9 @@ class ScalogramExplorer(QWidget):
             if k == protect:
                 continue
             total -= self._sg_cache.pop(k).nbytes
+            # The span dict is keyed the same way and would otherwise retain an
+            # entry for every cube ever evicted.
+            self._sg_span.pop(k, None)
 
     # -- status line ---------------------------------------------------------
     @staticmethod

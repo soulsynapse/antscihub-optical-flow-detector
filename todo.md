@@ -172,6 +172,7 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 19. Replicate direct manipulation | where T20's dropdown actually lives, why right-click-to-delete was refused, and two silent-write drag bugs |
 | 22. Batch P streaming generator | the measured nil cost, why absolute fps is not comparable across sessions, and the three traps in the new seam |
 | 23. Batch Q continuous surface | the cube-build livelock, the 1-frame window that renders, the backwards-drifting cursor, and why a slice with no observable behaviour means the boundary is wrong |
+| 24. Batch Q continuous plots | the tier table, why the pooled Morlet is NOT the expensive call, the percentile that re-opened a closed decision, and the hatch that inverted its own purpose |
 
 ---
 
@@ -621,17 +622,69 @@ progress looks healthy reads exactly like a quiet clip.
 `gui/explorers/scalogram_explorer.py` (`seek_absolute` + a `frame_moved` signal,
 because the strip is a seeker and nothing emitted an ABSOLUTE cursor).
 
-**STILL OPEN — the continuous-plots half of the user's ask.** The scalogram, the
-selected channel trace and the detection sweep all refresh together at ~1 Hz via
-`set_channel_data`, gated on `explorer.is_building()`. The user asked for the
-scalogram at ~1 Hz (fine as-is) but the OTHER TWO CONTINUOUS. They cannot simply
-be ungated: `_show_live_window`'s gate is what stops every cube arriving stale
-(§23 trap 3). The real shape is to split `set_channel_data` into a cheap path
-(channels + per-frame plots, ~10 Hz) and the cube rebuild (its own slower
-cadence) — **which puts a scalogram from an older span beside traces from a
-newer one, and that must be visibly marked or it is precisely the
-stale-shown-as-current failure this surface exists to prevent.** Decide that
-before building it; it is not a rendering detail.
+**CLOSED by slice 5 below.** ~~The continuous-plots half of the user's ask.~~
+
+---
+
+### Batch Q slice 5 — continuous plots. LANDED 2026-07-20 (uncommitted)
+
+**Full write-up in `FINDINGS.md` §24.** The design call slice 4 deferred is
+settled and built. Three things this section exists to stop being re-derived:
+
+**1. The premise of the slice-4 spec was wrong, and in the user's favour.** That
+section said *"The user asked for the scalogram at ~1 Hz (fine as-is) but the
+OTHER TWO CONTINUOUS"* and built a two-cadence design around the scalogram being
+necessarily slow. **The user did not ask for 1 Hz** — confirmed directly:
+*"i didn't ask for it at 1hz, i said it would be whatever."* And it is not slow:
+`scalo_plot` is fed by `morlet_power(pooled)` over a single `(T,)` series, **8 ms
+at T=30k**. It is the per-BLOCK `(F,T,B)` cube — 0.44 s to 6 s — that is
+expensive, and the only plots it feeds are the DENSITIES. So all three plots the
+split was designed around go continuous together at 10 Hz (~12 ms total) and no
+split between them was needed at all. *A cost attributed to the wrong widget
+produced a whole design; measure which call site is expensive before designing
+around it.*
+
+**2. `is_building()` gating is GONE, and its docstring now says so.** It existed
+because a cube arriving after its span moved was DISCARDED (§23 trap 3). Cubes
+are now RETAINED and tagged with the span they cover (`_sg_span`), drawn at that
+span by `DensityPlot.set_matrix(m, axis_off, axis_total)` with the remainder
+hatched. A late cube became late data correctly placed, so the gate had nothing
+left to protect and was only throttling the fast plots to the slow transform's
+rate. **Its own trap, found in review:** once cubes outlive their span,
+"cached" stops meaning "current" — `_request_cube` returning early on a cache
+HIT would make the first cube of a pass the only one ever built. Hence
+`_cube_is_current`.
+
+**3. Registration, not staleness — the design call itself.** The slice-4 spec
+framed the risk as a stale scalogram needing to be "visibly marked". That
+understates it: these plots stack, share a width and are read down a column, so a
+cube over `[0,8000)` beside traces over `[0,9500)` puts frame 7800 above frame
+8300. A badge leaves that misregistration intact. Decided with the user: **pad
+onto the shared axis, hatch the uncovered tail**, reusing slice 4's coverage
+vocabulary. The lag becomes a geometric fact instead of a claim.
+
+**The hatch inverted its own purpose on the first cut** (§24): derived from which
+columns received a frame rather than from the span, it painted 236 of 300
+*covered* columns as unexamined — destroying signal, strictly worse than the
+state it prevents. It passed the full suite, because both registration tests used
+spans denser than the failure needs. **"Covered" and "received a frame" are the
+same question only when T ≥ plot width**, which no live window early in a pass
+satisfies.
+
+**`_ov_scale` moved to the slow cadence.** `np.percentile` is a full sort of
+`T*B` — 53 ms at T=30k, more than three times the rest of the fast path — and
+the line already carried a comment that it was frozen so scrubbing would not
+re-percentile in the hot path. A 10 Hz caller reintroduced exactly that, one
+layer up. Holding it steady is also the better picture, by §19's argument.
+
+**Producer cost was measured too**, because the comment being replaced was about
+the window COPY, not the plots: 1.8% of worker time at 10 Hz, worst case. Not a
+constraint. *The rate was nearly justified by answering a different question than
+the comment it overrode asked.*
+
+Suite 655 passing. `tests/test_live_stream.py` gained 6.
+
+---
 
 **Also open, found in review and deliberately not fixed:** dragging the strip
 runs `seek_absolute` -> `_apply_frame` -> `_redraw_video`, i.e. a video decode
@@ -657,9 +710,10 @@ thread below as the near-term order.
 2. **Batch Q** — continuous live surface on `core/stream_buffer.py`. **Slices 1
    (worker), 2 (surface + `set_channel_data`), 3 (COI) and 4 (the whole-video
    rebuild — `core/live_track.py`, coverage, staleness, the strip as seeker)
-   have all landed. Slice 4 is UNCOMMITTED as of this writing. What remains of
-   Q is the continuous-plots decision written up in the slice 4 section
-   above** — it is a design call, not a build.
+   have all landed, and so has **slice 5 (continuous plots — the split, the
+   axis registration, the 10 Hz rate)**. Slice 5 is UNCOMMITTED as of this
+   writing; see its section above and `FINDINGS.md` §24. **Batch Q is now
+   closed.** Next is Batch R + T30.
 3. **Batch R + T30** — marking rehomed, and **an actual corpus laid down**. The
    widget without the corpus unblocks nothing.
 4. **T31** — validate occupancy/ratios against that corpus, on the tail statistic.
