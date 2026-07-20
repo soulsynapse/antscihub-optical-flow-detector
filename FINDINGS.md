@@ -25,6 +25,10 @@ Contents:
 14. [N-worker throughput, and the node count](#14-n-worker-throughput)
 15. [The container frame count is not the decodable frame count](#15-the-container-frame-count-is-not-the-decodable-frame-count)
 16. [Clip-backed throughput: the 25x decode win is ~1.06x end to end](#16-clip-backed-throughput-the-25x-decode-win-is-106x-end-to-end)
+17. [Plot collapse](#17-plot-collapse-t10-t13-t14-batch-d)
+18. [Detection readout](#18-detection-readout-t15-t16-t27-t28-batch-e)
+19. [Replicate direct manipulation](#19-replicate-direct-manipulation-t11-t12-batch-g)
+20. [Region means measure the tile, not the animal — and live-streaming throughput](#20-region-means-measure-the-tile-not-the-animal)
 
 ---
 
@@ -1616,3 +1620,92 @@ that produces it will not notice when production stops producing it.
 `test_extract_then_block_change_reuses_the_cache_it_just_stored` runs a real
 extract and asserts on the cache that pass actually stored; it fails if the fit
 check misses.
+
+---
+
+## 20. Region means measure the tile, not the animal
+
+**Measured 2026-07-20 on `GX010047c2_02_17_26`, 6 tiles, block 64, scale 1.0,
+400 frames.** Mean `change` per replicate over time:
+
+| replicate | label | mean `change` |
+|---|---|---|
+| 0 | rep1-mostly-flying-some-pause | 9.08 |
+| 1 | rep2-backlit-flying-whole-time | 15.04 |
+| 2 | rep3-intermittent | 9.62 |
+| 3 | rep4 | 15.03 |
+| 4 | rep5 | 10.94 |
+| **5** | **rep6-NO-flying** | **15.22 — the highest of all six** |
+
+**The replicate with no flying has the most change energy.** A region mean over
+~81 blocks is dominated by substrate and lighting differences between tiles; the
+animal occupies a handful of blocks and is diluted to nothing. Within a replicate
+the mean varies only ~1.5x over 400 frames, so it carries almost no temporal
+signal either.
+
+**This re-derives the detection-channel design the hard way.** The existing
+detector already reads a channel as *in-band block count* and *largest connected
+clump*, never as a mean, for exactly this reason. An attempt to validate the new
+`occupancy` channel against the marked `Still` span used region means and produced
+a change still/moving ratio of **0.988** — an apparent null result that was really
+a null *statistic*. Nothing was wrong with the channel; the read was wrong.
+
+**So: any channel validation, comparison or ablation must use the tail statistic
+— per-block density, count in band, clump area — not a region mean.** A mean over
+a region whose animal occupies a small fraction of the blocks measures the region,
+not the behaviour. This is cheap to get wrong because the mean is the obvious
+first thing to compute and it returns a plausible number.
+
+**A second thing that attempt exposed: `marks.json` holds one 0.39 s span and no
+animal-absent spans at all.** So the corpus cannot currently discriminate
+present-but-still from empty, which is the entire claim `occupancy` exists to
+support. That is a data gap, not a code gap, and no channel work substitutes for
+it (todo.md T30).
+
+### Live-streaming throughput, and why channel choice is now a UI constraint
+
+Same clip and geometry, measured in the same session:
+
+| channel set | throughput | vs 23.98 fps playback |
+|---|---|---|
+| `intensity` + `change` | ~80 fps | **3.3x realtime** |
+| + `appearance` (needs the flow solve) | ~18 fps | **0.75x — falls behind** |
+
+The flow solve alone is ~24% of a full pass. So continuous "process up to the
+second" streaming is possible for the cheap channel set and **impossible** for the
+full one. Channel selection stopped being only a cost knob and became a
+live-performance knob; a streaming surface must show the frontier falling behind
+rather than presenting stale plots as current.
+
+### The cone of influence is not cosmetic
+
+Morlet at `w0=6` has e-folding support ~`1.46/f` seconds: **~2.9 s at 0.5 Hz,
+~0.07 s at 20 Hz.** On a live trailing window the newest frames are therefore
+zero-padding artifact at low frequencies and perfectly good at high ones —
+progressive fill is *naturally frequency-dependent*, and a wingbeat band is
+trustworthy almost immediately while a 0.5 Hz band needs seconds of history.
+
+Drawing that edge as data would be the same class of failure as §7's withdrawn
+detection panel and §4's withdrawn `sig_corr`: an authoritative-looking number
+that does not mean what it appears to. Fade or hatch the wedge.
+
+### Two API traps found by review in the same session
+
+Both are in `core/derived_channels.py` / `core/stream_buffer.py` and are fixed;
+recorded because both are easy to reintroduce.
+
+- **A default threshold derived from the data it is applied to makes a channel a
+  function of its own window.** `intensive()` and `ratio()` originally defaulted
+  their floor to a fraction of the median of the array passed in. Under a
+  growing-then-sliding ring that recomputes every second, the floor moves every
+  tick: a block near it flickers between a finite value and NaN with no input
+  having changed, and a threshold tuned on a 10 s window means something else on
+  the whole clip. This is §5's `rescale_count_band` trap in a new place. Floors
+  are absolute now. **The general rule: a constant that scales with its own input
+  is not a constant.**
+- **Validate every plane before writing any.** `StreamBuffer.append` originally
+  validated as it wrote. On a full ring `index % capacity` is the *oldest
+  retained* frame's slot, so a frame missing its second channel clobbered the
+  first channel of a live frame and then raised — leaving that frame holding data
+  from two points in the clip while `[start, frontier)` still claimed to be
+  intact.
