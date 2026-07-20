@@ -46,6 +46,7 @@ from core.video import VideoSource
 from core.wavelet import default_freqs
 from gui.explorers.detection_timeline import DetectionNavigator
 from gui.explorers.scalogram_explorer import ScalogramExplorer
+from gui.tuning_store import load_tuning, save_tuning
 
 # Downsampling is opt-in and off by default (todo.md Batch K), so there is no
 # longer an "auto" sentinel on the scale knob -- 1.0 is a real, and the default,
@@ -305,7 +306,20 @@ class LiveScalogramSurface(QWidget):
         self._explorer: ScalogramExplorer | None = None
         self._worker: _LiveExtractWorker | None = None
         self._proc_worker: _ProcessWorker | None = None
-        self._pending_state: dict | None = None
+        # Tuning remembered for THIS clip (see gui/tuning_store). Loaded before
+        # the strip is built so the controls come up on it, and seeded into
+        # _pending_state so the first extract's explorer opens on the bands that
+        # were left here -- the same channel the live rebuild path already uses,
+        # so a restored session and a re-extract cannot diverge.
+        self._saved = load_tuning(video_path)
+        self._pending_state: dict | None = self._saved.get("view") or None
+        # Replicate selection travels alongside, not inside, the view state: a
+        # rebuild deliberately resets the selection, and only the reopen case
+        # should restore it. Consumed by the first _swap_explorer.
+        self._pending_region = self._saved.get("region_index")
+        # Last view state we managed to capture, for saves that land while the
+        # explorer is being rebuilt (there is no live one to read then).
+        self._saved_view: dict | None = self._pending_state
         # Progress-readout timing/context, set when each pass starts.
         self._extract_t0 = 0.0
         self._extract_ctx = ""
@@ -363,6 +377,15 @@ class LiveScalogramSurface(QWidget):
         self._block_debounce.setSingleShot(True)
         self._block_debounce.setInterval(250)
         self._block_debounce.timeout.connect(self._on_block_changed)
+
+        # Persist the tuning on settle. Longer than either compute debounce
+        # because nothing waits on it: the point is one write per edit rather
+        # than one per keystroke, and a write that lands after the re-extract
+        # has already started costs nothing.
+        self._save_debounce = QTimer(self)
+        self._save_debounce.setSingleShot(True)
+        self._save_debounce.setInterval(1000)
+        self._save_debounce.timeout.connect(self._save_tuning)
 
         # Focusable so a committed spin-box edit has somewhere to hand focus
         # back to: the main window's Space handler walks up from the focus
@@ -478,6 +501,33 @@ class LiveScalogramSurface(QWidget):
         self.norm_combo.currentTextChanged.connect(self._debounce.start)
         row.addWidget(self.norm_combo)
 
+        # Everything to its left, plus the detection window and the three
+        # threshold bands in the explorer below, back to how this surface opens
+        # on a clip it has never seen. Sits at the end of the knob run rather
+        # than with Extract/Process: it is the last member of that group, not a
+        # third action on the video.
+        self.reset_btn = QPushButton("Reset")
+        self.reset_btn.setToolTip(
+            "Restore the defaults: window, downsample, block and normalize "
+            "above, and — in the panel below — the detection window D and all "
+            "three detection bands (frequency, channel value, block count). "
+            "Re-extracts once. The selected channel and replicate are kept.")
+        self.reset_btn.clicked.connect(self.reset_all)
+        row.addWidget(self.reset_btn)
+
+        # The defaults the button restores, snapshotted from the values just
+        # built -- BEFORE any remembered tuning is applied over them, so Reset
+        # goes to the program's defaults and not to whatever this clip happened
+        # to be left on last session.
+        self._strip_defaults = self._strip_values()
+        self._apply_strip(self._saved.get("strip") or {})
+        # Wired after the restore: the restore is not an edit and must not
+        # schedule a write of what it just read.
+        for sig in (self.start_slider.valueChanged, self.len_spin.valueChanged,
+                    self.ds_spin.valueChanged, self.block_spin.valueChanged,
+                    self.norm_combo.currentTextChanged):
+            sig.connect(lambda *_: self._save_debounce.start())
+
         # Two stacked, right-aligned status lines sit inline to the left of the
         # action buttons and take the row's slack: the extract / whole-video
         # compute on top, and the hosted explorer's graph-compute line just below
@@ -546,6 +596,80 @@ class LiveScalogramSurface(QWidget):
         tracked = FlowConfig(block_size=None).resolve_block_size(
             float(self.ds_spin.value()))
         self.block_spin.setSpecialValueText(f"auto ({tracked})")
+
+    # -- remembered tuning / reset -------------------------------------------
+    def _strip_values(self) -> dict:
+        """The strip's knobs as plain numbers, for saving and for Reset."""
+        return {"start": int(self.start_slider.value()),
+                "length_s": float(self.len_spin.value()),
+                "downsample": float(self.ds_spin.value()),
+                "block": int(self.block_spin.value()),
+                "normalize": self.norm_combo.currentText()}
+
+    def _apply_strip(self, values: dict) -> None:
+        """Push ``values`` onto the strip without arming a re-extract.
+
+        Signals are blocked throughout: every setter here is wired to a
+        debounce, so applying five of them live would queue five passes to
+        arrive at one state. Callers run the single pass themselves.
+
+        Out-of-range values are clamped by the widgets (a remembered window
+        start from a longer clip, a block above this build's ceiling), and an
+        unknown normalize mode is dropped rather than forced -- a sidecar is a
+        file on disk and may not have been written by this version.
+        """
+        widgets = (self.start_slider, self.len_spin, self.ds_spin,
+                   self.block_spin, self.norm_combo)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            if "start" in values:
+                self.start_slider.setValue(int(values["start"]))
+            if "length_s" in values:
+                self.len_spin.setValue(float(values["length_s"]))
+            if "downsample" in values:
+                self.ds_spin.setValue(float(values["downsample"]))
+            if "block" in values:
+                self.block_spin.setValue(int(values["block"]))
+            norm = values.get("normalize")
+            if norm is not None and self.norm_combo.findText(str(norm)) >= 0:
+                self.norm_combo.setCurrentText(str(norm))
+        except (TypeError, ValueError):
+            pass                # a malformed sidecar leaves the strip as it was
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        # Both labels read off knobs that just moved underneath them, and
+        # "auto" in particular resolves against the scale.
+        self._sync_window_label()
+        self._sync_block_auto_text()
+
+    def reset_all(self) -> None:
+        """Reset button: the strip to its defaults and the explorer's detection
+        tuning with it, then one re-extract.
+
+        The explorer is reset FIRST because ``extract`` captures its view state
+        to carry across the rebuild -- reset after, and the pass now in flight
+        would restore the bands this just cleared.
+        """
+        if self._explorer is not None:
+            self._explorer.reset_tuning()
+        self._apply_strip(self._strip_defaults)
+        self._save_debounce.start()
+        self.status_lbl.setText("reset to defaults · re-extracting…")
+        self.extract()
+
+    def _save_tuning(self) -> None:
+        """Write this clip's tuning sidecar (best-effort; see gui/tuning_store)."""
+        self._save_debounce.stop()
+        if self._explorer is not None:
+            self._saved_view = self._explorer.capture_view_state()
+            region = self._explorer.active_region_index
+        else:
+            region = self._pending_region
+        save_tuning(self.video_path, {"strip": self._strip_values(),
+                                      "view": self._saved_view,
+                                      "region_index": region})
 
     # -- config assembly -----------------------------------------------------
     def _build_cfg(self) -> PipelineConfig:
@@ -1110,6 +1234,14 @@ class LiveScalogramSurface(QWidget):
         # strip's second orange line. A direct relay (not a signal) so the
         # explorer can force a synchronous repaint of it before blocking work.
         new.set_status_relay(self.graph_status_lbl)
+        new.tuning_changed.connect(self._save_debounce.start)
+        if self._pending_region is not None:
+            # Reopening the clip: put the selection back before the bands land,
+            # so the count band's re-denomination measures against the replicate
+            # it was tuned on. Consumed once -- a later rebuild is a rebuild and
+            # keeps the reset-to-selection-view behaviour it always had.
+            new.select_region(int(self._pending_region))
+            self._pending_region = None
         if self._pending_state is not None:
             note = new.apply_view_state(self._pending_state)
             self._pending_state = None
@@ -1236,7 +1368,18 @@ class LiveScalogramSurface(QWidget):
         if self._explorer is not None:
             self._explorer.toggle_playback()
 
+    def hideEvent(self, e):
+        # Switching tabs is the other way a tuning session ends without a
+        # close, and the app can be quit from any tab. Cheap enough (one small
+        # JSON write) to take unconditionally rather than track dirtiness.
+        self._save_tuning()
+        super().hideEvent(e)
+
     def closeEvent(self, e):
+        # Flush before anything is torn down: closing the tab (a new video, a
+        # replicate edit that rebuilds the surface) is the most common way a
+        # session ends, and an armed debounce would be dropped with the widget.
+        self._save_tuning()
         self._restart_extract = False
         # A knob edited just before the close leaves a debounce armed; let it fire
         # and it re-enters extract() on a surface that is on its way out.

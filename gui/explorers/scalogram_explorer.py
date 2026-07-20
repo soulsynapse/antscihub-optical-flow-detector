@@ -220,6 +220,12 @@ class ScalogramExplorer(QWidget):
     # cubes (610 MB each) but only the current one for a multi-minute clip.
     _SG_CACHE_BUDGET = 6 * 1024 ** 3
 
+    # Something ``capture_view_state`` would report differently now. The live
+    # surface persists that state per video off this, so it fires only on
+    # committed changes (band RELEASE, not every drag frame) -- a signal per
+    # mouse-move would drive a sidecar write per pixel of drag.
+    tuning_changed = pyqtSignal()
+
     def __init__(self, cache=None, video_path: str | None = None, *,
                  state=None, sidecar_path: str | None = None,
                  channel_data=None, own_shortcuts: bool = True,
@@ -384,6 +390,7 @@ class ScalogramExplorer(QWidget):
         self._sweep_debounce.setInterval(120)
         self._sweep_debounce.timeout.connect(self._recompute_counts)
         self._build_ui()
+        self._wire_tuning_changed()
 
         # Shift-to-peek (hide the overlay to read the raw frame) rides an
         # application-wide event filter, exactly as the structure-tensor
@@ -469,6 +476,79 @@ class ScalogramExplorer(QWidget):
                             "region_blocks": self._region_block_count(
                                 self.active_region_index)},
         }
+
+    def _wire_tuning_changed(self) -> None:
+        """Relay every committed change to something ``capture_view_state``
+        reports. Wired here in one block rather than folded into each handler:
+        the set of persisted knobs is defined by that method, so the thing that
+        has to stay in step with it is one list, in one place.
+
+        Band plots are taken on ``band_committed`` only -- ``band_changed``
+        fires per mouse-move, and the persistence downstream is a file write.
+        """
+        srcs = [self.scalo_plot.band_committed,
+                self.count_w_plot.band_committed,
+                self.sweep_win_slider.valueChanged,
+                self.centered_chk.stateChanged,
+                self.region_combo.currentIndexChanged,
+                self.chan_group.buttonToggled]
+        srcs += [dp.band_committed for dp in self.density_plots.values()]
+        for sig in srcs:
+            # *_ because these signals carry assorted payloads (an index, a
+            # button, a check state) and none of them belong in the relay.
+            sig.connect(lambda *_: self.tuning_changed.emit())
+
+    def select_region(self, index: int) -> None:
+        """Focus a replicate by index, as clicking it in the video would.
+
+        Deliberately NOT part of apply_view_state: a rebuild resets the
+        selection on purpose (the grid may have moved under it), and this is
+        for the one case that is not a rebuild -- restoring the replicate a
+        remembered session was tuned against when the clip is reopened.
+        """
+        i = self.region_combo.findData(int(index))
+        if i >= 0:
+            self.region_combo.setCurrentIndex(i)
+
+    def reset_tuning(self) -> None:
+        """Every tuned detection parameter back to a freshly-built explorer's:
+        the three bands wide open, D at one second, centered.
+
+        The per-scope band memory goes with them. That cache exists so a
+        replicate switch does not discard a threshold, which is exactly what
+        would make it the one place a reset thresholds could survive -- reset,
+        then look at another replicate, and the old band reappears.
+
+        The selected channel and replicate are left alone: they say what you
+        are looking at, not what counts as a detection.
+        """
+        self._value_band_cache.clear()
+        self._count_band_cache.clear()
+        # None is "never placed", which set_band_active re-seeds wide open --
+        # the same lazy seeding a new explorer gets, rather than a hand-written
+        # +/-inf that would read as a threshold the user deliberately opened.
+        for pl in [self.scalo_plot, self.count_w_plot,
+                   *self.density_plots.values()]:
+            pl.band_lo = pl.band_hi = None
+        self.scalo_plot.set_band_active(True)
+        self.count_w_plot.set_band_active(True)
+        for name, dp in self.density_plots.items():
+            dp.set_band_active(name == self.channel)   # as _apply_selected_plot_ui
+            dp.update()
+        self.sweep_win = max(1, min(self.T - 1, int(round(self.fps))))
+        self.centered = True
+        # Both blocked: the recompute below covers them in one pass, where each
+        # left live would trigger its own O(F*T*B) re-sum on the way through.
+        self.sweep_win_slider.blockSignals(True)
+        self.sweep_win_slider.setValue(self.sweep_win)
+        self.sweep_win_slider.blockSignals(False)
+        self.centered_chk.blockSignals(True)
+        self.centered_chk.setChecked(True)
+        self.centered_chk.blockSignals(False)
+        self._sync_labels()
+        if self.active_region_index >= 0:
+            self._on_freq_band_committed()
+        self.tuning_changed.emit()
 
     def detection_params(self) -> dict:
         """The tuned detector settings, for the whole-video commit pass. Returns

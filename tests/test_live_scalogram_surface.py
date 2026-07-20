@@ -17,6 +17,7 @@ from gui.explorers import live_scalogram_surface
 from gui.explorers.live_scalogram_surface import (_Busy, _Cancelled,
                                                   _StreamWorker,
                                                   LiveScalogramSurface)
+from gui.tuning_store import tuning_path
 from tests.test_channel_source import _write_moving_square
 
 
@@ -56,7 +57,18 @@ class _SurfaceTestCase(_QtTestCase):
         surface.deleteLater()
         self.app.processEvents()
 
+    def _drop_tuning(self):
+        """The surface remembers its tuning in a sidecar next to the clip, and
+        every test here shares one clip. Without this, knobs set by one test are
+        restored into the next test's surface."""
+        try:
+            os.remove(tuning_path(self.video))
+        except OSError:
+            pass
+
     def _surface(self):
+        self._drop_tuning()
+        self.addCleanup(self._drop_tuning)
         reps = [{"id": 0, "label": "all", "frac": (0.0, 0.0, 1.0, 1.0)}]
         # singleShot is patched out so constructing the surface does not kick off
         # the opening extract pass.
