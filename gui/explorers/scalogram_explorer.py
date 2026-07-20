@@ -53,7 +53,8 @@ from core.channel_source import cache_channel_source
 from core.detection import (detect_gate, inband_count, largest_clump_per_frame,
                             rescale_count_band,
                             window_bounds, windowed_mean)
-from core.wavelet import band_indices, default_freqs, morlet_power
+from core.wavelet import (band_indices, coi_edge_samples, default_freqs,
+                          morlet_power)
 from gui.video_panel import FrameView
 from gui.explorers.speed_explorer import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
                                           TXT, TXT_DIM, DensityPlot, MiniPlot,
@@ -95,9 +96,14 @@ class ScalogramPlot(MiniPlot):
 
     BASE_H = MiniPlot.EXPANDED_H
 
-    def __init__(self, title: str, freqs: np.ndarray):
+    def __init__(self, title: str, freqs: np.ndarray, fps: float):
         super().__init__(title, unit="Hz")
         self.freqs = np.asarray(freqs, np.float64)
+        # Required, not defaulted: the cone of influence is a width in SECONDS
+        # converted to columns, so a wrong fps draws a confidently wrong wedge.
+        # Same reasoning as the cache_key provenance argument -- make the
+        # omission impossible rather than documented.
+        self.fps = float(fps)
         self.matrix = np.zeros((0, 0), np.float32)     # (F, T) power
         self._img = None
         self._img_key = None
@@ -141,7 +147,12 @@ class ScalogramPlot(MiniPlot):
     def _heatmap(self, w, h, lo, hi):
         if w <= 0 or h <= 0 or self.matrix.size == 0:
             return None
-        key = (w, h, self._ver)
+        # fps is in the key because _fade_coi's wedge width is derived from it.
+        # It cannot move today (set_channel_data refuses an fps change), so this
+        # guards a future setter rather than a live bug -- but a stale cached
+        # image would carry a wrong-width cone drawn as authoritatively as a
+        # right one, which is the one failure this plot must not have.
+        key = (w, h, self._ver, self.fps)
         if self._img is not None and self._img_key == key:
             return self._img
         F, T = self.matrix.shape
@@ -150,18 +161,82 @@ class ScalogramPlot(MiniPlot):
         tlo, thi = self._fwd(lo), self._fwd(hi)
         row_f = self._inv(thi - (np.arange(h) + 0.5) / h * (thi - tlo))
         fidx = np.clip(np.searchsorted(self.freqs, row_f), 0, F - 1)
-        col = np.clip((np.arange(w) * T) // max(1, T), 0, T - 1)
-        cells = np.log10(self.matrix[np.ix_(fidx, col)] + EPS)
+        vals, d = self._columns(w, T, fidx)
+        cells = np.log10(vals + EPS)
         cmin, cmax = float(cells.min()), float(cells.max())
         norm = (cells - cmin) / max(1e-9, cmax - cmin)
         x = np.clip(norm, 0, 1) * (len(_SG_RAMP) - 1)
         i = np.clip(x.astype(int), 0, len(_SG_RAMP) - 2)
         f = (x - i)[..., None]
-        rgb = np.ascontiguousarray(
-            (_SG_RAMP[i] * (1 - f) + _SG_RAMP[i + 1] * f).astype(np.uint8))
+        rgb = _SG_RAMP[i] * (1 - f) + _SG_RAMP[i + 1] * f
+        rgb = self._fade_coi(rgb, row_f, d)
+        rgb = np.ascontiguousarray(rgb.astype(np.uint8))
         img = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
         self._img, self._img_key = img, key
         return img
+
+    def _columns(self, w, T, fidx):
+        """Map the record's T frames onto w pixel columns.
+
+        Returns the per-column power ``(h, w)`` and ``d``, each column's
+        distance in FRAMES to the nearer end of the record, which is what the
+        cone of influence is measured against.
+
+        Reduced, not point-sampled. Gathering one frame per column drops the
+        rest: at T=11308 into 600 px that is ~94% of frames never drawn, so a
+        brief burst is rendered only if it happens to land on a sampled index --
+        signal absent from the plot with nothing to show it was ever there,
+        which is the failure mode this project designs against. It also left the
+        last ~T/w frames unreachable, so the rightmost column lagged a live
+        frontier. A per-column MAX matches how ``_Strip`` paints the whole-clip
+        detection strip, and preserves brief events by construction.
+
+        ``d`` takes each column's WORST frame (the one nearest an end), so a
+        column whose max may have come from inside the cone is faded as if it
+        did. Conservative in the direction that under-claims.
+        """
+        if T >= w:
+            bounds = np.linspace(0, T, w + 1).astype(int)
+            a, b = bounds[:w], bounds[1:]
+            # reduceat over [a[i], a[i+1]) -- segments are non-empty here
+            # because T >= w, which is what makes the plain form safe.
+            vals = np.maximum.reduceat(self.matrix, a, axis=1)[fidx]
+            d = np.minimum(a, T - b)
+        else:
+            # Fewer frames than pixels: nothing to reduce, each frame just
+            # spans several columns.
+            col = np.clip((np.arange(w) * T) // max(1, w), 0, T - 1)
+            vals = self.matrix[np.ix_(fidx, col)]
+            d = np.minimum(col, (T - 1) - col)
+        return vals, d
+
+    def _fade_coi(self, rgb, row_f, d):
+        """Blend the cone of influence toward the plot background.
+
+        ``morlet_power`` zero-pads the record, so within one e-folding time of
+        either end the coefficients measure the padding rather than the signal
+        -- and because that width is 1.369/f seconds, the contaminated wedge is
+        frequency-dependent: ~2.74 s at 0.5 Hz against ~0.068 s at 20 Hz. On a
+        live trailing window the newest seconds are therefore artifact at low
+        frequencies and fine at high ones, so progressive fill is naturally
+        frequency-shaped and drawing that edge as data would be a
+        plausible-looking wrong number of exactly the kind this codebase is
+        built against.
+
+        BOTH ends fade, not only the newest. A trailing window's oldest edge has
+        real frames before it, but the transform did not see them, so it is a
+        genuine zero-padding edge for this cube regardless.
+
+        The linear ramp -- background at the very edge, full colour one
+        e-folding time in -- is a rendering choice. The e-folding time is a
+        scale rather than a cutoff, so a hard boundary would overclaim where
+        contamination stops.
+        """
+        if not np.isfinite(self.fps) or self.fps <= 0:
+            return rgb
+        edge = np.maximum(coi_edge_samples(row_f, self.fps), 1e-9)[:, None]
+        alpha = np.clip(np.asarray(d)[None, :] / edge, 0.0, 1.0)[..., None]
+        return rgb * alpha + _SG_RAMP[0] * (1.0 - alpha)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -1002,7 +1077,7 @@ class ScalogramExplorer(QWidget):
         col.addWidget(self.trace_plot)
 
         self.scalo_plot = ScalogramPlot("scalogram (drag frequency band)",
-                                        self.freqs)
+                                        self.freqs, self.fps)
         self.scalo_plot.seek_requested.connect(self._seek)
         # band_changed fires on every mouse-move; the band-power re-sum is an
         # O(F*T*B) pass per cached channel, so debounce it and recompute eagerly

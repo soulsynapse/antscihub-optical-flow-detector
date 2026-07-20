@@ -114,7 +114,7 @@ class CollapsedDoesNoWorkTest(unittest.TestCase):
         self.assertTrue(dp.matrix.size, "collapse must not discard the matrix")
 
     def test_scalogram_releases_its_image_too(self):
-        sp = ScalogramPlot("s", np.linspace(0.5, 8.0, 12))
+        sp = ScalogramPlot("s", np.linspace(0.5, 8.0, 12), 24.0)
         sp.set_scalogram(np.random.rand(12, 40).astype(np.float32))
         sp.resize(200, sp.maximumHeight())
         sp.grab()

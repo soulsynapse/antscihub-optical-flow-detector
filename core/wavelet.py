@@ -28,6 +28,31 @@ def morlet_scales(freqs_hz: np.ndarray) -> np.ndarray:
     return (W0 + np.sqrt(2.0 + W0 * W0)) / (4.0 * np.pi * f)
 
 
+def coi_efolding_s(freqs_hz: np.ndarray) -> np.ndarray:
+    """Cone-of-influence half-width in SECONDS for each Fourier frequency.
+
+    Torrence & Compo's e-folding time for Morlet, ``tau = sqrt(2) * s``. Within
+    ``tau`` of either end of the record the coefficients are contaminated by the
+    zero-padding ``morlet_power`` applies rather than by the signal, so that
+    wedge is artifact and must not be read as data.
+
+    Derived from :func:`morlet_scales` rather than from a baked-in constant, so
+    it follows ``W0`` if that ever moves. At w0=6 it works out to 1.369/f
+    seconds -- ~2.74 s at 0.5 Hz against ~0.068 s at 20 Hz. (A figure of 1.46/f
+    circulated in the plan; it is ~7% too large.)
+
+    Note this is a SCALE, not a threshold: contamination decays through the
+    wedge rather than stopping at its edge. A renderer should grade it.
+    """
+    return np.sqrt(2.0) * morlet_scales(freqs_hz)
+
+
+def coi_edge_samples(freqs_hz: np.ndarray, fs: float) -> np.ndarray:
+    """:func:`coi_efolding_s` in samples at rate ``fs`` -- the form a plot with
+    a time axis in frames needs."""
+    return coi_efolding_s(freqs_hz) * float(fs)
+
+
 def default_freqs(fps: float, fmin: float = 0.5, fmax: float = 25.0,
                   n: int = 24) -> np.ndarray:
     """Log-spaced frequency bank, capped below Nyquist."""
@@ -51,7 +76,7 @@ def morlet_power(x: np.ndarray, fs: float, freqs_hz: np.ndarray) -> np.ndarray:
     # fast composite length. This is the Torrence & Compo zero-padding: the
     # ends see zeros instead of circularly wrapping onto the other end of the
     # record (and a prime T would force the FFT into a Bluestein fallback).
-    support = int(np.ceil(np.sqrt(2.0) * scales.max() / dt))
+    support = int(np.ceil(coi_efolding_s(freqs_hz).max() / dt))
     n = _fft.next_fast_len(T + support)
     Xf = _fft.fft(x, n=n, axis=0, workers=-1)          # complex64
     omega = 2.0 * np.pi * np.fft.fftfreq(n, d=dt)
@@ -103,7 +128,7 @@ def morlet_band_power(x: np.ndarray, fs: float, freqs_hz: np.ndarray,
     if band.size == 0:
         k = int(np.clip(i, 0, len(scales_all) - 1))
         band = scales_all[k:k + 1]
-    support = int(np.ceil(np.sqrt(2.0) * scales_all.max() / dt))
+    support = int(np.ceil(coi_efolding_s(freqs_hz).max() / dt))
     n = _fft.next_fast_len(T + support)
     omega = 2.0 * np.pi * np.fft.fftfreq(n, d=dt)
     heavi = omega > 0

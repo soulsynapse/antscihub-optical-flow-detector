@@ -259,11 +259,66 @@ so the slice needed `set_channel_data` there too. What slice 3 can assume:
 **Slice 3 remains:** the ~1 Hz bounded-trailing-window CWT **with the cone of
 influence drawn**. The COI is still the one thing that must not ship wrong.
 
-**Decided (2026-07-20), do not relitigate without a reason:**
+**Slice 3 LANDED (2026-07-20): the cone of influence, plus the time axis it
+needs.** `core.wavelet.coi_efolding_s` / `coi_edge_samples` derive the wedge from
+`morlet_scales` rather than a baked constant, and `ScalogramPlot` fades it toward
+the plot background at both ends. Two things worth not re-deriving:
 
-- **One island.** Seeking forward past the frontier abandons the span and restarts
+- **The plan's own constant was wrong.** This file said the e-folding support is
+  "≈1.46/f seconds". Torrence & Compo give τ = √2·s with s = 0.96805/f at w0=6,
+  i.e. **1.369/f** — 2.74 s at 0.5 Hz, not 2.9. ~7% too large. Deriving it from
+  `morlet_scales` in code is what makes the discrepancy moot.
+- **`ScalogramPlot`'s time axis was broken from the file's first commit**
+  (`6466687`), and the COI could not have been built on it. `col = (arange(w)*T)
+  // T` cancels to `arange(w)`: the heatmap gathered the first `w` FRAMES and
+  stretched them over the full width, showing ~5% of a whole-clip cube while the
+  cursor mapped over all `T`. A transposition of `DensityPlot`'s scatter, which
+  divides correctly. It hid precisely the newest edge the COI is about.
+
+**T35 — the DETECTOR still consumes the cone it now fades. OPEN, and the most
+important thing slice 3 did not close.** `detect_channel_region` →
+`morlet_band_power` → `inband_count` → `detect_gate` reads every frame of the
+window, edges included. At 24 fps the newest 66 frames are padding response at
+0.5 Hz, so a low-frequency edge transient can push `inband_count` over
+`count_band` and report a detection **at the frontier that vanishes when the
+window slides past it**. Fading the wedge on the display while the detector
+trusts the same values makes the picture honest and the numbers not — which is
+the failure this slice existed to prevent, moved one layer down.
+
+*The redesign is where this gets fixed, and it fixes it cheaply:* with an
+accumulating whole-video series, a window's COI-contaminated frames are simply
+**not written** into the accumulator, and a later overlapping window — for which
+those frames are interior rather than edge — supplies them. Coverage then means
+"computed from frames the transform could actually see", which is the honest
+definition anyway. Do NOT paper over it with a detector-side mask.
+
+**REDESIGN (2026-07-20, from use): the live axis is the WHOLE VIDEO.** Live mode
+should match the post-commit detection strip (`DetectionNavigator`) rather than a
+sliding window — plots continuous, moving with time, skipping around generating
+parts of the same whole-video picture, so navigation is whole-video throughout.
+This supersedes the two decisions immediately below; both are struck rather than
+deleted, because the reasoning that produced them is still what bounds the build.
+
+**What makes it affordable, and the split it forces.** Per-FRAME series are
+free at whole-video length — gate/clump are ~120 KB each at 30k frames, the
+pooled scalogram ~2.9 MB — so those carry the whole-video axis and fill
+progressively. **Per-BLOCK data cannot**: the `(F,T,B)` cube runs to several GB,
+which is the whole reason the ring buffer and `sysmem.budget_bytes` exist. So
+densities and the cube stay windowed around the cursor. The CWT still *computes*
+over a bounded window; only the axis it is painted onto grew.
+
+**The hazard this creates, and it is the standing one.** `_Strip` paints
+unfilled regions `(18,18,22)` — identical to a computed `gate 0, clump 0`. Under
+progressive fill that makes **unexamined indistinguishable from examined-and-quiet**
+(§10 traps 7/8; the governing principle). A coverage mask is therefore the first
+piece of this build, not a polish item.
+
+- ~~**One island.** Seeking forward past the frontier abandons the span and restarts
   there. No gap list, no backfill worker. Backward seek inside the ring is instant;
-  before it is just another restart.
+  before it is just another restart.~~ **REVERSED.** Skipping around keeps earlier
+  segments and the strip carries several. What made one island look right was the
+  cost of retaining per-block history; the per-frame series that the whole-video
+  axis actually needs are cheap enough that the argument does not apply to them.
 - **Ring buffer, oldest dropped**, capacity from `sysmem.budget_bytes`. This is what
   keeps a fine block grid usable — block 16 on a 30k-frame clip is ~1.8 GB for two
   channels.
