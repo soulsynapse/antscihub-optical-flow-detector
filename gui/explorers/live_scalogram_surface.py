@@ -364,6 +364,11 @@ class LiveScalogramSurface(QWidget):
         self._block_debounce.setInterval(250)
         self._block_debounce.timeout.connect(self._on_block_changed)
 
+        # Focusable so a committed spin-box edit has somewhere to hand focus
+        # back to: the main window's Space handler walks up from the focus
+        # widget, and this is the level that carries toggle_playback().
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
         root = QVBoxLayout(self)
         root.addWidget(self._build_strip(cfg))
 
@@ -399,6 +404,7 @@ class LiveScalogramSurface(QWidget):
         self.start_slider = QSpinBox()
         self.start_slider.setRange(0, max(0, self.frame_count - 2))
         self.start_slider.setSingleStep(max(1, int(self.fps)))
+        self._commit_on_enter(self.start_slider)
         self.start_slider.valueChanged.connect(self._on_window_changed)
         row.addWidget(self.start_slider)
         self.start_lbl = QLabel("0.00 s")
@@ -411,6 +417,7 @@ class LiveScalogramSurface(QWidget):
         self.len_spin.setRange(0.2, max(0.2, max_len))
         self.len_spin.setValue(min(10.0, max(0.2, max_len)))
         self.len_spin.setSuffix(" s")
+        self._commit_on_enter(self.len_spin)
         self.len_spin.valueChanged.connect(self._on_window_changed)
         row.addWidget(self.len_spin)
 
@@ -428,6 +435,7 @@ class LiveScalogramSurface(QWidget):
             "behaviour has to be demonstrated for that behaviour and species. "
             "It is offered because it is often what makes a large project "
             "computationally feasible — it shortens every per-pixel stage.")
+        self._commit_on_enter(self.ds_spin)
         self.ds_spin.valueChanged.connect(self._debounce.start)
         self.ds_spin.valueChanged.connect(self._sync_block_auto_text)
         row.addWidget(self.ds_spin)
@@ -454,6 +462,7 @@ class LiveScalogramSurface(QWidget):
             "re-extracting. On auto the block tracks the scale, holding the "
             "grid fixed in source pixels so that moving Downsample changes "
             "compute only — not localization.")
+        self._commit_on_enter(self.block_spin)
         self.block_spin.valueChanged.connect(self._block_debounce.start)
         row.addWidget(self.block_spin)
         self._sync_block_auto_text()
@@ -504,6 +513,26 @@ class LiveScalogramSurface(QWidget):
         # denoise is deliberately absent: it is stateful from frame zero and
         # cannot be reproduced for an arbitrary mid-clip window (forced off).
         return box
+
+    def _commit_on_enter(self, spin):
+        """Make a typed spin box commit on Enter, not per keystroke.
+
+        Keyboard tracking off means valueChanged fires once the edit is
+        committed (Enter, focus-out, or a step), so typing "0.25" no longer
+        arms three extracts on the way through 0, 0.2, 0.25. On commit the box
+        also hands focus back to the surface: while its line edit holds focus
+        it eats Space, and Space is the play/pause the user reaches for next.
+        """
+        spin.setKeyboardTracking(False)
+        spin.editingFinished.connect(self._release_edit_focus)
+
+    def _release_edit_focus(self):
+        # editingFinished also fires on focus-out, where the box no longer has
+        # focus and something else just took it. Only Enter leaves the sender
+        # focused, and only then should focus come back here.
+        spin = self.sender()
+        if spin is not None and spin.hasFocus():
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_window_changed(self, *_):
         self._sync_window_label()

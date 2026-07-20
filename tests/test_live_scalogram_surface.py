@@ -9,6 +9,8 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
 
+from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from gui.explorers import live_scalogram_surface
@@ -64,6 +66,68 @@ class _SurfaceTestCase(_QtTestCase):
         surface._show_channel_data = MagicMock()
         surface.extract = MagicMock()
         return surface
+
+
+class TypedKnobCommitTests(_SurfaceTestCase):
+    """Typing into a knob must not fire a pass per keystroke, and pressing Enter
+    must hand focus back: while a spin box's line edit holds focus it eats the
+    Space that toggles playback."""
+
+    # Typed text per knob, each a value the box will actually accept: a no-op
+    # edit commits nothing and would prove nothing. The downsample "0.25" is the
+    # case that motivated this -- it passes through 0 and 0.2 on the way, and
+    # with keyboard tracking on each of those committed a value and armed a pass.
+    KNOBS = (("ds_spin", "0.25"), ("block_spin", "5"),
+             ("len_spin", "1.0"), ("start_slider", "3"))
+
+    def _shown_surface(self):
+        # Focus does not move on a widget that was never shown, so every
+        # assertion here would pass vacuously against an unshown surface.
+        surface = self._surface()
+        surface.show()
+        self.app.processEvents()
+        return surface
+
+    def test_typing_does_not_arm_a_pass_until_enter(self):
+        surface = self._shown_surface()
+        for name, typed in self.KNOBS:
+            spin = getattr(surface, name)
+            with self.subTest(knob=name):
+                spin.setFocus()
+                spin.selectAll()
+                surface._debounce.stop()
+                surface._block_debounce.stop()
+                QTest.keyClicks(spin, typed)
+                self.assertFalse(surface._debounce.isActive())
+                self.assertFalse(surface._block_debounce.isActive())
+
+                QTest.keyClick(spin, Qt.Key.Key_Return)
+                self.assertTrue(surface._debounce.isActive()
+                                or surface._block_debounce.isActive())
+
+    def test_enter_returns_focus_to_the_surface(self):
+        surface = self._shown_surface()
+        for name, _ in self.KNOBS:
+            spin = getattr(surface, name)
+            with self.subTest(knob=name):
+                spin.setFocus()
+                QTest.keyClick(spin, Qt.Key.Key_Return)
+                self.assertFalse(spin.hasFocus())
+                # The main window's Space handler walks up from the focus widget
+                # looking for toggle_playback(); the surface must carry focus for
+                # that walk to find one.
+                self.assertTrue(surface.hasFocus())
+                self.assertTrue(callable(getattr(surface, "toggle_playback")))
+
+    def test_clicking_away_leaves_focus_where_the_user_put_it(self):
+        """editingFinished also fires on focus-out. Grabbing focus back there
+        would yank it out of whatever the user just clicked into."""
+        surface = self._shown_surface()
+        surface.ds_spin.setFocus()
+        surface.norm_combo.setFocus()
+
+        self.assertTrue(surface.norm_combo.hasFocus())
+        self.assertFalse(surface.hasFocus())
 
 
 class LiveScalogramSurfaceBlockTests(_SurfaceTestCase):
