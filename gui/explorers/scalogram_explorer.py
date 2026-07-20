@@ -62,15 +62,20 @@ from gui.explorers.speed_explorer import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
 EPS = 1e-6
 SWEEP_C = QColor(110, 230, 120)      # in-band count / clump
 
-# Channel -> (attribute, overlay colormap). All are nonnegative energies except
-# cached speed; the scalogram cares only about their temporal fluctuation, so the
-# choice is about which signal's rhythm you want to see.
+# Channel -> (attribute, overlay colormap). All are nonnegative energies; the
+# scalogram cares only about their temporal fluctuation, so the choice is about
+# which signal's rhythm you want to see.
+#
+# The pipeline's cached flow ``speed`` was listed here and is not any more. Every
+# channel below comes from the structure tensor and is available on a bare video,
+# so on the live surface -- the primary path now -- the flow row was permanently
+# disabled furniture, offering a channel that only the cache-backed entry point
+# could ever select. The cache still carries ``speed`` for the flow explorers.
 CHANNELS = {
     "change energy Jtt": ("change", cv2.COLORMAP_TURBO),
     "appearance energy": ("appearance", cv2.COLORMAP_TURBO),
     "tensor speed": ("tensor_speed", cv2.COLORMAP_TURBO),
     "intensity": ("intensity", cv2.COLORMAP_TURBO),
-    "cached flow speed": ("speed", cv2.COLORMAP_TURBO),
 }
 
 # Warm scalogram ramp (0 -> plot bg, up to hot white), distinct from the cyan
@@ -245,8 +250,10 @@ class ScalogramExplorer(QWidget):
         self._status_relay = None
 
         # Source of geometry + channels. A ChannelData decouples us from the
-        # cache: it comes either from an open cache (all five channels) or a live
-        # windowed pass over a bare video (four channels, no cached flow speed).
+        # cache: it comes either from an open cache or a live windowed pass over
+        # a bare video. Both carry the four structure-tensor channels this panel
+        # plots; a cache additionally carries flow "speed", which this panel no
+        # longer offers (see CHANNELS).
         if channel_data is None:
             if cache is None:
                 raise ValueError(
@@ -288,7 +295,8 @@ class ScalogramExplorer(QWidget):
                          int(self.meta.get("work_height", 1)))
 
         # Channels present in this source. tensor_speed/change/intensity/
-        # appearance are always here; "speed" (cached flow) only from a cache.
+        # appearance are always here; a cache-backed source also carries "speed",
+        # which stays in the dict (unused here) rather than being filtered out.
         self._chan = {k: np.asarray(v, np.float32)
                       for k, v in channel_data.channels.items()}
         self._channels_bytes = sum(a.nbytes for a in self._chan.values())
@@ -712,7 +720,10 @@ class ScalogramExplorer(QWidget):
 
     def _channel_available(self, name: str) -> bool:
         """Whether this source carries the channel behind display name ``name``.
-        Live (cacheless) sources lack ``cached flow speed``."""
+
+        True for every listed channel on both source types today -- the guard is
+        kept because it is what a partially-populated source would trip, and a
+        checked-but-absent channel would otherwise read as an empty detection."""
         return CHANNELS[name][0] in self._chan
 
     def _chan_arr(self):
@@ -901,7 +912,7 @@ class ScalogramExplorer(QWidget):
             cb.setEnabled(available)
             cb.setToolTip(
                 f"Detect on {name} (builds its cube on first check)" if available
-                else f"{name} needs a flow cache — unavailable on the live source")
+                else f"{name} is not carried by this source")
             cb.setChecked(available and name == self.channel)
             self.chan_group.addButton(cb)
             self.chan_checks[name] = cb
@@ -919,15 +930,16 @@ class ScalogramExplorer(QWidget):
         self.chan_group.buttonToggled.connect(self._on_channel_toggled)
 
         section("Detection sweep (selected channel)")
-        self.count_plot = PixelBarPlot("# blocks in band", unit="blocks",
-                                       color=SWEEP_C)
-        self.count_plot.seek_requested.connect(self._seek)
-        col.addWidget(self.count_plot)
         # T15: the detection gate is shaded onto this plot rather than drawn as
         # a separate 0/1 trace. The gate is read against THIS plot's band, so
         # the threshold and its consequence now share one set of axes; a
         # separate plot forced the eye to correlate two x-axes to see whether a
         # handle drag had done anything.
+        #
+        # It leads the sweep section, above the raw per-frame count, because it
+        # is the one carrying a live control: the permanent readouts are what
+        # the eye should land on first, and the raw count is the diagnostic you
+        # drop to when the windowed trace looks wrong.
         self.count_w_plot = MiniPlot("windowed # blocks in band (mean over D)"
                                      " -- green = positive detection",
                                      "blocks", SWEEP_C)
@@ -948,6 +960,10 @@ class ScalogramExplorer(QWidget):
         self.band_note.setStyleSheet("color:#d0a050; font-size:11px;")
         self.band_note.setVisible(False)
         col.addWidget(self.band_note)
+        self.count_plot = PixelBarPlot("# blocks in band", unit="blocks",
+                                       color=SWEEP_C)
+        self.count_plot.seek_requested.connect(self._seek)
+        col.addWidget(self.count_plot)
         self.clump_plot = PixelBarPlot("largest connected clump in band",
                                        unit="blocks", color=SWEEP_C)
         self.clump_plot.seek_requested.connect(self._seek)

@@ -228,16 +228,39 @@ def _block_mean(values: np.ndarray, block: int, h: int, w: int,
     reshape), and runs ``nanmean``: three full-size temporaries for what is a
     strided sum. Reshaping to (ny, block, nx, block) and reducing axes 1 and 3
     needs none of them. Only the ragged last row/column fall outside the regular
-    grid, and there are at most ny + nx of those cells, so they are done directly.
+    grid, and there are at most ny + nx of those cells.
+
+    Those edge cells are reduced as three SLABS rather than one at a time. The
+    per-cell loop was correct but paid numpy's fixed per-call overhead on cells
+    of a few thousand pixels: a 349x321 replicate tile at block 64 has 25 regular
+    cells and **11** ragged ones, so the loop ran 11 tiny ``mean`` calls per tile
+    per frame -- 24 200 of them in a 200-frame pass, and most of this function's
+    cost. The geometry makes the slabs possible: ``include_partial`` uses ceiling
+    division, so there is at most ONE short row and ONE short column, and every
+    cell in the bottom strip shares a height (every cell in the right strip, a
+    width). Only the corner is genuinely alone. 1.7-3x, and reducing the same
+    elements per cell as before.
     """
     out = np.empty((ny, nx), np.float32)
     full_y, full_x = h // block, w // block
+    rem_y, rem_x = h - full_y * block, w - full_x * block
+    # Gated on ny/nx exceeding the regular grid, NOT on rem_y/rem_x being
+    # nonzero: without include_partial, ny == full_y even when the plane has a
+    # remainder, and the short row is meant to be dropped. Writing out[full_y]
+    # then would be an IndexError.
     if full_y and full_x:
         core = values[:full_y * block, :full_x * block]
         out[:full_y, :full_x] = core.reshape(
             full_y, block, full_x, block).mean(axis=(1, 3), dtype=np.float32)
-    for by, bx, cell in _ragged_cells(values, block, h, w, ny, nx):
-        out[by, bx] = cell.mean(dtype=np.float32)
+    if ny > full_y and full_x:              # bottom strip: rem_y tall, block wide
+        out[full_y, :full_x] = values[full_y * block:, :full_x * block].reshape(
+            rem_y, full_x, block).mean(axis=(0, 2), dtype=np.float32)
+    if nx > full_x and full_y:              # right strip: block tall, rem_x wide
+        out[:full_y, full_x] = values[:full_y * block, full_x * block:].reshape(
+            full_y, block, rem_x).mean(axis=(1, 2), dtype=np.float32)
+    if ny > full_y and nx > full_x:         # the single corner cell
+        out[full_y, full_x] = values[full_y * block:, full_x * block:].mean(
+            dtype=np.float32)
     return out
 
 

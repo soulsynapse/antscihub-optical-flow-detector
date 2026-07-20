@@ -58,6 +58,17 @@ CHANNEL_VERSION = 3     # bump when the extraction math changes (sidecar key)
 _NEEDS_TENSOR = frozenset({"change", "appearance", "texture", "tensor_speed"})
 _NEEDS_FLOW = frozenset({"tensor_speed", "appearance"})
 
+# Which of the six tensor components each read actually consumes, in COMPONENTS
+# order (xx, yy, tt, xy, xt, yt). Forming and blurring all six regardless was
+# ~81% of a change-only pass on 5.3K footage (FINDINGS.md section 15) -- `change`
+# is tt alone, so five products and five full-resolution Gaussian blurs were
+# being computed and thrown away every frame.
+_COMPONENTS = {
+    "change": frozenset({2}),                       # tt
+    "texture": frozenset({0, 1, 3}),                # the spatial 2x2 block
+    "flow": frozenset(range(6)),                    # the LK solve reads all six
+}
+
 # Shared always-off timer so _reduce can time itself without a per-call branch.
 _NO_TIMER = Timer("", enabled=False)
 
@@ -267,6 +278,26 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                      ({"appearance"} if cached_uv is not None else set()))
     need_texture = "texture" in want and cached_texture is None
 
+    # The components actually consumed, so the products and the blur can skip the
+    # rest. Note what is NOT here: ``appearance`` against a supplied ``cached_uv``
+    # reads no tensor component at all -- it forms its own spatial gradient and
+    # rides the cached field -- so the cache-backed path now builds no tensor for
+    # it. Against the tensor's own flow it needs the solve, and so all six, which
+    # ``need_flow`` already covers.
+    comps: set[int] = set()
+    if "change" in want:
+        comps |= _COMPONENTS["change"]
+    if need_texture:
+        comps |= _COMPONENTS["texture"]
+    if need_flow:
+        comps |= _COMPONENTS["flow"]
+    # Recomputed from ``comps`` rather than from ``want``: the two disagree
+    # exactly in the appearance-with-cached-flow case above, and ``comps`` is the
+    # one that reflects the work.
+    need_tensor = bool(comps)
+    # Appearance is gated separately from the tensor for the same reason.
+    need_appearance = "appearance" in want
+
     out = {k: np.zeros((n if k in want else 0, ny, nx), np.float32)
            for k in CHANNELS}
     if n == 0:
@@ -348,16 +379,22 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                     if "texture" in want and cached_texture is not None:
                         out["texture"][oi, ay0:ay1, ax0:ax1] = \
                             cached_texture[i, ay0:ay1, ax0:ax1]
-                    if gp is not None and need_tensor:
-                        # Form and spatially smooth the complete 3-D tensor at a
-                        # small scale, solve LK per pixel, then reduce speed to
-                        # blocks. Solving once per block would couple the aperture
-                        # problem to the user's display/block size.
-                        with tm.span("tensor_products"):
-                            prods = tensor_products(gp, g)
-                        with tm.span("tensor_blur"):
-                            J = np.stack([cv2.GaussianBlur(prods[k], (0, 0), sigma)
-                                          for k in range(6)])
+                    if gp is not None and (need_tensor or need_appearance):
+                        # Form and spatially smooth the tensor components this
+                        # selection reads, at a small scale, solve LK per pixel,
+                        # then reduce speed to blocks. Solving once per block
+                        # would couple the aperture problem to the user's
+                        # display/block size.
+                        J: list = [None] * 6
+                        if need_tensor:
+                            with tm.span("tensor_products"):
+                                prods = tensor_products(gp, g, comps)
+                            with tm.span("tensor_blur"):
+                                # Only the requested planes; the rest stay None,
+                                # so a read that needs them raises rather than
+                                # quietly working on zeros.
+                                for k in comps:
+                                    J[k] = cv2.GaussianBlur(prods[k], (0, 0), sigma)
                         uv = None
                         if need_flow:
                             with tm.span("flow_solve"):
