@@ -19,8 +19,8 @@ to the relevant section rather than restating it.
 | id | item |
 |---|---|
 | ~~**T10**~~ | ~~Plots are themselves the main source of lag at block=1 with weak downsampling.~~ **FIXED** — see Batch D. Measured **3.2x** cheaper scrub collapsed. The premise was half wrong: plot cost tracks *widget pixel area*, not block count, so the win is the same at every block size (`FINDINGS.md` §17). |
-| **T11** | If fixed-size stamp is on, it should be the stamp of the *currently selected* replicate. Drawing a new box should select it (and set the stamp). |
-| **T12** | Replicate tab: clicking a replicate should highlight + zoom to it; dragging its box should reposition it; right-click should delete it (that tab only). |
+| ~~**T11**~~ | ~~If fixed-size stamp is on, it should be the stamp of the *currently selected* replicate.~~ **FIXED** — see Batch G. `stamp_size` became a property derived from the selection; the fix was to delete the second copy of the state, not to sync it. |
+| ~~**T12**~~ | ~~Clicking a replicate should highlight + zoom to it; dragging its box should reposition it; right-click should delete it.~~ **FIXED, with the right-click half deliberately REFUSED** — see Batch G. Right-click is `back_requested` on five other screens, and T12's own zoom is what makes this tab need an un-zoom. |
 | ~~**T13**~~ | ~~Per-block band power by channel draws black blocks when unpopulated — collapse those to checkbox height.~~ **FIXED** — see Batch D. |
 | ~~**T14**~~ | ~~All plots should collapse/expand via `[+]`, collapsed by default, and a collapsed plot must not render.~~ **FIXED** — see Batch D. |
 | ~~**T27**~~ | ~~The four **detection-sweep** plots draw the same black slab T13 removed from the density plots.~~ **FIXED** — see Batch E. Not the two-line change this entry claimed: the mechanism lived on `DensityPlot` and is keyed on `matrix`, so it had to move up to `MiniPlot` behind an overridable `_is_empty()`. |
@@ -29,7 +29,7 @@ to the relevant section rather than restating it.
 | ~~**T16**~~ | ~~On a detection, show a `DETECTED` badge (green bg, bold black) bottom-right of the viewer box.~~ **FIXED** — see Batch E; the shift-held exemption is pinned by a pixel test. |
 | ~~**T17**~~ | ~~Whole-video processing resets the detection threshold bands when navigating.~~ **FIXED** — see Batch F. |
 | ~~**T18**~~ | ~~"Process whole video" computes every channel regardless of the selected one.~~ **FIXED** — see Batch F. |
-| **T20** | Drop the replicate dropdown — redundant with click navigation. |
+| **T20** | ~~Drop the replicate dropdown — redundant with click navigation.~~ **RESCOPED, and it is not in the file this entry assumed** (`FINDINGS.md` §19). There is no dropdown on the replicate tab. The widget is `region_combo` in **five explorers**, where it is not redundant with click navigation but *is* the selection state — `active_region_index` reads `currentData()`, click-to-select is `setCurrentIndex`, and it carries a **pooled scope (`-1`) with no click gesture at all**. Deleting it means rehoming three things. Belongs with the explorers, not Batch G. |
 | **T21** | Suspected runaway memory issue somewhere on the replicate tab. **Not reproduced by inspection** — `_refresh_list` was the obvious suspect and is clean (14x14 swatch pixmaps, `list.clear()` releases the items). Needs an actual measurement, not more code reading; do not guess at a fix. |
 | ~~**T22**~~ | ~~New **viewer tab** consuming a fully-processed video.~~ **DROPPED** (2026-07-19) — scope, not value. A convenience shell over a `DetectionResult` that nothing else depends on; never started. Re-open only if day-to-day review actually stalls without it. |
 | ~~**T23**~~ | ~~**ROI pre-transcode**: cut each source once into per-replicate clips + manifest.~~ **DONE** — see Batch I. Works, and **the premise it was justified on turned out false**: the 25x isolated decode win is **1.06x end to end** (`FINDINGS.md` §16). Not the lever that moves the floor at scale 1.0. |
@@ -117,6 +117,8 @@ in Batch K — see `FINDINGS.md` §9.)
 | O | decodable frame count (T26) | `cba9824` |
 | D | plot collapse, empty-plot collapse (T10, T13, T14) | `0b112a6` |
 | E | detection readout (T15, T16, T27, T28) | `4fdf8b0` |
+| N (item 2) | count-band re-denomination + the three permanent controls | `1d1f958` |
+| G (part) | replicate direct manipulation (T11, T12) — **T20, T21 still open** | — |
 
 Their durable output is `FINDINGS.md`. Everything else about them has been deleted.
 
@@ -154,6 +156,7 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 16. Clip-backed throughput | why the 25x decode win is 1.06x end to end, and where it may still be real |
 | 17. Plot collapse | the 3.2x, why it does not scale with block size, and the detector the collapse nearly disarmed |
 | 18. Detection readout | why the gate moved onto the band's own plot, the 1 px floor, and the badge's shift-peek exemption |
+| 19. Replicate direct manipulation | where T20's dropdown actually lives, why right-click-to-delete was refused, and two silent-write drag bugs |
 
 ---
 
@@ -279,11 +282,47 @@ nobody asked for), and `scale_sweep` now takes and records the same `channels`,
 because a cost model fitted across a four-channel and a one-channel sample reads
 the difference as scale.
 
-### Batch G — replicate tab (T11, T12, T20, T21) · `tab2_replicates` + `video_panel`
-Click-to-select + zoom, drag to reposition, right-click to delete (that tab only),
-fixed stamp follows selection, new box selects itself, drop the redundant dropdown.
-The memory leak (T21) is likely an overlay/pixmap not released per selection —
-chase it last, with the rest already simplified.
+### Batch G — replicate tab (~~T11~~, ~~T12~~, T20, T21) · `tab2_replicates` + `video_panel`
+**T11 and T12 landed. T20 left the batch, T21 is untouched — G is NOT closed.**
+Full write-up in `FINDINGS.md` §19; what matters here:
+
+**T11 — LANDED.** `stamp_size` is now a property derived from the selection
+rather than a stored value written by the last box *drawn*. Those were two
+pieces of state answering one question and they diverged whenever you selected
+an older box: the highlight said one thing, the next click placed another size.
+Same remedy class as T17 and the count-band re-denomination — delete the second
+copy rather than keep it in step.
+
+**T12 — LANDED, except the right-click, which was refused on purpose.**
+`FrameView` grows an opt-in `box_drag_enabled` (off by default, so the four
+explorers, `mask_dialog` and tab3 keep clicking *through* their boxes) plus
+`box_grabbed` / `box_clicked` / `box_moved`. Press selects, release-in-place
+zooms, drag repositions. Right-click stays `back_requested` = un-zoom: it means
+that on five other screens, and T12's own zoom is what makes this tab need one,
+so honouring the item would have made one button mean "go back" on five screens
+and "destroy a replicate" on the sixth. Delete stays on the button.
+
+**The zoom is the box's `frac` verbatim — the same call the explorers make.** A
+margin was built first and removed: same replicate at a different magnification
+is not comparable by eye, which is the whole reason to zoom. Its stated
+justification ("no room left to drag into") was also false, and the test that
+now pins dragging at full zoom exists because the no-margin choice makes that
+extrapolation load-bearing.
+
+**Two silent-write bugs, both found by review and confirmed with real mouse
+events**, both shaped "writes a change the user did not make": `moved` and the
+displacement came from separate sources (reachable via Qt's move-event
+compression — a release that reads as a 150 px drag while the cached delta is
+zero, firing `_rebuild_rois` and a sidecar write for a no-op), and a chorded
+right-click mid-drag committed a partial drag under a coordinate mapping the
+un-zoom had already changed. `tests/test_replicate_tab.py`, 26 tests.
+
+**Still open in this batch:**
+- **T20** — left the batch entirely; see the item above and §19. It is explorer
+  work, and a state-ownership change rather than a deletion.
+- **T21** (memory) — untouched, and still **must not be guessed at**. The plan's
+  own note stands: `_refresh_list` was inspected and is clean. It needs a
+  measurement. Nothing in this batch's changes bears on it either way.
 
 ### Batch I — ROI pre-transcode (T23) · `core/pretranscode.py` + `channel_source`  ← **CLOSED**
 Cut each source once into per-replicate clips plus a manifest (geometry, scale,
@@ -608,19 +647,28 @@ blurrier image to render.
 1. **State the storage cost.** One sentence, already measured in §5: ~0.9 TB per
    3000 h at block 64 against ~11 TB at block 16. This is the whole decision for
    most users and it does not need a plot.
-2. **Warn that changing block size invalidates the tuned detector — the item
-   this stub previously missed entirely.** `inband_count` produces a **raw block
-   count** and `detect_gate` compares it against raw `count_band` endpoints, with
-   no normalization by region size; `clump` is in block units too. A region holds
-   ~29 blocks at block 64 and ~377 at block 16, so **the same `count_band` means
-   something ~13x different** — a threshold of `[20, ∞)` is meaningful at block 16
-   and unreachable at block 64. Same class as T17: tuned state that quietly stops
-   meaning what it meant. Offer the re-scaled equivalent rather than only warning,
-   if that is cheap.
+2. ~~**Warn that changing block size invalidates the tuned detector.**~~
+   **LANDED (`1d1f958`), and as a conversion rather than a warning.** The
+   hazard, which is why this was the load-bearing item: `inband_count` produces
+   a **raw block count** and `detect_gate` compares it against raw `count_band`
+   endpoints with no normalization by region size (`clump` is in block units
+   too). A region holds ~29 blocks at block 64 and ~377 at block 16, so **the
+   same `count_band` means something ~13x different** — `[20, ∞)` is meaningful
+   at block 16 and unreachable at block 64, and the detector does not clamp or
+   fail when that happens, it just silently stops firing. Same class as T17.
+
+   `core.detection.rescale_count_band` now carries a band across the change.
+   The factor comes from **actual region block counts, not the block-size ratio
+   squared** — those disagree whenever the grid does not divide the working
+   frame evenly, and the actual count is what the detector compares against.
+   `capture_view_state` records `count_denom` (block size, region blocks, and
+   the region index, which is load-bearing because replicate tiles are not
+   uniform and a rebuilt explorer resets its selection). This plan offered the
+   re-scale "if that is cheap"; it was.
 3. **Possibly a grid overlay** on the live view showing cell size against the
    animal, which is the honest form of "what you lose" for a localization lever.
 
-Item 2 is the load-bearing one and is worth doing even if 1 and 3 never happen.
+Items 1 and 3 remain open, and neither blocks anything.
 
 **Still inherit M's required prose pattern** wherever this surfaces: state
 plainly both that the lever can be what makes a project feasible, *and* that it
@@ -631,9 +679,23 @@ produces either avoidance or silent degradation.
 
 ## 6. Order
 
-**I → J → O → D → E → F all landed and closed. Only G remains open.** **G is
-next**, and after it the plan is down to deferred work (L) plus two cheap
-measurements.
+**I → J → O → D → E → F closed. N item 2 landed. G is half done: T11 and T12
+landed, T20 left the batch, T21 is untouched.**
+
+**What is actually next, and none of it is a build:**
+
+1. **T21 (memory), the only open item on the replicate tab.** Still needs a
+   *measurement*, and the plan's standing instruction not to guess at a fix has
+   survived two sessions of inspection. Batch G did not touch it and does not
+   bear on it. If it is real it wants a run under `tracemalloc`, not a reading.
+2. **T20**, now understood to be explorer work — see its item and §19. Not
+   urgent: the combo is redundant *as navigation* but is currently the only
+   route to pooled scope, so it is a rehoming job, not a deletion.
+3. **Batch L's two cheap measurements** (tile occupancy from the `change`
+   channel; clip-backed throughput at N=8), which remain the plan's real
+   throughput question. Take both before building anything.
+
+Batch N items 1 and 3 are one sentence and a maybe; neither blocks anything.
 
 **Scope cut, 2026-07-19.** Batch H (T22, viewer tab) is **dropped** — unbuilt,
 self-scoped as the largest batch, a convenience shell nothing depends on. Batch I
@@ -649,12 +711,16 @@ measurements, not builds, and are recorded in L: **tile occupancy from the
 `change` channel**, and **clip-backed throughput at N=8** (inherited from I).
 Take both before building anything.
 
-**One thing D showed that applies to G and H.** That batch's stated file
-locality was wrong — the class it had to change lived in a file the spec did not
-name. The remaining GUI batches inherit the same hazard, because these explorers
-share a base-class layer (`MiniPlot`, `FrameView`, `video_panel`) that the
-per-batch "· file" annotations do not reflect. Check what a widget actually
-derives from before trusting the locality line.
+**The file-locality hazard has now fired three times — treat the "· file"
+annotations as guesses.** D's stated locality was wrong (`MiniPlot` lived in a
+file the spec did not name). E only escaped because D had already moved it. G
+made it three: **T20's dropdown is not on the replicate tab at all**, and worse
+than being in the wrong file, it is not the *kind of thing* the item said —
+authoritative state in five explorers rather than a redundant convenience on
+one tab (§19). The rule has grown a second half: check what a widget derives
+from **and where its state actually lives** before trusting the locality line.
+An item that names a file is asserting two things, and the second one is the
+one that has been wrong every time.
 
 Explicitly deferred and not blocking: **Batch L**, the pixels-per-body-length
 denomination, and the per-behaviour sensitivity study that would justify any

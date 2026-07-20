@@ -52,14 +52,20 @@ class Tab2Replicates(QWidget):
         self.video = VideoPanel(state)
         self.video.view.box_drawn.connect(self._on_box_drawn)
         self.video.view.stamp_at.connect(self._on_stamp_at)
-        self.video.view.clicked.connect(self._on_view_clicked)
+        # T12: the boxes on this tab are grabbable. A press inside one selects
+        # it; releasing in place zooms to it; dragging repositions it.
+        self.video.view.box_drag_enabled = True
+        self.video.view.box_grabbed.connect(self._on_box_grabbed)
+        self.video.view.box_clicked.connect(self._on_box_clicked)
+        self.video.view.box_moved.connect(self._on_box_moved)
+        # Right-click is "back" everywhere in this app (four explorers and tab3
+        # wire it to un-zoom). T12 asked for right-click-to-delete here; that was
+        # refused deliberately, because T12 also introduces the zoom that makes
+        # this tab NEED an un-zoom gesture, and a tab where the same button means
+        # "go back" in one place and "destroy a replicate" in another is a
+        # misfire away from silent data loss. Delete stays on the button.
+        self.video.view.back_requested.connect(self.video.clear_focus)
         ll.addWidget(self.video, 1)
-
-        # Stamp size in frame fractions, set from the last box you draw. When
-        # stamp mode is on, clicking drops an identically-sized box -- which is
-        # what keeps replicates the same size, so a fixed "min blocks" and the
-        # max-aggregation mean the same thing in every box.
-        self.stamp_size: tuple[float, float] | None = None
 
         bar = QHBoxLayout()
         self.draw_btn = QPushButton("✏ Draw boxes: OFF")
@@ -69,17 +75,18 @@ class Tab2Replicates(QWidget):
         bar.addWidget(self.draw_btn, 1)
         self.stamp_chk = QCheckBox("Fixed-size stamp")
         self.stamp_chk.setToolTip(
-            "Draw one box to set the size, then click to drop identically-sized "
-            "boxes. Same-size replicates make block counts comparable.")
+            "Click empty space to drop a box the size of the SELECTED replicate. "
+            "Same-size replicates make block counts comparable.")
         self.stamp_chk.setChecked(True)
         bar.addWidget(self.stamp_chk)
         self.draw_btn.setChecked(True)
         ll.addLayout(bar)
 
         self.hint = QLabel(
-            "Drag the first replicate box to set the stamp size (e.g. one per "
-            "tube), then CLICK to place more boxes of the same size. Drag again "
-            "at any time to change the stamp size.")
+            "Drag out the first replicate box (e.g. one per tube), then CLICK "
+            "empty space to place more of the same size. Click a box to select "
+            "and zoom to it, drag it to reposition, right-click to zoom out. "
+            "The stamp is always the SELECTED box's size.")
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color:#333; font-size:11px;")
         ll.addWidget(self.hint)
@@ -95,6 +102,11 @@ class Tab2Replicates(QWidget):
         bl = QVBoxLayout(box)
         self.list = QListWidget()
         self.list.currentItemChanged.connect(self._on_select)
+        # itemClicked, not currentItemChanged: only a USER picking a row should
+        # move the frame. _add_box selects the box it just placed, and zooming
+        # on that would fight the place-several-in-a-row workflow T11 exists to
+        # support -- every click would fly the view somewhere new.
+        self.list.itemClicked.connect(lambda _: self._zoom_to_selected())
         bl.addWidget(self.list, 1)
 
         row = QHBoxLayout()
@@ -199,6 +211,9 @@ class Tab2Replicates(QWidget):
         path = self.state.video_sidecar("rois")
         self.replicates = []
         self._next_id = 1
+        # A zoom is a rectangle of the PREVIOUS video's frame; carrying it into
+        # a new clip frames an arbitrary region of it.
+        self.video.clear_focus()
         if path and os.path.exists(path):
             try:
                 with open(path) as f:
@@ -256,24 +271,104 @@ class Tab2Replicates(QWidget):
         self._autosave()
         self.list.setCurrentRow(self.list.count() - 1)
 
-    def _on_box_drawn(self, x0: float, y0: float, x1: float, y1: float):
-        # Every drawn box updates the stamp size, so you can redraw to resize.
-        self.stamp_size = (x1 - x0, y1 - y0)
+    # -- T11: the stamp is the SELECTED replicate's size ----------------------
+    #
+    # It used to be a stored `stamp_size`, written by the last box DRAWN. That
+    # made the stamp and the selection two independent pieces of state saying
+    # what "the current box" is, and they diverged the moment you selected an
+    # older box: the highlight said one thing, the next click placed another.
+    # Deriving it removes the second copy rather than syncing it, so the label,
+    # the highlight and what a click actually places cannot disagree.
+
+    @property
+    def stamp_size(self) -> tuple[float, float] | None:
+        rep = self._selected_rep()
+        if rep is None:
+            return None
+        x0, y0, x1, y1 = rep["frac"]
+        return (x1 - x0, y1 - y0)
+
+    def _sync_stamp_label(self):
+        size = self.stamp_size
         self.stamp_chk.setText(
-            f"Fixed-size stamp  ({self.stamp_size[0]*100:.0f}%×"
-            f"{self.stamp_size[1]*100:.0f}%)")
+            "Fixed-size stamp" if size is None else
+            f"Fixed-size stamp  ({size[0]*100:.0f}%×{size[1]*100:.0f}%)")
+
+    def _on_box_drawn(self, x0: float, y0: float, x1: float, y1: float):
+        # Drawing selects the new box (_add_box), which by the property above
+        # makes it the stamp -- so "drag again to change the stamp size" still
+        # holds, without a second variable to keep in step.
         self._add_box(x0, y0, x1, y1)
 
     def _on_stamp_at(self, cx: float, cy: float):
-        """A click in draw mode: drop a stamp-sized box centred on the click."""
-        if not self.stamp_chk.isChecked() or self.stamp_size is None:
+        """A click on empty space in draw mode: drop a box the size of the
+        selected replicate, centred on the click."""
+        size = self.stamp_size
+        if not self.stamp_chk.isChecked() or size is None:
             return
-        w, h = self.stamp_size
+        w, h = size
         x0 = min(max(cx - w / 2, 0.0), 1.0 - w)
         y0 = min(max(cy - h / 2, 0.0), 1.0 - h)
         self._add_box(x0, y0, x0 + w, y0 + h)
 
+    # -- T12: select, zoom, reposition ---------------------------------------
+
+    def _select_index(self, idx: int):
+        if 0 <= idx < self.list.count():
+            self.list.setCurrentRow(idx)
+
+    def _zoom_to_selected(self):
+        """Frame the selected replicate.
+
+        The box's own frac, verbatim -- the same zoom the four explorers apply
+        on a region change (`set_focus_frac(regions[i]["frac"])`). Deliberately
+        no margin: this view and an explorer's are the same replicate at the
+        same magnification, so a reader can compare them directly, and a tab
+        that framed it slightly wider would make the two disagree about how big
+        the animal is on screen.
+
+        Dragging still works at full zoom -- the press lands inside the box, and
+        _delta_to extrapolates past the widget edge (Qt grabs the mouse), so the
+        box follows a cursor that leaves the view.
+        """
+        rep = self._selected_rep()
+        if rep is None:
+            return
+        x0, y0, x1, y1 = rep["frac"]
+        if x1 <= x0 or y1 <= y0:
+            return
+        self.video.set_focus_frac(rep["frac"])
+
+    def _on_box_grabbed(self, idx: int):
+        # Press: select only. The zoom waits for release, or it would move the
+        # frame out from under a drag that is just starting.
+        self._select_index(idx)
+
+    def _on_box_clicked(self, idx: int):
+        self._select_index(idx)
+        self._zoom_to_selected()
+
+    def _on_box_moved(self, idx: int, x0: float, y0: float,
+                      x1: float, y1: float):
+        if not (0 <= idx < len(self.replicates)):
+            return
+        self.replicates[idx]["frac"] = (x0, y0, x1, y1)
+        # A moved box is new geometry, so the ROIs and every series computed
+        # against them are stale -- same path as drawing one.
+        self._rebuild_rois()
+        self._redraw_boxes()
+        self._autosave()
+        # No _sync_stamp_label: the release clamps the ORIGIN and keeps the
+        # size, so a reposition cannot change what the stamp reports.
+
     def _redraw_boxes(self):
+        # This 1:1, in-order mapping IS the contract behind the index carried by
+        # box_grabbed / box_clicked / box_moved -- FrameView reports a position
+        # in the list published here, and _on_box_moved indexes self.replicates
+        # with it. Filtering or reordering this comprehension (to hide boxes
+        # outside a zoom, say) would silently reposition the WRONG replicate.
+        # Note this tab matches by POSITION where _source_box deliberately
+        # matches by id: there, build_layout re-sorts and position is a trap.
         sel = self.state.selected_roi
         self.video.set_frac_boxes([
             (*r["frac"], r["label"], r["color"], r["id"] == sel)
@@ -335,6 +430,10 @@ class Tab2Replicates(QWidget):
         self.list.blockSignals(False)
         if self.list.currentItem() is None:
             self._sync_standardization_controls(None)
+        # blockSignals above suppresses _on_select, so the label is refreshed
+        # here too -- otherwise deleting the selected box leaves the stamp
+        # advertising a size that no longer exists.
+        self._sync_stamp_label()
 
     def _selected_rep(self) -> dict | None:
         it = self.list.currentItem()
@@ -347,6 +446,9 @@ class Tab2Replicates(QWidget):
         rep = self._selected_rep()
         self.state.selected_roi = rep["id"] if rep else None
         self._sync_standardization_controls(rep)
+        # T11: selection IS the stamp, so the label follows it here rather than
+        # at the one place a box happens to be drawn.
+        self._sync_stamp_label()
         self._redraw_boxes()
         self._refresh_inspector()
 
@@ -446,20 +548,11 @@ class Tab2Replicates(QWidget):
         self._rebuild_rois()
         self._autosave()
 
-    def _on_view_clicked(self, pt):
-        """Click a point on the video -> select the box under it."""
-        if self.state.source is None:
-            return
-        # pt is in source-frame pixels; convert to fractions.
-        if self.video._cache_frame is None:
-            return
-        w, h = self.video.view._src_size
-        fx, fy = pt.x() / w, pt.y() / h
-        for i, r in enumerate(self.replicates):
-            x0, y0, x1, y1 = r["frac"]
-            if x0 <= fx <= x1 and y0 <= fy <= y1:
-                self.list.setCurrentRow(i)
-                return
+    # _on_view_clicked is gone: FrameView._box_at now owns the hit test for both
+    # tabs, and `clicked` no longer fires for a press inside a box. Keeping the
+    # old scan would have left TWO hit tests with different overlap rules (this
+    # one took the first match, _box_at prefers the selected box), which is the
+    # kind of pair that agrees until boxes overlap and then disagrees silently.
 
     def _rename(self):
         rep = self._selected_rep()
@@ -479,6 +572,9 @@ class Tab2Replicates(QWidget):
         if not rep:
             return
         self.replicates = [r for r in self.replicates if r["id"] != rep["id"]]
+        # Deleting what you are zoomed into otherwise strands the view on empty
+        # frame, showing a region that no longer belongs to anything.
+        self.video.clear_focus()
         self._rebuild_rois()
         self._refresh_list()
         self._redraw_boxes()
@@ -490,6 +586,7 @@ class Tab2Replicates(QWidget):
         if QMessageBox.question(self, "Clear all", "Delete all replicate boxes?") \
                 == QMessageBox.StandardButton.Yes:
             self.replicates = []
+            self.video.clear_focus()
             self._rebuild_rois()
             self._refresh_list()
             self._redraw_boxes()

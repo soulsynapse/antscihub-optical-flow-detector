@@ -1275,3 +1275,73 @@ already correct.
   is intentional and correctly stored. **Verify encoding claims by reading the
   bytes in Python, never from console output** -- the display artifact and the
   real defect look identical in a terminal.
+
+## 19. Replicate direct manipulation (T11, T12, Batch G)
+
+Interactive work, so this records decisions and traps rather than numbers.
+
+**T20 is not in the file the batch named, and is not a deletion.** The plan says
+"drop the replicate dropdown -- redundant with click navigation", filed under
+`tab2_replicates`. There is no dropdown on the replicate tab; it has a
+`QListWidget`. The widget meant is `region_combo`, and it exists in **five
+explorers**, where it is not redundant with click navigation but *is* the
+selection state: `active_region_index` is read off `currentData()`,
+`_on_video_clicked` is implemented as `setCurrentIndex(findData(i))`, and
+`_clear_region_focus` returns to a **pooled scope (`-1`) that has no click
+gesture at all**. Deleting the combo therefore means rehoming three things, not
+removing one. Third time the Order section's warning has paid: check what a
+widget derives from, and where the state actually lives, before trusting a
+per-batch "· file" annotation.
+
+**T12's right-click-to-delete was refused, deliberately.** Right-click is
+`back_requested` in four explorers and tab3. T12 also introduces the zoom, which
+is what makes the replicate tab *need* an un-zoom -- so honouring the item as
+written would have made one button mean "go back" on five screens and "destroy a
+replicate" on the sixth, one misfire from silent data loss on the only screen
+where the boxes are authored. Delete stays on the button. **The item was the
+right instinct at the wrong altitude**: it wanted a fast delete, and it was
+written before the zoom it shares a batch with existed.
+
+**The zoom is the box's `frac` verbatim, with no margin, because the explorers'
+is.** A margin was implemented first and was wrong: this view and an explorer's
+show the same replicate, so any difference in magnification makes them
+non-comparable by eye, which is the entire reason to zoom. The rationale offered
+for the margin -- "no empty space left to drag the box into" -- was also false:
+`_delta_to` uses `_frac_of(clip=False)` and Qt grabs the mouse on press, so a
+drag extrapolates past the widget edge and works at full zoom. That is now
+pinned by a test, because the no-margin decision makes it load-bearing.
+
+**T11 removed a copy of state rather than syncing it.** `stamp_size` was stored
+and written by the last box *drawn*; the selection was separate. The two
+diverged the moment you selected an older box -- the highlight said one thing
+and the next click placed another size -- and same-size replicates are the whole
+point (a fixed "min blocks" only means one thing if the boxes match). It is now
+a property derived from the selection, so the label, the highlight, and what a
+click places cannot disagree. Same remedy class as T17 and the count-band
+re-denomination: state that quietly stops meaning what it meant.
+
+**Two silent-write bugs found by review, both confirmed by driving real mouse
+events, both in the "writes a change the user did not make" direction:**
+
+- **`moved` and the displacement had separate sources.** The release decided
+  *whether* it was a drag from `e.pos()` but applied *how far* from
+  `_move_delta`, cached by the last move event. Qt compresses move events under
+  load, so press-then-release with none in between is reachable: the release
+  reads as a 150 px drag while the cached delta is still zero, rewrites the box
+  to where it already was, and fires `_rebuild_rois()` and a sidecar write for a
+  reposition that never happened. Both now come from the release event.
+- **A chorded right-click mid-drag committed a partial one.** Right-press
+  returned early without clearing `_move_idx`, so the right *release* fell into
+  the move path and repositioned the box using whatever delta the drag had
+  reached -- and `back_requested`'s un-zoom had already changed the coordinate
+  mapping that delta was measured in, so it landed somewhere never dragged to.
+  Right-click during a drag now cancels it and is not also a "back".
+
+**This tab matches replicates by POSITION, where `_source_box` matches by id.**
+The index in `box_grabbed` / `box_clicked` / `box_moved` is a position in the
+list `_redraw_boxes` publishes, and `_on_box_moved` indexes `self.replicates`
+with it. That holds only because the comprehension is 1:1 and in order, and it
+is the *opposite* convention to `_source_box`, which matches by `replicate_id`
+precisely because `build_layout` re-sorts. Filtering that comprehension -- to
+hide boxes outside the zoom, the obvious future optimization -- would silently
+move the wrong replicate. The contract is commented at the point it is created.
