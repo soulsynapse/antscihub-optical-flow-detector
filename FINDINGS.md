@@ -1778,3 +1778,78 @@ exactly at the clip end where the window gets truncated.
 undercounts by one whenever a consumer closes the generator instead of draining
 it — and the log line for a cancelled pass, which is exactly when that happens
 (a knob edit supersedes the running extraction), is where the lie would land.
+
+---
+
+## 23. Batch Q slice 2: the continuous surface, and four ways a live plot lies
+
+The surface now has a third action, **Live ▶**, that runs `LiveStreamWorker`
+forward to the end of the clip and updates the hosted explorer in place at ~1 Hz
+instead of extracting a window and blocking. The wiring itself is small; almost
+all of the work was in the failure modes, which are all the same shape — **a plot
+that renders and does not mean what it appears to** — and all four were reachable
+in the first working cut.
+
+**The slice boundary in the plan was wrong, and the symptom was "no user-visible
+payload".** Batch Q slice 2 was specced as file-local to
+`live_scalogram_surface.py`. It is not: `ScalogramExplorer` derives `T`, the
+regions, `freqs`, the cube cache and the detect array **at construction**, and
+has no in-place update — `capture_view_state`/`apply_view_state` exist precisely
+because rebuilding was the only way to change the data. Cutting the slice at the
+file boundary produced a stream worker whose windows nothing could render, i.e. a
+progress readout. **This is the fourth time the "· file" locality annotation has
+been wrong** (see the note at the end of `todo.md`). The new signal worth
+recording: *if a slice has no observable behaviour, the boundary is in the wrong
+place* — that is cheaper to notice than re-deriving the file list.
+
+**Trap 1 — a one-frame window is not empty, and renders.** `LiveStreamWorker`
+refuses to serve a window of *zero* rows (the "empty is not vacuously valid"
+rule). The first tick of a pass routinely lands **one or two** frames, which is
+one row above that guard: the explorer then built its entire time axis on it — a
+Morlet transform over a single sample, detection window D of 1, a scrub with one
+position. All of it drew. The gate is `min(requested, MIN_CAPACITY)`, never a
+flat floor, because a request shorter than the floor is a short window the user
+asked for. *Known remaining wart:* this lives on the consumer, while the
+zero-row guard it extends lives on the producer — slice 3 should move both into
+`request_latest`.
+
+**Trap 2 — the cube cache is keyed by `(region, channel)` and carries no span.**
+Replacing the channels under a fixed geometry means a cube built over the
+previous window is **indistinguishable from a current one**. A `_data_gen`
+counter now stamps both the cache and the in-flight worker, and a cube whose
+stamp is stale is dropped. Had this been missed the symptom would have been a
+scalogram from a span the user had already left — and it would have been blamed
+on the transform.
+
+**Trap 3 — and the generation guard alone causes a livelock.** `_ScalogramWorker`
+**cannot be cancelled**, and `_request_cube` refuses to launch while one is in
+flight. So if a cube takes longer to build than the update interval, every cube
+arrives stale, is dropped, and is relaunched only to be dropped again: the
+scalogram **never appears at all** rather than appearing late. Cubes run to
+"several GB and tens of seconds" on a full-length clip, so this is the normal
+case, not the edge. The fix is backpressure, not a faster tick: the surface skips
+an update while `explorer.is_building()`, so the display settles to the rate the
+transform can actually sustain. Measured on a 1500-frame synthetic pass: one
+build plus three in-place updates, each landing between builds.
+
+**Trap 4 — the cursor drifts backwards while appearing to sit still.** The frame
+cursor is an index into the *window*, and the window slides. Carrying the index
+across an update walks the cursor backwards through the clip at the eviction
+rate. It is now carried by **absolute video frame**, clamped when the window has
+slid past it — with a `followed` case (cursor on the newest frame keeps riding
+it) because that is the live default. `follow_latest()` exists only because a
+freshly built explorer sits at frame 0, so without it the live view pins to the
+**oldest retained frame** — the exact opposite of live, and it looks stationary
+rather than wrong.
+
+**Two lifecycle notes.** A live pass runs to the end of the clip, so unlike the
+extract it does not self-terminate in seconds: `hideEvent` now stops it, or a tab
+switch leaves the decoder held and `extract`/`process` blocked for minutes. And
+the request timer is stopped at the *stop request*, not only at `_end_stream` —
+`cancel()` sets a flag the worker notices at its next frame, and the timer would
+keep parking requests across that gap.
+
+**`truncated` is not known until the pass ends**, so a live `ChannelData` carries
+`False` during the run and the final window is re-rendered once the answer is in.
+The status line alone was not enough: anything reading `cd.meta` — detection
+included — would have seen a clean window. Same obligation as §15.

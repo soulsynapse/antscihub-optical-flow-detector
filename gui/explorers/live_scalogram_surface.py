@@ -30,8 +30,9 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel,
                              QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
-from core.channel_source import (LIVE_CHANNELS, live_channel_source,
-                                 reduce_channel_data)
+from core.channel_source import (LIVE_CHANNELS, ChannelData,
+                                 live_channel_source, reduce_channel_data,
+                                 synth_live_meta)
 from core.cache import human_bytes
 from core.config import FlowConfig, PipelineConfig, PreprocessConfig
 from core.cost_model import CostModel, PassSample
@@ -43,16 +44,18 @@ from core.replicates import build_layout, in_tile_order
 # never copy them across -- see refresh_replicate_metadata.
 _GEOMETRY_KEYS = frozenset({"frac", "id"})
 from core.detection import detect_channel_region
+from core.stream_buffer import MIN_CAPACITY, capacity_for_budget
 from core.sysmem import budget_bytes
+from core.tensor_channels import plan_channel_stream
 from core.video import VideoSource
 from core.wavelet import default_freqs
 from gui.explorers.detection_timeline import DetectionNavigator
 from gui.explorers.scalogram_explorer import ScalogramExplorer
-# The worker base moved to gui/stream_worker.py so the new continuous worker
-# (LiveStreamWorker, not yet wired here -- Batch Q slice 2) could share it
-# without importing this module. Re-bound to the private names the rest of this
-# file, and its tests, already use.
+# The worker base moved to gui/stream_worker.py so the continuous worker could
+# share it without importing this module. The base and Cancelled are re-bound to
+# the private names the rest of this file, and its tests, already use.
 from gui.stream_worker import Cancelled as _Cancelled
+from gui.stream_worker import LiveStreamWorker
 from gui.stream_worker import StreamWorker as _StreamWorker
 from gui.tuning_store import load_tuning, save_tuning
 
@@ -65,10 +68,44 @@ _MIN_DS = 0.05
 # and let FlowConfig hold the grid fixed in source pixels.
 _AUTO_BLOCK = 0
 
-# Idle labels for the two action buttons; each becomes "Stop" while its own pass
-# runs (see _set_busy).
+# Idle labels for the three action buttons; each becomes "Stop" while its own
+# pass runs (see _set_busy).
 _EXTRACT_TEXT = "Extract"
 _PROCESS_TEXT = "Process whole video ▶"
+_LIVE_TEXT = "Live ▶"
+
+# How often the GUI asks the stream worker for a trailing window. This is the
+# tick the ~1 Hz scalogram recompute hangs off (todo.md Batch Q slice 3), and it
+# is deliberately NOT the worker's own publish rate: `advanced` is a number to
+# paint and can run at 10 Hz, while a window is a copy of hundreds of block
+# frames whose consumer is an O(T log T) transform.
+_WINDOW_REQUEST_HZ = 1.0
+
+# Fewest frames a served window may have before it is put on screen.
+#
+# The worker only refuses a window of ZERO rows, which is one frame short of the
+# guard this needs: the first tick of a pass routinely lands 1-2 frames, and the
+# explorer derives its whole time axis from whatever it is handed -- a Morlet
+# transform over a single sample, a detection window D of 1, a scrub with one
+# position. All of that renders, and none of it means anything, which is the
+# failure mode this codebase keeps naming (a plausible-looking plot of nothing).
+# The value is core.stream_buffer.MIN_CAPACITY for the same stated reason: below
+# it there is not enough history for the slowest wavelet scale to mean anything.
+#
+# Applied as min(requested, floor), never as a flat floor -- a request SHORTER
+# than this is a deliberately short window, and refusing to draw it at all would
+# be worse than drawing it late.
+_MIN_LIVE_FRAMES = MIN_CAPACITY
+
+# Fraction of free RAM the ring buffer may take, and its floor/cap. Read
+# separately from _PP_BUDGET_* and not shared with it: the per-pixel cache is
+# sized for a peak of ~2x because the extract holds its own copy alongside it,
+# whereas the ring IS the only copy of the streamed channels. Deriving one from
+# the other would silently re-tune the ring the next time that peak argument
+# changes, for a reason that has nothing to do with streaming.
+_RING_BUDGET_FRACTION = 0.25
+_RING_BUDGET_FLOOR = 512 * 1024 ** 2
+_RING_BUDGET_CAP = 8 * 1024 ** 3
 
 # "the caller did not say which block regime this pass ran in". Distinct from
 # None, which is a real regime (the block tracked the scale).
@@ -106,6 +143,7 @@ class _Busy(Enum):
     EXTRACT = "extract"
     PROCESS = "process"
     SWEEP = "sweep"
+    STREAM = "stream"
 
 
 class _LiveExtractWorker(_StreamWorker):
@@ -350,6 +388,35 @@ class LiveScalogramSurface(QWidget):
         self._render_worker: _RenderWorker | None = None
         self._dlg = None
 
+        # -- the continuous pass (todo.md Batch Q) ---------------------------
+        # Unlike the extract, this one runs forward to the end of the clip and
+        # publishes a frontier instead of returning a result. It owns the decoder
+        # for as long as it runs, so it is tracked by _Busy like the others.
+        self._stream_worker: LiveStreamWorker | None = None
+        self._ring_budget = budget_bytes(_RING_BUDGET_FRACTION,
+                                         _RING_BUDGET_FLOOR, _RING_BUDGET_CAP)
+        # The last trailing window the worker served, as it handed it over:
+        # {"first", "channels", "frontier", "token"}. Slice 3's scalogram reads
+        # this; for now it is what proves the request/serve round trip is live
+        # rather than plumbed-but-untravelled, via the status line.
+        self._live_window: dict | None = None
+        self._live_request_n = 0
+        self._stream_truncated = False
+        # Bumped on every (re)start. A window request is serviced on the worker
+        # thread and arrives by queued signal, so one parked before a restart can
+        # land after it -- carrying frames from the abandoned island. The token
+        # is what lets the handler tell that case from a current one; without it
+        # the surface would render a span from a different set of knobs and look
+        # merely stale rather than wrong.
+        self._stream_token = 0
+        self._stream_plan_obj = None
+        self._stream_meta: dict | None = None
+        # Drives request_latest. Started with the pass and stopped with it, so a
+        # request is never parked on a worker that is on its way out.
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setInterval(int(1000 / _WINDOW_REQUEST_HZ))
+        self._stream_timer.timeout.connect(self._request_live_window)
+
         # Coalesce rapid knob edits into a single re-extract on settle. Created
         # before the strip because the controls connect to it.
         self._debounce = QTimer(self)
@@ -547,6 +614,15 @@ class LiveScalogramSurface(QWidget):
         self.extract_btn = QPushButton(_EXTRACT_TEXT)
         self.extract_btn.clicked.connect(self._on_extract_clicked)
         row.addWidget(self.extract_btn)
+        self.live_btn = QPushButton(_LIVE_TEXT)
+        self.live_btn.setToolTip(
+            "Process forward continuously from the window start to the end of "
+            "the clip, instead of extracting a fixed window and waiting. The "
+            "readout reports the achieved rate against playback: below 1.0× the "
+            "frontier is falling behind, and the retained history is bounded by "
+            "a ring buffer, so a long run drops its oldest frames.")
+        self.live_btn.clicked.connect(self._on_live_clicked)
+        row.addWidget(self.live_btn)
         self.process_btn = QPushButton(_PROCESS_TEXT)
         self.process_btn.setToolTip(
             "Run the tuned detector over the WHOLE clip (one streaming pass, no "
@@ -702,15 +778,18 @@ class LiveScalogramSurface(QWidget):
 
     # -- button state --------------------------------------------------------
     def _set_busy(self, which: _Busy | None):
-        """Reflect which pass is running in the two action buttons: the running
-        one becomes Stop, the other is disabled (only one streaming pass at a
+        """Reflect which pass is running in the three action buttons: the running
+        one becomes Stop, the others are disabled (only one streaming pass at a
         time). ``None`` restores the idle labels."""
         extracting = which is _Busy.EXTRACT
         processing = which is _Busy.PROCESS
+        streaming = which is _Busy.STREAM
         self.extract_btn.setText("Stop" if extracting else _EXTRACT_TEXT)
         self.process_btn.setText("Stop" if processing else _PROCESS_TEXT)
+        self.live_btn.setText("Stop" if streaming else _LIVE_TEXT)
         self.extract_btn.setEnabled(which is None or extracting)
         self.process_btn.setEnabled(which is None or processing)
+        self.live_btn.setEnabled(which is None or streaming)
 
     def _on_extract_clicked(self):
         if self._worker is not None:
@@ -730,11 +809,13 @@ class LiveScalogramSurface(QWidget):
         worker.cancel()
         self.extract_btn.setEnabled(False)
         self.process_btn.setEnabled(False)
+        self.live_btn.setEnabled(False)
         self.status_lbl.setText(f"stopping the {what}…")
 
     # -- extraction ----------------------------------------------------------
     def extract(self):
-        if self._proc_worker is not None or self._sweep_worker is not None:
+        if (self._proc_worker is not None or self._sweep_worker is not None
+                or self._stream_worker is not None):
             return                          # another pass owns the decoder
         if self._worker is not None:
             # A knob settled mid-extract: that pass is now stale, so supersede it
@@ -782,6 +863,237 @@ class LiveScalogramSurface(QWidget):
         self.status_lbl.setText(
             f"extracting… {done}/{total} frames ({pct:.0f}%) · "
             f"{self._extract_ctx}{self._eta(done, total, self._extract_t0)}")
+
+    # -- the continuous pass (todo.md Batch Q) -------------------------------
+    def _on_live_clicked(self):
+        if self._stream_worker is not None:
+            self.stop_stream()
+        else:
+            self.start_stream()
+
+    def stop_stream(self):
+        """Ask the live pass to unwind. The timer stops HERE rather than in
+        _end_stream alone: the worker only notices the cancel at its next frame,
+        and until then the timer would keep parking requests on a thread that is
+        on its way out."""
+        if self._stream_worker is None:
+            return
+        self._stream_timer.stop()
+        self._request_stop(self._stream_worker, "live pass")
+
+    def _stream_plan(self, cfg: PipelineConfig, start: int):
+        """Geometry, window and ring capacity for a live pass. Decode-free, which
+        is the whole reason ``plan_channel_stream`` exists: the ring is sized from
+        the SAME object the pass runs on, so the clamp of the window against the
+        clip is computed once rather than once here and once in the worker."""
+        w, h, fps, fc = self._dims
+        meta = synth_live_meta(self.video_path, cfg, self.replicates,
+                               width=w, height=h, fps=fps, frame_count=fc)
+        # n=None: forward to the end of the clip. A live pass has no window --
+        # that is the difference between it and extract() -- and the ring, not
+        # the plan, is what bounds memory.
+        plan = plan_channel_stream(meta, start=start, n=None,
+                                   want=frozenset(LIVE_CHANNELS))
+        capacity = capacity_for_budget(self._ring_budget, len(plan.want),
+                                       plan.ny, plan.nx)
+        return meta, plan, capacity
+
+    def start_stream(self):
+        if (self._worker is not None or self._proc_worker is not None
+                or self._sweep_worker is not None
+                or self._stream_worker is not None):
+            return                          # another pass owns the decoder
+        self._debounce.stop()
+        self._block_debounce.stop()
+        start = int(self.start_slider.value())
+        cfg = self._build_cfg()
+        meta, plan, capacity = self._stream_plan(cfg, start)
+        if plan.n < 2:
+            self.status_lbl.setText("nothing left to stream from here")
+            return
+        # Carry the tuning across exactly as a re-extract does: a live pass
+        # rebuilds the explorer, and without this the bands revert to defaults on
+        # every start (T17, and the reason capture_view_state exists).
+        if self._explorer is not None:
+            self._pending_state = self._explorer.capture_view_state()
+        self._stream_meta = meta
+        self._stream_plan_obj = plan
+        self._stream_token += 1
+        self._live_window = None
+        self._stream_truncated = False
+        self._set_busy(_Busy.STREAM)
+        self.status_lbl.setText(
+            f"live from {start / self.fps:.2f} s · ring holds "
+            f"{capacity / max(self.fps, 1e-6):.0f} s at "
+            f"{plan.ny}×{plan.nx} blocks…")
+        self._stream_worker = LiveStreamWorker(
+            self.video_path, plan, capacity, parent=self)
+        self._stream_worker.advanced.connect(self._on_advanced)
+        self._stream_worker.window_ready.connect(self._on_window_ready)
+        self._stream_worker.done.connect(self._on_stream_done)
+        self._stream_worker.failed.connect(self._on_stream_failed)
+        self._stream_worker.cancelled.connect(self._on_stream_cancelled)
+        self._stream_worker.finished.connect(self._stream_worker.deleteLater)
+        self._stream_worker.start()
+        self._stream_timer.start()
+
+    def _request_live_window(self):
+        """Ask for the trailing window the scalogram is recomputed over.
+
+        Bounded, never the growing island: ``morlet_band_power`` is
+        O(F·T log T·B), so re-running it over a 30k-frame island every tick is
+        not interactive. The length is the same one the window knob already
+        carries, so the live and extracted views cover comparable spans.
+        """
+        if self._stream_worker is None:
+            return
+        n = max(2, int(round(self.len_spin.value() * self.fps)))
+        # Remembered so the arriving window can be measured against what was
+        # actually asked for, rather than against the knob's value now -- the two
+        # differ if the knob moved while the request was in flight.
+        self._live_request_n = n
+        self._stream_worker.request_latest(n, sorted(LIVE_CHANNELS),
+                                           self._stream_token)
+
+    def _on_advanced(self, start: int, frontier: int, rate: float):
+        """Frontier readout, in the terms that let the user judge whether the
+        surface is keeping up.
+
+        The realtime RATIO is the point, not the raw fps: the measured drop from
+        ~80 fps to ~18 fps when `appearance` joins the pass is the difference
+        between running ahead of playback and falling behind it, and a bare fps
+        number does not say which side of 1.0 it is on. ``start`` is reported
+        (not assumed to be the plan's) because past capacity the ring has dropped
+        history, and claiming the island still reaches its origin would be the
+        stale-shown-as-current failure this whole surface is built against.
+        """
+        if self._stream_worker is None or self._stream_worker.is_cancelled():
+            return          # keep the "stopping…" note
+        plan = self._stream_plan_obj
+        ratio = rate / max(self.fps, 1e-6)
+        behind = " — behind playback" if rate > 0 and ratio < 1.0 else ""
+        held = (frontier - start) / max(self.fps, 1e-6)
+        dropped = (" · oldest dropped"
+                   if plan is not None and start > plan.start else "")
+        pct = (100.0 * (frontier - plan.start) / max(1, plan.n)
+               if plan is not None else 0.0)
+        self.status_lbl.setText(
+            f"live · frame {frontier} ({pct:.0f}%) · holding {held:.1f} s"
+            f"{dropped} · {rate:.0f} fps ({ratio:.2f}× realtime){behind}")
+
+    def _on_window_ready(self, win: dict):
+        """A trailing window came back from the worker thread.
+
+        The token check is the whole guard: a request parked before a restart is
+        serviced against the OLD island and arrives after the new one has begun,
+        so rendering it would put frames from a different set of knobs on screen
+        looking merely stale. Dropping it is safe because the next tick asks
+        again against the current worker.
+        """
+        if self._stream_worker is None:
+            return
+        if win.get("token") != self._stream_token:
+            return
+        arrived = int(next(iter(win["channels"].values())).shape[0])
+        if arrived < min(self._live_request_n, _MIN_LIVE_FRAMES):
+            # Still filling. Dropped rather than drawn short: see
+            # _MIN_LIVE_FRAMES. The frontier readout is already reporting the
+            # fill, so the user is not left wondering why nothing has appeared.
+            return
+        self._live_window = win
+        self._show_live_window(win)
+
+    def _on_stream_done(self, pass_meta):
+        self._end_stream()
+        n = int((pass_meta or {}).get("n_frames", 0))
+        if (pass_meta or {}).get("truncated"):
+            # Not the same as reaching the end: the decoder stopped early and
+            # this island is shorter than the clip. Saying "complete" here is
+            # exactly the claim FINDINGS.md section 15 was written about.
+            self._stream_truncated = True
+            if self._live_window is not None:
+                # Re-render the window that is already on screen, now that the
+                # flag is known: the status line alone would leave the
+                # ChannelData (and anything reading its meta, detection
+                # included) asserting a clean pass.
+                self._show_live_window(self._live_window, force=True)
+            self.status_lbl.setText(
+                f"live pass stopped early at {n} frames — the decoder ended "
+                f"before the clip did")
+            return
+        self.status_lbl.setText(f"live pass complete · {n} frames")
+
+    def _on_stream_failed(self, msg: str):
+        self._end_stream()
+        self.status_lbl.setText(f"live pass failed: {msg}")
+
+    def _on_stream_cancelled(self):
+        self._end_stream()
+        self.status_lbl.setText("live pass stopped")
+
+    def _end_stream(self):
+        """One place the three terminal signals converge, so the timer cannot
+        outlive the worker it parks requests on."""
+        self._stream_timer.stop()
+        self._stream_worker = None
+        self._set_busy(None)
+
+    def _live_channel_data(self, win: dict) -> ChannelData:
+        """Wrap a served trailing window as the same ChannelData a windowed
+        extract produces, so the explorer and the detector read a live span
+        through the one interface they already have.
+
+        ``n_frames`` is the WINDOW's length, not the clip's -- the explorer's T
+        axis is the span it was handed, exactly as in ``live_channel_source``.
+        """
+        chans = win["channels"]
+        first = int(win["first"])
+        any_arr = next(iter(chans.values()))
+        meta = {**self._stream_meta,
+                "n_frames": int(any_arr.shape[0]),
+                "window_start": first,
+                # Carried for the same reason live_channel_source carries it: a
+                # consumer that sees only a length cannot tell a short window
+                # from a decode that ended early. Unknown until the pass ends,
+                # so it is False during the run and the final window is
+                # re-rendered once the answer is in (see _on_stream_done).
+                "truncated": self._stream_truncated,
+                "channels_computed": sorted(chans)}
+        plan = self._stream_plan_obj
+        return ChannelData(
+            meta=meta, channels=chans, window_start=first,
+            approximated=bool(plan.approximated) if plan is not None else False)
+
+    def _show_live_window(self, win: dict, force: bool = False) -> None:
+        """Put a served window on screen: build the explorer on the first one,
+        then update it in place.
+
+        In place, not rebuilt: ``_swap_explorer`` constructs a fresh
+        ScalogramExplorer and re-applies the captured view state, which is right
+        for a knob change (the geometry moved) and wrong at 1 Hz -- it would
+        discard the scalogram cube cache, reset the selected replicate, and
+        replace the widget under the user's cursor once a second.
+
+        Skipped while the explorer is still transforming the LAST window it was
+        given. The cube worker cannot be cancelled and refuses to relaunch while
+        one is in flight, so pushing updates faster than the transform runs makes
+        every cube arrive stale, get dropped, and relaunch -- a scalogram that
+        never appears rather than one that lags. Dropping the window instead lets
+        the display settle to the rate the transform sustains; the next tick asks
+        again. ``force`` is for the terminal update, which must land whatever the
+        display is doing.
+        """
+        if (not force and self._explorer is not None
+                and self._explorer.is_building()):
+            return
+        cd = self._live_channel_data(win)
+        if self._explorer is None:
+            self._swap_explorer(cd)
+            # Opens on the newest frame, which is also what keeps it following:
+            # see ScalogramExplorer.follow_latest.
+            self._explorer.follow_latest()
+            return
+        self._explorer.set_channel_data(cd)
 
     def _record_cost_sample(self, cd, block_intent: int | None = _INFER):
         """Keep one timing sample per (scale, block) for the cost model.
@@ -1030,7 +1342,8 @@ class LiveScalogramSurface(QWidget):
         detector and no selected replicate, so it can run the moment the window
         opens. Only a decoder conflict or a degenerate window can stop it.
         """
-        if self._worker is not None or self._proc_worker is not None:
+        if (self._worker is not None or self._proc_worker is not None
+                or self._stream_worker is not None):
             return False, "Another pass is running; wait for it to finish."
         if self._window()[1] < 2:
             return False, "The window is too short at this start position."
@@ -1200,7 +1513,8 @@ class LiveScalogramSurface(QWidget):
     def _on_block_changed(self):
         """Block changed: re-reduce the cached pixel channels (instant) if they
         cover this window, else fall back to a full (block=1) extract."""
-        if self._proc_worker is not None or self._sweep_worker is not None:
+        if (self._proc_worker is not None or self._sweep_worker is not None
+                or self._stream_worker is not None):
             return
         if self._worker is not None:
             # Mid-extract: even a cache hit would be overwritten by the pass in
@@ -1288,7 +1602,8 @@ class LiveScalogramSurface(QWidget):
     # -- whole-video commit --------------------------------------------------
     def process_whole_video(self):
         if (self._worker is not None or self._proc_worker is not None
-                or self._sweep_worker is not None):
+                or self._sweep_worker is not None
+                or self._stream_worker is not None):
             return                                  # a pass is already running
         if self._explorer is None:
             self.status_lbl.setText("extract a window and tune it first")
@@ -1402,6 +1717,12 @@ class LiveScalogramSurface(QWidget):
         # close, and the app can be quit from any tab. Cheap enough (one small
         # JSON write) to take unconditionally rather than track dirtiness.
         self._save_tuning()
+        # A live pass runs to the END OF THE CLIP, so unlike the extract it does
+        # not self-terminate in seconds: left running on a hidden tab it holds
+        # the decoder and a full ring for minutes, and blocks extract/process
+        # when the user comes back. Stopped rather than paused because the ring
+        # is bounded anyway -- resuming would restart the island in most cases.
+        self.stop_stream()
         super().hideEvent(e)
 
     def closeEvent(self, e):
@@ -1414,13 +1735,16 @@ class LiveScalogramSurface(QWidget):
         # and it re-enters extract() on a surface that is on its way out.
         self._debounce.stop()
         self._block_debounce.stop()
+        # Before the workers: this one parks requests on the stream worker, and a
+        # tick between the cancel and the wait would touch a thread on its way out.
+        self._stream_timer.stop()
         for w in (self._worker, self._proc_worker, self._sweep_worker,
-                  self._render_worker):
+                  self._render_worker, self._stream_worker):
             if w is not None:
                 w.cancel()      # unwind at the next tick instead of waiting it out
                 w.wait()
         self._worker = self._proc_worker = self._sweep_worker = None
-        self._render_worker = None
+        self._render_worker = self._stream_worker = None
         if self._explorer is not None:
             self._explorer.close()
         super().closeEvent(e)

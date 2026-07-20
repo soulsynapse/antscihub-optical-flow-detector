@@ -34,7 +34,7 @@ to the relevant section rather than restating it.
 | ~~**T22**~~ | ~~New **viewer tab** consuming a fully-processed video.~~ **DROPPED** (2026-07-19) — scope, not value. A convenience shell over a `DetectionResult` that nothing else depends on; never started. Re-open only if day-to-day review actually stalls without it. |
 | ~~**T23**~~ | ~~**ROI pre-transcode**: cut each source once into per-replicate clips + manifest.~~ **DONE** — see Batch I. Works, and **the premise it was justified on turned out false**: the 25x isolated decode win is **1.06x end to end** (`FINDINGS.md` §16). Not the lever that moves the floor at scale 1.0. |
 | ~~**T24**~~ | ~~**Headless batch driver**: no-GUI entry point, file-level partitioning, N-worker throughput.~~ **DONE** — all three slices landed; throughput measured in `FINDINGS.md` §14 (**~130 fps / 5.4x realtime, ceiling at 8 workers**). |
-| **T29** | **Streaming live surface** — display immediately, process forward continuously, plots fill as frames arrive, instead of extract-a-window-then-block. Architecture decided 2026-07-20; see Batches P/Q. Foundations landed in `e11a4cb` (`core/stream_buffer.py`); **Batch P landed** (`stream_channel_planes` + `ChannelPlan`, `FINDINGS.md` §22, cost measured at nil). **Batch Q is what remains.** |
+| **T29** | **Streaming live surface** — display immediately, process forward continuously, plots fill as frames arrive, instead of extract-a-window-then-block. Architecture decided 2026-07-20; see Batches P/Q. Foundations landed in `e11a4cb` (`core/stream_buffer.py`); **Batch P landed** (`stream_channel_planes` + `ChannelPlan`, `FINDINGS.md` §22, cost measured at nil). **Batch Q slices 1 and 2 landed** (`LiveStreamWorker`; the `Live ▶` surface + `set_channel_data`, §23). **Slice 3 — the CWT with the cone of influence — is what remains.** |
 | **T30** | **The mark corpus is not a corpus.** `marks.json` holds **one** 0.39 s span, and **no animal-absent spans at all** — so occupancy's whole claim (present-but-still ≠ empty) cannot be tested, and neither can any supervised channel comparison. Needs flying / still-with-animal / animal-absent / wingbeat, several each, across replicates. `rep6-no-flying` is a ready-made negative control. **This blocks T31 and T32, and no amount of channel-building substitutes for it.** |
 | **T31** | **Validate occupancy and the ratio channels against marked footage**, using the **tail statistic, not region means** (`FINDINGS.md` §20 — this was got wrong once already). Gates Batch S. |
 | **T32** | **Supervised signature fitting.** With a real corpus, fit LDA / L1-logistic per labelled behaviour over the (channel × spatial scale × temporal scale) grid. The weight vector *is* an interpretable, tunable signature and drops into a template detector with the existing `DetectionResult` shape. Cheap, and it tells you which channels earn their place before the unsupervised map is built around them. |
@@ -171,6 +171,7 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 18. Detection readout | why the gate moved onto the band's own plot, the 1 px floor, and the badge's shift-peek exemption |
 | 19. Replicate direct manipulation | where T20's dropdown actually lives, why right-click-to-delete was refused, and two silent-write drag bugs |
 | 22. Batch P streaming generator | the measured nil cost, why absolute fps is not comparable across sessions, and the three traps in the new seam |
+| 23. Batch Q continuous surface | the cube-build livelock, the 1-frame window that renders, the backwards-drifting cursor, and why a slice with no observable behaviour means the boundary is wrong |
 
 ---
 
@@ -233,8 +234,29 @@ clip runs a 400-frame pass in ~0.12 s, which is shorter than one publish
 interval — so any test that reacts to a mid-pass `advanced` is racing the pass,
 not testing it. Park the request before `start()` where determinism matters.
 
-**Slices 2 and 3 remain:** wiring the surface to the worker (replacing
-extract-then-block), and the ~1 Hz bounded-trailing-window CWT **with the cone of
+**Slice 2 of 3 LANDED (2026-07-20): the surface.** Full write-up in
+`FINDINGS.md` §23. **It was NOT file-local** — `ScalogramExplorer` derives `T`,
+regions, `freqs` and the cube cache at construction and had no in-place update,
+so the slice needed `set_channel_data` there too. What slice 3 can assume:
+
+- **`Live ▶`** runs `LiveStreamWorker` to the end of the clip and updates the
+  hosted explorer in place at ~1 Hz; `_show_live_window` is the seam, and
+  `self._live_window` holds the last served window.
+- **`ScalogramExplorer.set_channel_data(cd)`** accepts a new span under a
+  **fixed** geometry and refuses a grid/fps change (that is still a rebuild).
+  Tuning, bands and selection survive it. The cursor is carried by **absolute
+  video frame**, with `follow_latest()` for the live default.
+- **Updates are gated on `explorer.is_building()`.** Do not remove this: the
+  cube worker cannot be cancelled and will not relaunch while one is in flight,
+  so an ungated 1 Hz update makes every cube arrive stale and the scalogram
+  **never appears at all** (§23 trap 3).
+- **`_MIN_LIVE_FRAMES`** stops a 1-2 frame window from being transformed as if
+  it were a time series. It sits on the consumer and should move into
+  `request_latest` alongside the worker's zero-row guard.
+- The realtime-ratio readout is live, so the "falling behind playback"
+  requirement below is met.
+
+**Slice 3 remains:** the ~1 Hz bounded-trailing-window CWT **with the cone of
 influence drawn**. The COI is still the one thing that must not ship wrong.
 
 **Decided (2026-07-20), do not relitigate without a reason:**
@@ -483,9 +505,9 @@ This is what the last session was actually about, and it supersedes the throughp
 thread below as the near-term order.
 
 1. ~~**Batch P** — streaming generator in `tensor_channels`.~~ **DONE**, §22.
-2. **Batch Q** — continuous live surface on `core/stream_buffer.py`. **Slice 1
-   (the worker) landed; slices 2 (surface wiring) and 3 (CWT + cone of
-   influence) are next.**
+2. **Batch Q** — continuous live surface on `core/stream_buffer.py`. **Slices 1
+   (the worker) and 2 (the surface + `set_channel_data`) landed; slice 3 (CWT +
+   cone of influence) is next.**
 3. **Batch R + T30** — marking rehomed, and **an actual corpus laid down**. The
    widget without the corpus unblocks nothing.
 4. **T31** — validate occupancy/ratios against that corpus, on the tail statistic.
@@ -546,8 +568,14 @@ measurements, not builds, and are recorded in L: **tile occupancy from the
 `change` channel**, and **clip-backed throughput at N=8** (inherited from I).
 Take both before building anything.
 
-**The file-locality hazard has now fired three times — treat the "· file"
-annotations as guesses.** D's stated locality was wrong (`MiniPlot` lived in a
+**The file-locality hazard has now fired FOUR times — treat the "· file"
+annotations as guesses.** Batch Q slice 2 is the fourth: specced as file-local to
+`live_scalogram_surface.py`, it needed `set_channel_data` on `ScalogramExplorer`
+as well, because that class derives its whole time axis at construction. §23
+records the cheap tell that generalizes: **if a slice has no observable
+behaviour, the boundary is in the wrong place** — noticing that is cheaper than
+re-deriving the file list up front.
+ D's stated locality was wrong (`MiniPlot` lived in a
 file the spec did not name). E only escaped because D had already moved it. G
 made it three: **T20's dropdown is not on the replicate tab at all**, and worse
 than being in the wrong file, it is not the *kind of thing* the item said —

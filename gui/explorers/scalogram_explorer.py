@@ -347,6 +347,16 @@ class ScalogramExplorer(QWidget):
         # short clip many -- degrades correctly instead of running out of RAM.
         self._sg_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         self._worker = None
+        # Bumped by every set_channel_data. The cube cache is keyed by
+        # (region, channel) and NOT by the data, so on a live surface -- where
+        # the channels are replaced under a fixed geometry once a second -- that
+        # key alone cannot tell a cube built over the previous window from one
+        # built over this one. Both the cache and the in-flight worker are
+        # therefore stamped with this, and a cube whose stamp is stale is
+        # dropped. Without it the failure is silent and looks like the
+        # transform: a scalogram from a span the user has already left.
+        self._data_gen = 0
+        self._cube_gen = 0
         # Channels whose band-power sum was skipped because their plot was
         # collapsed; re-summed when the user expands one.
         self._density_dirty: set[str] = set()
@@ -441,6 +451,115 @@ class ScalogramExplorer(QWidget):
                    video_path=video_path or channel_data.meta.get("video_path"),
                    own_shortcuts=own_shortcuts, own_status=own_status,
                    parent=parent)
+
+    def _sync_info_label(self) -> None:
+        self._info_lbl.setText(
+            f"cache: {self.meta.get('backend','?')} | fps {self.fps:.2f} | "
+            f"{self.T} frames | scalogram "
+            f"{self.freqs[0]:.2f}-{self.freqs[-1]:.2f} Hz, "
+            f"{len(self.freqs)} scales")
+
+    # -- live data replacement (Batch Q) -------------------------------------
+    def is_building(self) -> bool:
+        """Whether a per-block cube is still being transformed off-thread.
+
+        A live producer must gate its updates on this. The cube worker cannot be
+        cancelled and ``_request_cube`` refuses to launch while one is running,
+        so replacing the channels faster than a cube builds means every cube
+        arrives against a newer generation, is dropped, and is relaunched only to
+        be dropped again -- the scalogram then never appears at all, silently.
+        Gating instead makes the display refresh at the rate the transform can
+        actually sustain, which is the honest behaviour anyway.
+        """
+        return self._worker is not None
+
+    def follow_latest(self) -> None:
+        """Park the cursor on the newest frame of the current span.
+
+        Called once when a live pass opens this explorer. A freshly built
+        explorer sits at frame 0, and :meth:`set_channel_data` treats "cursor on
+        the newest frame" as the signal to keep following -- so without this the
+        live view pins to the OLDEST retained frame and stays there, drifting
+        further behind the frontier with every update while looking stationary.
+        """
+        self._update_frame(self.T - 1)
+
+    def set_channel_data(self, channel_data) -> None:
+        """Replace the channels in place, keeping the tuning and the geometry.
+
+        This is the streaming counterpart to rebuilding the explorer from a
+        fresh ChannelData. A rebuild is right when the GEOMETRY moves (a
+        downsample or block change): the constructor re-derives the grid,
+        regions, block snap and cube budget together, which is far safer than
+        mutating them. It is wrong once a second on a live pass, because it
+        would discard the cube cache, reset the selected replicate to the
+        selection view, and swap the widget under the user's cursor.
+
+        So this deliberately refuses a geometry change rather than trying to
+        absorb one: same grid, same regions, same fps. What it does accept is a
+        new span -- different length, different ``window_start`` -- which is
+        exactly what a sliding trailing window is.
+
+        The frame cursor is carried by ABSOLUTE video frame, not by its index on
+        the T axis. Those differ the moment the window slides, and keeping the
+        index would walk the cursor backwards through the clip at the ring's
+        eviction rate while appearing to sit still.
+        """
+        meta = channel_data.meta
+        ny, nx = map(int, meta["grid"])
+        if (ny, nx) != (self.ny, self.nx):
+            raise ValueError(
+                f"set_channel_data cannot change the grid: {(ny, nx)} vs "
+                f"{(self.ny, self.nx)}; rebuild the explorer instead")
+        fps = float(meta["fps"])
+        if abs(fps - self.fps) > 1e-6:
+            raise ValueError(
+                f"set_channel_data cannot change fps ({fps} vs {self.fps}); "
+                f"self.freqs and every cached cube are derived from it")
+        chan = {k: np.asarray(v, np.float32)
+                for k, v in channel_data.channels.items()}
+        if "change" not in chan:
+            # self.T is read off it, and every scope/threshold path assumes it.
+            raise ValueError("set_channel_data needs the 'change' channel")
+
+        old_start = self.window_start
+        old_abs = old_start + self.frame
+        followed = self.frame >= self.T - 1      # was the cursor at the newest frame?
+
+        self._data_gen += 1
+        self._cd = channel_data
+        self.meta = meta
+        self.window_start = int(channel_data.window_start)
+        self._chan = chan
+        self._channels_bytes = sum(a.nbytes for a in self._chan.values())
+        self.T = self._chan["change"].shape[0]
+        # Every cube was transformed over the previous span. Keyed by (region,
+        # channel) only, so they cannot be told apart from current ones -- drop
+        # them wholesale rather than trying to salvage the overlapping frames.
+        self._sg_cache.clear()
+        self._density_dirty = set(CHANNELS)
+
+        # A cursor that was riding the newest frame keeps riding it; otherwise
+        # hold the absolute frame the user parked on, and clamp if the window has
+        # slid past it.
+        frame = self.T - 1 if followed else old_abs - self.window_start
+        self.frame = max(0, min(int(frame), self.T - 1))
+        self.sweep_win = max(1, min(max(1, self.T - 1), int(self.sweep_win)))
+        self.scrub.blockSignals(True)
+        self.scrub.setRange(0, max(0, self.T - 1))
+        self.scrub.setValue(self.frame)
+        self.scrub.blockSignals(False)
+        self.sweep_win_slider.blockSignals(True)
+        self.sweep_win_slider.setRange(1, max(2, self.T - 1))
+        self.sweep_win_slider.setValue(self.sweep_win)
+        self.sweep_win_slider.blockSignals(False)
+        # The slider's own handler is what normally writes this, and it was
+        # blocked above (a live update is not a user edit and must not re-enter
+        # _recompute_windowed_count before the new channels are in place).
+        self._sync_labels()
+        self._sync_info_label()
+        self._rebuild_scalograms()
+        self._redraw_video()
 
     # -- view-state carry-over (survives a live re-extract rebuild) ----------
     def capture_view_state(self) -> dict:
@@ -843,12 +962,13 @@ class ScalogramExplorer(QWidget):
         note.setStyleSheet("color:#8ab; padding-top:4px;")
         left.addWidget(note)
 
-        info = QLabel(f"cache: {self.meta.get('backend','?')} | fps "
-                      f"{self.fps:.2f} | {self.T} frames | scalogram "
-                      f"{self.freqs[0]:.2f}-{self.freqs[-1]:.2f} Hz, "
-                      f"{len(self.freqs)} scales")
-        info.setStyleSheet("color:#888;")
-        left.addWidget(info)
+        # Held rather than dropped after construction: the frame count in it is
+        # replaced by set_channel_data, and a live surface would otherwise keep
+        # reporting the length of the first window it ever showed.
+        self._info_lbl = QLabel("")
+        self._info_lbl.setStyleSheet("color:#888;")
+        self._sync_info_label()
+        left.addWidget(self._info_lbl)
         # Persistent activity/memory line. Everything heavy on this explorer is
         # either off-thread (the cube worker) or a blocking O(F*T*B) / O(T)
         # GUI-thread pass; this line names the current step and reports retained
@@ -1223,6 +1343,7 @@ class ScalogramExplorer(QWidget):
         self._set_phase(f"building scalogram · {channel} · "
                         f"{len(self.freqs)}×{self.T}×{b} (~{self._fmt_bytes(est)})…",
                         paint=True)
+        self._cube_gen = self._data_gen
         self._worker = _ScalogramWorker(key, blocks, self.fps, self.freqs, self)
         self._worker.done.connect(self._on_cube_ready)
         # Free the finished thread (and its private (T, B) blocks copy) instead
@@ -1232,6 +1353,16 @@ class ScalogramExplorer(QWidget):
         self._worker.start()
 
     def _on_cube_ready(self, key, cube):
+        if self._cube_gen != self._data_gen:
+            # The channels were replaced while this built, so the cube's T axis
+            # belongs to a window that is gone. Caching it under (region,
+            # channel) would serve it as current for as long as the selection
+            # stays put. Drop it and rebuild against what is on screen now.
+            self._worker = None
+            self._request_cube()
+            if self._worker is None:
+                self._set_busy(False)
+            return
         self._sg_cache[key] = cube
         self._sg_cache.move_to_end(key)
         self._worker = None
