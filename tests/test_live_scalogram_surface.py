@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -15,6 +16,7 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from gui.explorers import live_scalogram_surface
+from core.replicate_home import replicate_dir
 from core.scale_sweep import ScalePass
 from gui.explorers.live_scalogram_surface import (_Busy, _Cancelled,
                                                   _StreamWorker,
@@ -62,11 +64,16 @@ class _SurfaceTestCase(_QtTestCase):
     def _drop_tuning(self):
         """The surface remembers its tuning in a sidecar next to the clip, and
         every test here shares one clip. Without this, knobs set by one test are
-        restored into the next test's surface."""
+        restored into the next test's surface.
+
+        Since Batch S slice 3 that sidecar has two halves -- the strip beside the
+        video and the ``view`` inside the replicate's home -- so both go, and the
+        home with them."""
         try:
             os.remove(tuning_path(self.video))
         except OSError:
             pass
+        shutil.rmtree(replicate_dir(self.video, 0), ignore_errors=True)
 
     def _surface(self):
         self._drop_tuning()
@@ -336,10 +343,13 @@ class SaveDetectionsTests(_SurfaceTestCase):
             os.remove(marks_path(self.video))
         except OSError:
             pass
+        shutil.rmtree(replicate_dir(self.video, 0), ignore_errors=True)
 
     def _saved(self):
+        """The marks as the REPLICATE holds them (Batch S slice 3). The fixture
+        has one box, id 0, and the stamp is scoped to region index 0."""
         from gui.marks_store import load_marks
-        return load_marks(self.video)
+        return load_marks(self.video, replicate_id=0, legacy_region=0)
 
     def test_save_writes_current_detections_as_labelled_marks(self):
         from gui.marks_store import marks_path
@@ -348,13 +358,49 @@ class SaveDetectionsTests(_SurfaceTestCase):
         with patch.object(live_scalogram_surface, "QInputDialog") as dlg:
             dlg.getText.return_value = ("flying", True)
             surface._save_detections()
-        self.assertTrue(os.path.exists(marks_path(self.video)))
+        self.assertTrue(os.path.exists(marks_path(self.video, replicate_id=0)))
         doc = self._saved()
         # 30 fps -> seconds; keyed by the region the detector was scoped to.
         self.assertEqual(doc["spans"]["0"],
                          [[1.0, 2.0, "flying"], [3.0, 3.5, "flying"]])
         self.assertEqual(doc["provenance"]["flying"]["channel"], "change")
         self.assertIn("flying", surface.status_lbl.text())
+
+    def test_the_spans_go_to_the_home_not_the_per_video_file(self):
+        """Two replicates saving the same label must not share a provenance
+        entry -- the collision the per-video file could not avoid."""
+        from gui.marks_store import load_marks
+        surface = self._surface()
+        self._armed(surface, [(30, 60)])
+        with patch.object(live_scalogram_surface, "QInputDialog") as dlg:
+            dlg.getText.return_value = ("flying", True)
+            surface._save_detections()
+        # The per-video file holds the palette and no spans of its own.
+        self.assertEqual(load_marks(self.video)["spans"], {})
+
+    def test_the_palette_is_written_per_video(self):
+        """One behaviour is one colour across the whole clip, so the assignment
+        lives beside the video rather than restarting inside each home."""
+        from gui.marks_store import load_palette
+        surface = self._surface()
+        self._armed(surface, [(30, 60)])
+        with patch.object(live_scalogram_surface, "QInputDialog") as dlg:
+            dlg.getText.return_value = ("flying", True)
+            surface._save_detections()
+        self.assertIn("flying", load_palette(self.video))
+        self.assertEqual(self._saved()["colors"], {})
+
+    def test_provenance_records_the_rectangle_the_spans_describe(self):
+        """Batch S slice 6 retires a geometry on a box move; a mark that cannot
+        name its rectangle would go on being shown against a box that may have
+        landed on a different animal."""
+        surface = self._surface()
+        self._armed(surface, [(30, 60)])
+        with patch.object(live_scalogram_surface, "QInputDialog") as dlg:
+            dlg.getText.return_value = ("flying", True)
+            surface._save_detections()
+        self.assertEqual(self._saved()["provenance"]["flying"]["frac"],
+                         [0.0, 0.0, 1.0, 1.0])
 
     def test_cancelling_the_label_prompt_writes_nothing(self):
         from gui.marks_store import marks_path

@@ -75,7 +75,8 @@ from core.wavelet import default_freqs
 from gui.explorers.detection_timeline import DetectionNavigator
 from gui.explorers.scalogram_explorer import CHANNELS as _DISPLAY_CHANNELS
 from gui.explorers.scalogram_explorer import ScalogramExplorer
-from gui.marks_store import add_detection_spans, load_marks, save_marks
+from gui.marks_store import (add_detection_spans, color_for, load_marks,
+                             load_palette, save_marks, save_palette)
 # The worker base moved to gui/stream_worker.py so the continuous worker could
 # share it without importing this module. The base and Cancelled are re-bound to
 # the private names the rest of this file, and its tests, already use.
@@ -519,13 +520,21 @@ class LiveScalogramSurface(QWidget):
         # Tuning remembered for THIS clip (see gui/tuning_store). Loaded before
         # the strip is built so the controls come up on it.
         self._saved = load_tuning(video_path)
-        # Seeded here so the FIRST live pass opens on the bands that were left
-        # here, and consumed by the first _swap_explorer.
-        self._pending_state: dict | None = self._saved.get("view") or None
         # Replicate selection travels alongside, not inside, the view state: a
         # rebuild deliberately resets the selection, and only the reopen case
         # should restore it. Consumed by the first _swap_explorer.
         self._pending_region = self._saved.get("region_index")
+        # Seeded here so the FIRST live pass opens on the bands that were left
+        # here, and consumed by the first _swap_explorer.
+        #
+        # The view is the per-REPLICATE half of the sidecar (Batch S slice 3),
+        # so it is read for the region the per-video half remembers -- not from
+        # the per-video file. Restoring a global view would hand whichever
+        # replicate happens to come up the count band placed against another
+        # one's block count, which is the ~13x mis-scaling Batch N item 2 exists
+        # to prevent.
+        self._pending_state: dict | None = (
+            self._load_view(self._pending_region) or None)
         # Last view state we managed to capture, for saves that land while the
         # explorer is being rebuilt (there is no live one to read then).
         self._saved_view: dict | None = self._pending_state
@@ -1094,7 +1103,14 @@ class LiveScalogramSurface(QWidget):
             self.status_lbl.setText("reset to defaults")
 
     def _save_tuning(self) -> None:
-        """Write this clip's tuning sidecar (best-effort; see gui/tuning_store)."""
+        """Write the tuning sidecars (best-effort; see gui/tuning_store).
+
+        Two files, per Batch S slice 3: the clip's own half beside the video,
+        and the active replicate's ``view`` in its home. ``region_index`` stays
+        in the per-video half because it records which replicate this SESSION
+        was last on -- a fact about the clip, and the key the per-replicate half
+        is then looked up by.
+        """
         self._save_debounce.stop()
         if self._explorer is not None:
             self._saved_view = self._explorer.capture_view_state()
@@ -1102,9 +1118,9 @@ class LiveScalogramSurface(QWidget):
         else:
             region = self._pending_region
         save_tuning(self.video_path, {"strip": self._strip_values(),
-                                      "view": self._saved_view,
                                       "process": self._process_settings,
                                       "region_index": region})
+        self._save_view(region, self._saved_view)
 
     # -- config assembly -----------------------------------------------------
     def _build_cfg(self) -> PipelineConfig:
@@ -1633,6 +1649,44 @@ class LiveScalogramSurface(QWidget):
                 return None
         return None
 
+    def _frac_for(self, region_index: int) -> list | None:
+        """The fractional box a region index refers to, or None.
+
+        Rounded the way ``core.replicates._canonical_geometry`` rounds it, so a
+        recorded ``frac`` compares equal to the geometry hash's view of the same
+        box instead of differing by float noise.
+        """
+        reps = in_tile_order(self.replicates)
+        if not (0 <= region_index < len(reps)):
+            return None
+        try:
+            return [round(float(v), 12) for v in reps[region_index]["frac"]]
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _load_view(self, region_index) -> dict:
+        """The remembered view state for a region index; ``{}`` when there is
+        none. Resolves the replicate id first, so a legacy per-video view is
+        offered only to the region that wrote it (see gui/tuning_store)."""
+        if region_index is None or int(region_index) < 0:
+            return {}
+        region_index = int(region_index)
+        rid = self._replicate_id_for(region_index)
+        if rid is None:
+            return {}
+        saved = load_tuning(self.video_path, replicate_id=rid,
+                            legacy_region=region_index)
+        return saved.get("view") or {}
+
+    def _save_view(self, region_index, view: dict | None) -> None:
+        """Write one region's view state into its own home."""
+        if region_index is None or int(region_index) < 0 or not view:
+            return
+        rid = self._replicate_id_for(int(region_index))
+        if rid is None:
+            return
+        save_tuning(self.video_path, {"view": view}, replicate_id=rid)
+
     def _activate_region(self, region_index: int) -> None:
         """Make ``region_index``'s track the one this surface reads and writes.
 
@@ -1643,6 +1697,15 @@ class LiveScalogramSurface(QWidget):
 
         Loading is lazy and cached, so switching back and forth between two
         replicates re-reads neither.
+
+        **The detection VIEW hands over here too** (Batch S slice 3), for a
+        reason sharper than tidiness. The view carries ``count_band``, which
+        ``inband_count`` compares as a raw block count with no normalization by
+        region size -- so letting one replicate's band ride along into another
+        writes a threshold that means something ~13x different, and the detector
+        does not clamp or fail when that happens, it silently stops firing
+        (Batch N item 2). Saving the outgoing view before the switch is what
+        stops the next debounced save from filing it under the wrong replicate.
         """
         if region_index == self._active_region or region_index < 0:
             return
@@ -1654,7 +1717,37 @@ class LiveScalogramSurface(QWidget):
             return
         if self._active_region is not None:
             self._save_track()
+            # Captured from the LIVE explorer or not written at all. `_saved_view`
+            # is a cache whose region is whatever was active when it was filled,
+            # and with no explorer to ask there is no way to confirm that is the
+            # region being switched away from -- so writing it would risk filing
+            # one replicate's count band under another's name, the exact failure
+            # this split exists to prevent. Nothing is lost by skipping: the
+            # debounced _save_tuning has already written that view under the
+            # region it was captured for.
+            if self._explorer is not None:
+                self._saved_view = self._explorer.capture_view_state()
+                self._save_view(self._active_region, self._saved_view)
         self._active_region = region_index
+        # Set BEFORE the view is applied: apply_view_state fires channel toggles
+        # and a replan, and _active_region is the guard that keeps those from
+        # re-entering this method.
+        incoming = self._load_view(region_index)
+        if incoming:
+            self._saved_view = incoming
+            if self._explorer is not None:
+                # WITHOUT `frame`. The cursor is a position in the CLIP, not in
+                # a replicate -- slice 4 made the strip the whole video's seeker
+                # and it stays put across a region switch. Re-applying the
+                # remembered frame here would yank the view back to wherever
+                # this replicate was last looked at, overriding navigation the
+                # user just performed. The initial restore still carries it,
+                # through _pending_state, where there is no navigation to fight.
+                self._explorer.apply_view_state(
+                    {k: v for k, v in incoming.items() if k != "frame"})
+            else:
+                # No explorer yet -- the first _swap_explorer consumes this.
+                self._pending_state = incoming
         track = self._tracks.get(region_index)
         if track is None:
             rid = self._replicate_id_for(region_index)
@@ -1719,13 +1812,30 @@ class LiveScalogramSurface(QWidget):
             "downsample": stamp.downsample,
             "block_size": stamp.block_size,
             "fps": self.fps,
+            # The rectangle these spans describe. Batch S slice 6 retires a
+            # geometry on a box move, and a mark that cannot name its rectangle
+            # cannot be retired with it -- it would go on being shown against a
+            # box that may have landed on a different animal entirely.
+            "frac": self._frac_for(stamp.region_index),
         }
-        doc = load_marks(self.video_path)
+        rid = self._replicate_id_for(stamp.region_index)
+        doc = load_marks(self.video_path, replicate_id=rid,
+                         legacy_region=stamp.region_index)
         add_detection_spans(doc, stamp.region_index, label, spans_s, provenance)
-        wrote, note = save_marks(self.video_path, doc)
+        wrote, note = save_marks(self.video_path, doc, replicate_id=rid)
         if not wrote:
             self.status_lbl.setText(note or "Could not save detections.")
             return
+        # The palette is per-CLIP: one behaviour is one colour across every
+        # replicate, so it is assigned and stored against the video, not folded
+        # into the home whose insertion order would restart per replicate.
+        #
+        # AFTER the spans land, because a colour is assigned by insertion order:
+        # reserving a slot for a save that then failed would silently shift the
+        # colour of every label assigned afterwards.
+        palette = {"colors": load_palette(self.video_path)}
+        color_for(palette, label)
+        save_palette(self.video_path, palette["colors"])
         n = len(spans_s)
         self.status_lbl.setText(
             f"Saved {n} detection{'s' if n != 1 else ''} as '{label}' "

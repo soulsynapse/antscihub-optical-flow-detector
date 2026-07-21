@@ -536,6 +536,13 @@ tensor channel is DONE** (shipped in `9d843c0`; see the current thread below) �
 built but not yet validated for want of a postural corpus. Signature fitting
 (T32) is its own branch.
 
+**Batch S is the live thread (2026-07-21): slices 1–3 landed, 4–6 open.** It is
+where per-replicate ownership is being made real on disk, and it is ahead of
+everything else here because slices 1–3 each fixed a *silent cross-replicate
+overwrite* rather than adding a feature. **Slice 6 (retired geometries) is the
+one with unruled design questions and should be ruled before it is started**;
+slices 4 and 5 are specced and independent of it.
+
 ---
 
 ### Batch Q slice 4 — the whole-video rebuild. LANDED 2026-07-20 · `d944cad`
@@ -671,6 +678,15 @@ proven environmental. **It did NOT fire on the 2026-07-20 closing run** (655
 passed, 57 subtests, 40.6 s, clean tree at `c7634c1`), which is consistent with
 the intermittent story and still does not confirm the cause.
 
+**2026-07-21 (Batch S slice 3) adds the cleanest data point so far, and it is
+evidence AGAINST the crash being ours.** It fired once mid-session, in the same
+`_serve_pending` frame, on a session that never touched `gui/stream_worker.py`.
+Immediately after: 764 passed with `test_stream_worker.py` deselected, that file
+passed **3/3 in isolation**, and two subsequent full runs passed clean (780).
+So the crash needs the full-suite context and does not reproduce on the file
+alone — still unexplained, still not reason to chase it, and the deselect-plus-
+isolate pair is the cheap way to prove a session did not cause it.
+
 ---
 
 ### The current thread (2026-07-20): live streaming, then a corpus, then signatures
@@ -779,4 +795,194 @@ one that has been wrong every time.
 
 Explicitly deferred and not blocking: **Batch L**, the pixels-per-body-length
 denomination, and the per-behaviour sensitivity study that would justify any
-non-1.0 default. The latter two need labelled events; `marks.json` has one span.
+non-1.0 default. The latter two need labelled events — **the "`marks.json` has
+one span" that used to stand here is stale**: T30 laid down 152 hand-verified
+Flying bouts on 2026-07-20. What they still lack is *variety*, not volume; the
+corpus is one behaviour on one clip and saturated (T31's caveat), so it cannot
+price a sensitivity curve across behaviours.
+
+---
+
+## Batch S — per-replicate homes (started 2026-07-21, slices 1–3 landed)
+
+The replicate box, not the video, is the unit of ownership on disk. A home is
+`<stem>_rep01/` beside the source, holding that replicate's track, marks, tuning
+and — optionally — a transcoded clip of just that region. The cut
+(`core/pretranscode.py`, already built and CLI-only) becomes a pure speed-up that
+drops a file into a directory that already exists, rather than a mode that
+changes the layout.
+
+**Three rulings this batch rests on. Do not relitigate without new evidence.**
+
+1. **Homes are named by id, never by label.** `core/replicates.py:68`
+   (`_canonical_geometry`) already decided labels are not identity. Naming by
+   label would make a rename a directory move with every path inside it
+   shifting, and duplicate labels a filesystem collision. With id naming a
+   rename is one string in `rois.json` and duplicates are cosmetic.
+2. **Nothing deletes a home.** Moving a box warns and enumerates; deleting a box
+   stops referring to the directory. `TrackStamp` carries geometry per frame and
+   `track_store` refuses a mismatch, so staleness is *detected* — deleting would
+   do destructively and irreversibly what that already does safely, and would
+   take a curated marks corpus with it on a 2% nudge.
+3. **`next_id` is monotonic and persisted.** This is what makes (2) safe: a
+   retired id is never reissued, so an orphaned home can never be silently
+   adopted by a later box.
+
+### Landed
+- **Slice 1** · `core/replicate_home.py` (new), `gui/tab2_replicates.py`.
+  Homes on box draw; `next_id` persisted; imports renumbered onto fresh ids;
+  `_confirm_move` enumerates and deletes nothing; delete prompts only when the
+  home holds something; duplicate labels warn rather than block.
+- **Slice 2** · `gui/track_store.py`, `gui/explorers/live_scalogram_surface.py`.
+  **The bug was bigger than the file path**: one `WholeVideoTrack` per clip meant
+  replicate 3's pass overwrote replicate 2's `count`/`clump`/`gate` frame-for-
+  frame *in memory*, with only the stamp id changing — the strip stayed
+  plausible. Now one track per region (`_tracks`, `_active_region`), swapped in
+  `_sync_track` before `set_stamp`, flushed to its own home on handover.
+  Legacy sidecars are adopted once, only by the region named in their own stamp.
+  `region_index` and `replicate_id` are passed separately on purpose — they
+  coincide only while ids run 1..N with nothing deleted.
+
+- **Slice 3 · schema split. LANDED 2026-07-21** · `gui/marks_store.py`,
+  `gui/tuning_store.py`, `gui/explorers/live_scalogram_surface.py`.
+  Built as ruled below. Three things worth not re-deriving:
+
+  **The view handover is where the count-band hazard actually lives.** Splitting
+  storage alone is not enough: tune replicate A, switch to B, and the debounced
+  `_save_tuning` files A's `count_band` under B. So `_activate_region` saves the
+  outgoing view before the switch and applies the incoming one, mirroring the
+  track handover it already performed. `apply_view_state` turned out to be built
+  for this — `_converted_count_band` already converts a band across differing
+  region block counts.
+
+  **The handover applies the view WITHOUT `frame`, and a test caught it.** The
+  cursor is a position in the CLIP, not in a replicate (slice 4 made the strip
+  the whole video's seeker), so re-applying a remembered frame yanked the view
+  back from wherever the user had just navigated —
+  `test_focusing_a_detection_while_stopped_loads_the_window` failed with
+  `15 != 20`. The initial restore still carries `frame`, through
+  `_pending_state`, where there is no navigation to fight.
+
+  **`_save_view` writes only from a LIVE explorer.** `_saved_view` is a cache
+  whose region is whatever was active when it was filled; with no explorer to
+  confirm that against the region being switched away from, writing it could
+  file one replicate's band under another's name — the very failure the split
+  exists to prevent. Skipping costs nothing, since the debounce already wrote it.
+
+  Also: `add_detection_spans` no longer assigns a colour (per-replicate
+  insertion order would restart in every home), and `save_palette` runs AFTER
+  the spans land, since a slot reserved for a failed save shifts every later
+  label's colour. Suite 780 green.
+
+### The slice 3 rulings, kept because the reasoning still binds slices 4–6
+- **Slice 3 · schema split — RULED 2026-07-21, all three questions answered,
+  and built (see Landed above).**
+  - **Tuning: `view` per-replicate, everything else per-video.** The home holds
+    `{view: …}` — channel, freq band, value band, count band, detect window,
+    selection — which is exactly `TrackStamp`'s invalidation set. `strip`
+    (downsample, block, normalize, window), `process` and `region_index` stay
+    beside the video as source properties. `count_band` settles it on its own:
+    §N item 2's `count_denom` rescaling exists *because* a raw block count means
+    something ~13x different per region, so it cannot be per-video.
+  - **Marks: read-through, never migrate.** A home with no marks file falls back
+    to the per-video `.marks.json`, **filtered** to its own region index — filter,
+    never reshape, so the 152-bout rep3 corpus is read where it lies and no
+    curated file is ever rewritten. Writes always go to the home; the legacy file
+    goes inert once a home copy exists. This is `track_store.load_track`'s
+    adopt-once discipline minus the adoption, and it is the safer half: marks
+    carry no stamp naming their region, so an actual migration would have to
+    infer index==tile-order-position — the inference slice 2 exists to forbid.
+  - **`colors` stays per-video** (palette-by-insertion-order is a per-clip
+    display contract: one behaviour label is one colour across replicates).
+    It therefore keeps living in the per-video `.marks.json`, and the palette
+    write is **load-modify-save touching only the `colors` key**, preserving
+    `spans`/`provenance`/unknown keys verbatim. That file is a curated corpus.
+  - **`provenance` moves per-replicate**, which dissolves rather than changes the
+    "honest record" caveat in `marks_store`'s docstring: label-keyed overwrite
+    was only lossy because two regions shared one file.
+  - **The box `frac` joins `provenance`.** One copy, in the place that already
+    records what produced a span — NOT a second top-level `geometry` key. Marks
+    written between slice 3 and slice 6 must be able to say which rectangle they
+    were labelled against, or they inherit the legacy corpus's own defect.
+
+### Open
+- **Slice 6 · retired geometries. NEW, and it REVERSES a ruling above.**
+  Slice 3's spec said "marks survive a box move (ruled, and already reflected in
+  `_confirm_move`'s text)". **The user reversed this on 2026-07-21:** the marks
+  survive *the deletion*, not *the move* — they stay valid **for the geometry
+  they were labelled against**, and nothing may let the user believe what they
+  are now looking at is current. `_confirm_move`'s docstring and `_MOVE_ANYWAY`
+  both assert the old ruling and must be rewritten with it.
+
+  **The reason is stronger than "computed under old settings", and it is the
+  user's:** after a move there is no reason to believe those marks are remotely
+  detectable under the new rectangle — *or that they were ever centred on the
+  replicate the box now names*. A moved box can land on a different animal, or
+  on nothing. So carrying marks forward as current is not a staleness problem
+  (which the gray-stamp machinery already handles); it is **attributing one
+  animal's labelled behaviour to another**, the same failure class as the track
+  collision slice 2 fixed, and the reason a gray-out is not sufficient here.
+  This is also why the old `_confirm_move` argument inverts: it reasoned that
+  deleting "would take a hand-curated marks corpus with it on a 2% nudge", and
+  that is still true — but the answer is to RETIRE the corpus with its
+  rectangle, not to keep showing it against a rectangle it never described.
+
+  What the user asked for, in their terms: old boxes stay **recoverable**, **sit
+  in place** (still drawn, at their old rectangle), **labelled distinctly**
+  (`OLD_<id>` or similar), and a move is **roll-back-able — bringing the
+  detections back with it**. Explicitly: *"I don't want it to be a surprise to
+  the user."*
+
+  **The design tension this has to resolve, and it is the whole slice.** Batch
+  S ruling 3 makes `next_id` monotonic so a retired id is never reissued, and
+  ruling 2 refuses to delete a home so a 2% nudge cannot take a corpus with it.
+  Retiring the *id* on every move would satisfy "old work stays put" but
+  re-creates exactly the orphaning ruling 2 forbids. So the generation must sit
+  **inside** the home, not beside it — the id keeps meaning "this animal", and a
+  generation means "this rectangle". Sketch, not yet ruled:
+
+      GX010047_rep01/
+        GX010047.track.npz        <- current geometry
+        GX010047.marks.json
+        GX010047.tuning.json
+        old_002/                  <- retired generation, with its own frac
+          …
+
+  Open questions for that slice: where the retired rectangle is persisted
+  (`rois.json` is the only per-video record of a box and has no generation
+  concept); whether the OLD box is drawn on every surface or only the Replicates
+  tab; and whether rollback is per-replicate or a single undo. **Do not start
+  this without ruling those** — it spans `rois.json`'s schema,
+  `core/replicate_home.py`, `gui/tab2_replicates.py` and both stores, which is
+  the file-locality hazard's sixth firing waiting to happen.
+- **Slice 4 · cut into the home.** `clip_filename` → `rep01/<stem>.mkv`;
+  `--layout` on `cli/pretranscode.py`. `ClipEntry.filename` widens from a
+  basename to a POSIX relative path, which needs **no `PRETRANSCODE_VERSION`
+  bump** (three real consumers; a basename is a valid relative path).
+  `clip_layout` stays OUT of `provenance_key` — it does not change pixels.
+- **Slice 5 · routing + cost model.** `resolve_source(video)` derived per call
+  via the existing `verify_manifest` (~1.4 ms), never a recorded pointer file —
+  "resume is by identity, not existence" (§13, §15). Plus the contamination
+  hazard: `core/cost_model.py:89` `PassSample` has **no source-kind field**, so a
+  sweep taken before a cut and one taken after fit the same `CostModel`, whose
+  `fixed_s` *is* the decode floor the cut changes ~25x. Needs the field and a fit
+  that refuses to mix.
+
+**Locality warning (the hazard has now fired six times).** Slice 2 was specced
+as `track_store.py` plus a call site; it needed a real restructure of
+`live_scalogram_surface.py` because `self._track` was a single attribute read
+from ~25 places.
+
+**Slice 3 was the sixth, and it fired in a new way worth naming: the spec listed
+DATA files, not code files.** "`tuning.json` and `marks.json` each mix per-video
+and per-replicate content" reads as a schema edit in two stores, and the two
+stores were indeed the easy half. The work was in `live_scalogram_surface.py`,
+because a schema split is only inert until you ask *who holds the value between
+writes* — `_saved_view` is an in-memory cache that outlives a region switch, so
+separating the files without separating the handover would have kept the bug and
+merely given it two filenames. **A spec that names a file FORMAT is making the
+same claim as one that names a file, and it has now been wrong the same way:
+ask what holds the state, not where the state is written.**
+
+Treat slices 4–6's file lists as guesses. Slice 6's is already flagged in its
+own section as spanning four files, which is a prediction, not a reprieve.

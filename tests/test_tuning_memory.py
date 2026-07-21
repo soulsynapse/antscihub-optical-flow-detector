@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import QApplication
 
 from gui.explorers.live_scalogram_surface import LiveScalogramSurface
 from gui.explorers.scalogram_explorer import ScalogramExplorer
+from core.replicate_home import replicate_dir
 from gui.tuning_store import load_tuning, save_tuning, tuning_path
 from tests.test_channel_source import _write_moving_square
 from tests.test_view_state import _channel_data
@@ -190,14 +191,30 @@ class _SurfaceTestCase(_QtTestCase):
             pass
 
     def _drop_tuning(self):
+        """Clear BOTH halves of the split sidecar (Batch S slice 3).
+
+        The per-replicate homes matter as much as the per-video file here: a
+        leftover ``moving_rep00/moving.tuning.json`` would restore a previous
+        test's view into the next one's surface, and the failure would look like
+        the surface remembering something it was never told."""
         try:
             os.remove(tuning_path(self.video))
         except OSError:
             pass
+        for rid in range(4):
+            try:
+                os.remove(tuning_path(self.video, replicate_id=rid))
+            except OSError:
+                pass
+            try:
+                os.rmdir(replicate_dir(self.video, rid))
+            except OSError:
+                pass
 
-    def _surface(self) -> LiveScalogramSurface:
+    def _surface(self, reps: list[dict] | None = None) -> LiveScalogramSurface:
         self.addCleanup(self._drop_tuning)
-        reps = [{"id": 0, "label": "all", "frac": (0.0, 0.0, 1.0, 1.0)}]
+        if reps is None:
+            reps = [{"id": 0, "label": "all", "frac": (0.0, 0.0, 1.0, 1.0)}]
         surface = LiveScalogramSurface(self.video, reps)
         self.addCleanup(self._destroy, surface)
         # Nothing runs on construction (Play commits the decoder), but the
@@ -245,9 +262,16 @@ class SurfaceMemoryTests(_SurfaceTestCase):
         self.assertFalse(second._debounce.isActive())
         self.assertFalse(second._block_debounce.isActive())
 
+    # Two boxes, so a region INDEX of 1 resolves to a replicate id. The view is
+    # per-replicate now, and a view captured against a region no box backs is
+    # correctly dropped -- so a one-box fixture would test the discard path
+    # while claiming to test the restore.
+    _TWO_REPS = [{"id": 0, "label": "a", "frac": (0.0, 0.0, 0.5, 1.0)},
+                 {"id": 1, "label": "b", "frac": (0.5, 0.0, 1.0, 1.0)}]
+
     def test_the_bands_and_replicate_are_handed_to_the_first_explorer(self):
         self._drop_tuning()
-        first = self._surface()
+        first = self._surface(self._TWO_REPS)
         first._explorer = MagicMock()
         first._explorer.capture_view_state.return_value = {
             "channel": "tensor speed", "sweep_win": 7,
@@ -255,13 +279,84 @@ class SurfaceMemoryTests(_SurfaceTestCase):
         first._explorer.active_region_index = 1
         first._save_tuning()
 
-        second = self._surface()
+        second = self._surface(self._TWO_REPS)
 
         self.assertEqual(second._pending_state["channel"], "tensor speed")
         self.assertEqual(second._pending_state["sweep_win"], 7)
         self.assertEqual(second._pending_state["count_band"],
                          [2.0, float("inf")])
         self.assertEqual(second._pending_region, 1)
+
+    def test_each_replicate_keeps_its_own_view(self):
+        """Batch S slice 3. The count band is a RAW block count that the
+        detector compares without normalizing by region size, so one replicate's
+        band riding along into another is a threshold that silently stops
+        firing (Batch N item 2)."""
+        self._drop_tuning()
+        s = self._surface(self._TWO_REPS)
+        s._explorer = MagicMock()
+        s._explorer.capture_view_state.return_value = {
+            "channel": "change energy Jtt", "count_band": [2.0, float("inf")]}
+        s._explorer.active_region_index = 0
+        s._save_tuning()
+        s._explorer.capture_view_state.return_value = {
+            "channel": "tensor speed", "count_band": [40.0, float("inf")]}
+        s._explorer.active_region_index = 1
+        s._save_tuning()
+
+        self.assertEqual(s._load_view(0)["count_band"], [2.0, float("inf")])
+        self.assertEqual(s._load_view(1)["count_band"], [40.0, float("inf")])
+        self.assertEqual(s._load_view(0)["channel"], "change energy Jtt")
+
+    def test_switching_replicate_saves_the_outgoing_view_and_loads_the_incoming(self):
+        """The handover, mirroring the track's. Without the save half, the next
+        debounced write would file the view under whichever replicate happened
+        to be active by then."""
+        self._drop_tuning()
+        s = self._surface(self._TWO_REPS)
+        # Region 1 already has a remembered view on disk.
+        save_tuning(self.video, {"view": {"count_band": [40.0, float("inf")]}},
+                    replicate_id=1)
+        s._explorer = MagicMock()
+        s._explorer.capture_view_state.return_value = {
+            "count_band": [2.0, float("inf")]}
+        s._active_region = 0
+
+        s._activate_region(1)
+
+        # Outgoing view persisted under region 0, not under region 1.
+        self.assertEqual(s._load_view(0)["count_band"], [2.0, float("inf")])
+        # Incoming view applied to the live explorer.
+        applied = s._explorer.apply_view_state.call_args[0][0]
+        self.assertEqual(applied["count_band"], [40.0, float("inf")])
+
+    def test_the_handover_does_not_move_the_cursor(self):
+        """The cursor is a position in the CLIP -- the strip is the whole
+        video's seeker (Batch Q slice 4) -- so a remembered per-replicate frame
+        must not yank the view away from where the user just navigated."""
+        self._drop_tuning()
+        s = self._surface(self._TWO_REPS)
+        save_tuning(self.video,
+                    {"view": {"frame": 900, "count_band": [4.0, 9.0]}},
+                    replicate_id=1)
+        s._explorer = MagicMock()
+        s._explorer.capture_view_state.return_value = {}
+        s._active_region = 0
+
+        s._activate_region(1)
+
+        applied = s._explorer.apply_view_state.call_args[0][0]
+        self.assertNotIn("frame", applied)
+        self.assertEqual(applied["count_band"], [4.0, 9.0])
+
+    def test_a_view_for_a_region_no_box_backs_is_not_restored(self):
+        """A layout that has lost boxes since the view was captured. Handing it
+        to whatever now sits at that index would be another animal's threshold."""
+        self._drop_tuning()
+        s = self._surface(self._TWO_REPS)
+        save_tuning(self.video, {"view": {"count_band": [7.0, 8.0]}},
+                    replicate_id=3)
+        self.assertEqual(s._load_view(5), {})
 
     def test_a_clip_never_tuned_opens_on_defaults(self):
         self._drop_tuning()
