@@ -134,8 +134,7 @@ The live tensor detection loop (root README: "Live tensor detection") has
 offscreen tests for the math and plumbing but no accuracy validation. Reuse the
 per-video marks and saved boxes (as in §2) to report precision, recall,
 false-positive time and bout-boundary error for a behavior isolated on a tensor
-channel, and compare it against the flow-cache Behavior tab on the same behavior
-where both apply. This is what decides whether the tensor path can stand alone for
+channel. This is what decides whether the tensor path can stand alone for
 energetic/rhythmic behaviors.
 
 Do not treat a clean-looking navigation strip as validation — the same caution as
@@ -153,13 +152,13 @@ change — it caches channels, not a scalogram, and must never masquerade as a f
 cache. Hold until the workflow has been felt on real footage (a sidecar you don't
 need is just stale-state risk).
 
-## 12. Whether the Behavior tab reads a tensor sidecar (deferred)
+## 12. Whether the Behavior tab reads a tensor sidecar (DROPPED)
 
-The Behavior tab is flow-cache-only. The whole-clip detection track is already a
-behavior output produced without flow, so the trajectory is for Behavior to
-consume a tensor-channel sidecar for tensor-isolable behaviors. This was
-explicitly deferred and must not shape the current design; revisit only after §10
-shows the tensor path is accurate enough to stand alone.
+Dropped with the flow-cache teardown: the Behavior tab was flow-cache-only and was
+deleted with the rest of that subsystem, so there is no tab left to read a tensor
+sidecar. The whole-clip detection track already produces a behavior output without
+flow; any future ethogram surface will be built fresh against it rather than by
+extending the removed tab.
 
 ## Note on §3
 

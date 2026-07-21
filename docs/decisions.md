@@ -212,12 +212,13 @@ its window back for verification. Because the band power is retained, value-band
 and detection-window re-tuning is instant, while a frequency-band or channel
 change requires a fresh pass.
 
-A flow cache still earns its keep for flow-derived features (coherence,
-divergence, curl, direction oscillation) and for instant re-query of an arbitrary
-frequency band across a whole clip (which needs the retained full cube). The
-Behavior tab remains flow-cache-only; whether it eventually reads a tensor-channel
-sidecar is deferred (next-steps). This path is not yet validated for detection
-accuracy on marked footage.
+Divergence and curl — two of the flow-derived features a cache once justified —
+are now tensor-path DERIVED channels (`core.channels` velocity-gradient family:
+`vel_divergence`, `vel_vorticity`, `vel_shear`), taken from the block flow `u`/`v`
+the structure tensor already solves, so they need no cache. Coherence and
+direction oscillation are not yet exposed. The flow cache and the flow-cache-only
+Behavior tab are both removed (see the top of this document). The velocity-gradient
+channels are built but not yet validated on marked footage.
 
 ## Explorers stay partitioned by measurement domain
 
