@@ -29,7 +29,7 @@ to the relevant section rather than restating it.
 | ~~**T16**~~ | ~~On a detection, show a `DETECTED` badge (green bg, bold black) bottom-right of the viewer box.~~ **FIXED** — see Batch E; the shift-held exemption is pinned by a pixel test. |
 | ~~**T17**~~ | ~~Whole-video processing resets the detection threshold bands when navigating.~~ **FIXED** — see Batch F. |
 | ~~**T18**~~ | ~~"Process whole video" computes every channel regardless of the selected one.~~ **FIXED** — see Batch F. |
-| **T20** | **Delete the `region_combo` dropdown in the five explorers.** Earlier thought blocked because the combo was the only route to pooled scope (`-1`) — it is **not**: right-click already reaches the pooled view, so the dropdown is redundant with both click-to-select and right-click-to-pool and can just go. `active_region_index` (reads `currentData()`) and `setCurrentIndex` rehome onto the click / right-click gestures. Small explorer cleanup; unblocks nothing. |
+| ~~**T20**~~ | ~~Delete the `region_combo` dropdown in the explorers.~~ **DONE.** The "five explorers" was stale — it was **one** combo, in `scalogram_explorer.py`, and it was the *hub*: click-to-select and right-click-to-pool routed through `setCurrentIndex` → `currentIndexChanged` → `_on_region_changed`. Replaced with a single `_set_active_region(new_index)` sink the gestures (and `select_region` for session restore) write directly; the combo became a passive `region_lbl` readout. The combo also carried the region→`tuning_changed` relay, so the sink now emits it. `_on_region_changed` deleted, `QComboBox` import dropped. `test_view_state._select` repointed at `select_region`. 148 GUI tests green. |
 | **T21** | Suspected runaway memory issue somewhere on the replicate tab. **Not reproduced by inspection** — `_refresh_list` was the obvious suspect and is clean (14x14 swatch pixmaps, `list.clear()` releases the items). Needs an actual measurement, not more code reading; do not guess at a fix. |
 | ~~**T22**~~ | ~~New **viewer tab** consuming a fully-processed video.~~ **DROPPED** (2026-07-19) — scope, not value. A convenience shell over a `DetectionResult` that nothing else depends on; never started. Re-open only if day-to-day review actually stalls without it. |
 | ~~**T23**~~ | ~~**ROI pre-transcode**: cut each source once into per-replicate clips + manifest.~~ **DONE** — see Batch I. Works, and **the premise it was justified on turned out false**: the 25x isolated decode win is **1.06x end to end** (`FINDINGS.md` §16). Not the lever that moves the floor at scale 1.0. |
@@ -75,38 +75,22 @@ isolated decode number again — that number is real and nearly irrelevant. The 
 untested case is **N=8 clip-backed** (carried to Batch L below), where 8-way
 decode contention meets §14's suspected memory-bandwidth ceiling.
 
-**The clip-provenance cache obligation (from Batch I, still unenforced).**
-`cfg.cache_key(video_hash, geometry_hash, provenance_key=None)` has a third
-provenance axis that **no caller passes**. Nothing caches a clip-derived result
-today, so it is an available guard, not an active one — but the day something
-does, omitting it collides a source-derived and a clip-derived result in one
-cache entry, silently. The key travels as `meta["clip_provenance"]` out of
-`live_channel_source`.
+**The clip-provenance cache obligation (from Batch I).** `PipelineConfig.cache_key`
+was **DELETED** — the flow cache was its only consumer, and after the teardown it
+had zero production callers (its named call sites `core/pipeline.py` and
+`scripts/validate_standardization.py` are themselves gone). So there is no key to
+thread a `provenance_key` through today. The obligation survives as data, not code:
+the clip's provenance travels as `meta["clip_provenance"]` out of
+`live_channel_source`, and the day something first caches a clip-derived result it
+MUST fold that into the new cache key — below `lossless` a clip-derived and a
+source-derived result are different measurements (`FINDINGS.md` §10). Re-introduce
+the key with `provenance_key` **required and keyword-only** so the omission is a
+deliberate claim, not an oversight.
 
-*Recommended fix, cheap and worth doing before it bites — make the omission
-impossible rather than documented.* Drop the default and make the parameter
-**required and keyword-only**:
-
-```python
-def cache_key(self, video_hash, replicate_geometry_hash, *, provenance_key): ...
-```
-
-Every call site must then write `provenance_key=None` deliberately, which is a
-claim ("this pass read the source") rather than an oversight. Cost is three call
-sites — `core/pipeline.py:174`, `scripts/validate_standardization.py:114` — plus
-`tests/test_clip_extraction.py`. (A third was `gui/tab1_flow.py`, now retired to
-`gui/_shelved/`; leave it broken if this lands.)
-The *hashing* behaviour must not change: `None` stays omitted from the blob, so
-every pre-clip cache keeps its key. This is the T17 shape handled early — state
-that quietly stops meaning what it meant — and the same remedy class as bumping
-`PRETRANSCODE_VERSION`: make the silent case loud at the boundary.
-
-**Shelved (T8, T9) — done.** `tab1_flow.py` and `tab3_behavior.py` moved to
-`gui/_shelved/`, joining the two files that already used the flat `_shelved_*`
-prefix (the old prefix convention is retired; the package replaces it). Nothing
-imports them. `MainWindow` is down to two tabs, and `tests/test_cache_naming.py`
-was deleted with the `_test_cache_suffix` it covered. Don't fix anything in
-`gui/_shelved/` if a change breaks it; just note it.
+**Shelved (T8, T9) — now DELETED.** `tab1_flow.py` and `tab3_behavior.py` were
+shelved to `gui/_shelved/` and then deleted outright with the flow-cache teardown
+(the whole `gui/_shelved/` package is gone). `MainWindow` is down to two tabs, and
+`tests/test_cache_naming.py` was deleted with the `_test_cache_suffix` it covered.
 
 ## 3. Done
 
@@ -126,7 +110,7 @@ was deleted with the `_test_cache_suffix` it covered. Don't fix anything in
 | D | plot collapse, empty-plot collapse (T10, T13, T14) | `0b112a6` |
 | E | detection readout (T15, T16, T27, T28) | `4fdf8b0` |
 | N (item 2) | count-band re-denomination + the three permanent controls | `1d1f958` |
-| G (part) | replicate direct manipulation (T11, T12) — **T20, T21 still open** | — |
+| G (part) | replicate direct manipulation (T11, T12) — T20 done, **T21 still open** | — |
 | — | occupancy + conjunction channels, live stream ring buffer | `e11a4cb` |
 | P | streaming extraction generator (`stream_channel_planes`, `ChannelPlan`) | `73ac827` |
 | Q | continuous live surface, all five slices (T29, T35) — **closed** | `aefa8cc`…`c7634c1` |
@@ -136,11 +120,6 @@ archived 2026-07-20). Their durable output is `FINDINGS.md`; the specs are kept
 only because several were wrong in instructive ways.
 
 Their durable output is `FINDINGS.md`. Everything else about them has been deleted.
-
-**Batch B left one open question:** a stop during the detector phase discards a
-completed `DetectionResult`, because `detect_channel_region` has no cancel point
-and the trailing `if self._cancel` throws the finished result away. Delivering it
-may be better — the expensive extraction is already paid for.
 
 **Batch K left one loose end:** `resolve_downsample(src_width)` keeps a parameter
 it ignores. Harmless but misleading — it invites the inference that scale still
@@ -552,9 +531,10 @@ left the batch, T21 is untouched.**
 
 **Corpus laid down and the wingbeat band validated (T30, T31 — 2026-07-20).**
 Marking rehoming onto the old span model is **dropped** — the future marking
-surface will look different and is out of scope here. **Next: the velocity
-gradient tensor channel** (strain rate + vorticity from block flow — see the
-current thread below). Signature fitting (T32) is its own branch.
+surface will look different and is out of scope here. **The velocity gradient
+tensor channel is DONE** (shipped in `9d843c0`; see the current thread below) —
+built but not yet validated for want of a postural corpus. Signature fitting
+(T32) is its own branch.
 
 ---
 
@@ -714,13 +694,23 @@ thread below as the near-term order.
    Frequency-specific, `butter` ≈ Morlet; contrast saturated so it validates the
    band, not a fine channel ranking. Occupancy half deferred (see Open items).
 5. **T32** — supervised signature fitting. **Large; its own branch.**
-6. **Velocity gradient tensor channel — NEXT** (was Batch S; T31 unblocked it).
-   Strain rate and vorticity from the block flow. `∇v` is **translation-invariant by construction**,
-   so it measures posture change with no tracker and no body frame — the one
-   configural read available in the low-resolution regime. `features.py` already has
-   `_divergence`/`_curl` for the flow path; neither is exposed on the tensor path.
-   Needs `(u, v)` exposed as a channel, which `flow_from_tensor` computes and
-   `tensor_channels` currently discards in favour of the magnitude.
+6. ~~**Velocity gradient tensor channel**~~ **DONE — shipped in `9d843c0`** (the
+   Phase-1 commit, before the flow-cache teardown; this line was never updated).
+   `∇v` decomposed into its three 2-D invariant parts — `vel_divergence` (trace),
+   `vel_shear` (deviatoric strain-rate magnitude), `vel_vorticity` (antisymmetric)
+   — in `core/channels.py`, per atlas region so a gradient never crosses a
+   replicate seam. Translation-invariant by construction, so it measures configural
+   change with no tracker. `(u, v)` ARE now exposed as base fields (`LIVE_CHANNELS`,
+   `tensor_channels.py:502` — the old "discards in favour of the magnitude" claim is
+   stale); the derived channels fold in via `with_derived_channels`. Wired end to
+   end: live-surface extraction resolves base fields then derives, `vel_shear` is a
+   first-class detection channel, the explorer menu carries all three (signed axis +
+   no band for divergence/vorticity, per detection-channel design), stream worker
+   derives `vel_shear` before the transform. Tests: `test_channels.py`,
+   `test_channel_source.py`, `test_stream_worker.py` (34 green). **Not validated on
+   marked footage** — the rep3 corpus is saturated flying-vs-not and cannot rank a
+   configural channel (T31 caveat); a still/postural corpus is the prerequisite,
+   same gap as the deferred Occupancy item.
 
 **Deliberately NOT next, and why:**
 
@@ -747,9 +737,8 @@ thread below as the near-term order.
    *measurement*, and the plan's standing instruction not to guess at a fix has
    survived two sessions of inspection. Batch G did not touch it and does not
    bear on it. If it is real it wants a run under `tracemalloc`, not a reading.
-2. **T20**, now understood to be explorer work — see its item and §19. Not
-   urgent: the combo is redundant *as navigation* but is currently the only
-   route to pooled scope, so it is a rehoming job, not a deletion.
+2. ~~**T20**~~ **DONE** — the dropdown was rehomed onto the click/right-click
+   gestures (a `_set_active_region` sink) and deleted; see its item above.
 3. **Batch L's two cheap measurements** (tile occupancy from the `change`
    channel; clip-backed throughput at N=8), which remain the plan's real
    throughput question. Take both before building anything.

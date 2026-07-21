@@ -1,8 +1,8 @@
 """Replicates tab: manual experimental-unit bounding boxes.
 
-The histogram-driven automatic ROI discovery is shelved in
-gui/_shelved/tab2_roi_auto.py -- it worked, but on footage where the behavior is
-everywhere and the camera moves, drawing the replicate regions by hand is faster
+The histogram-driven automatic ROI discovery was retired -- it worked, but on
+footage where the behavior is everywhere and the camera moves, drawing the
+replicate regions by hand is faster
 and less error-prone than tuning a filter to segment them. Each box becomes a
 replicate: a spatial region present for the whole clip, which Tab 3 then
 classifies exactly as it would an auto-discovered ROI.
@@ -23,8 +23,6 @@ from PyQt6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout
                              QListWidget, QListWidgetItem, QMessageBox,
                              QPushButton, QVBoxLayout, QWidget)
 
-from core.roi import packed_rect_roi, rect_roi, roi_psd
-from gui.inspector import PSDPlot, TimeSeriesPlot
 from gui.state import AppState
 from gui.video_panel import VideoPanel
 
@@ -197,24 +195,11 @@ class Tab2Replicates(QWidget):
             signal.connect(self._standardization_changed)
         rl.addWidget(std_box)
         self._sync_standardization_controls(None)
-
-        insp = QGroupBox("Replicate inspector")
-        il = QVBoxLayout(insp)
-        self.ts_speed = TimeSeriesPlot("speed")
-        self.ts_band = TimeSeriesPlot("band power")
-        self.psd = PSDPlot()
-        for w in (self.ts_speed, self.ts_band):
-            w.seek_requested.connect(
-                lambda t: self.state.set_frame(int(t * self.state.fps)))
-            il.addWidget(w)
-        il.addWidget(self.psd)
-        rl.addWidget(insp, 1)
+        rl.addStretch(1)
 
         lay.addWidget(right, 1)
 
         state.video_loaded.connect(self._on_video_loaded)
-        state.cache_opened.connect(self._on_cache_opened)
-        state.frame_changed.connect(self._on_frame_changed)
         state.calibration_changed.connect(self._on_calibration_changed)
 
     # -- per-video persistence ----------------------------------------------
@@ -257,15 +242,6 @@ class Tab2Replicates(QWidget):
                 json.dump({"replicates": self.replicates}, f, indent=2)
         except OSError as e:
             self.state.status.emit(f"Could not save boxes: {e}")
-
-    # -- cache ---------------------------------------------------------------
-
-    def _on_cache_opened(self):
-        # Boxes are geometry (fractions), so they survive re-caching the same
-        # video at different settings -- only rebuild the ROIs onto the new grid.
-        self._rebuild_rois()
-        self._refresh_list()
-        self._redraw_boxes()
 
     # -- drawing -------------------------------------------------------------
 
@@ -462,41 +438,9 @@ class Tab2Replicates(QWidget):
             for r in self.replicates])
 
     def _rebuild_rois(self):
-        """Materialize replicate boxes into rectangular ROIs on the current grid
-        and hand them to shared state, so Tab 3 sees them as ROIs."""
+        """Publish replicate geometry to shared state so the live detection path
+        and the other tabs pick up the current boxes."""
         self.state.set_replicate_specs(self.replicates)
-        if not self.state.has_cache:
-            self.state.rois = []
-            self.state.invalidate_series()
-            self.state.rois_changed.emit()
-            return
-        grid = self.state.cache.grid
-        n = self.state.cache.n_frames
-        packed = self.state.cache.meta.get("processing_scope") == "replicate"
-        tiles = {int(t["id"]): t
-                 for t in self.state.cache.meta.get("replicate_tiles", [])}
-        rois = []
-        for r in self.replicates:
-            baseline = r.get("baseline_s")
-            common = dict(
-                label=r["label"],
-                baseline_start_s=float(baseline[0]) if baseline else None,
-                baseline_end_s=float(baseline[1]) if baseline else None,
-                pixels_per_mm=r.get("pixels_per_mm"),
-                body_length_mm=r.get("body_length_mm"),
-            )
-            if packed:
-                tile = tiles.get(int(r["id"]))
-                if tile is None:
-                    continue
-                rois.append(packed_rect_roi(
-                    r["id"], tuple(r["frac"]),
-                    tuple(tile["atlas_bbox"]), grid, n, **common))
-            else:
-                rois.append(rect_roi(
-                    r["id"], r["frac"], grid, n, **common))
-        self.state.rois = rois
-        self.state.invalidate_series()
         self.state.rois_changed.emit()
 
     # -- list ----------------------------------------------------------------
@@ -567,7 +511,6 @@ class Tab2Replicates(QWidget):
         # at the one place a box happens to be drawn.
         self._sync_stamp_label()
         self._redraw_boxes()
-        self._refresh_inspector()
 
     def _sync_standardization_controls(self, rep: dict | None):
         widgets = (self.use_baseline, self.baseline_start, self.baseline_end,
@@ -727,37 +670,6 @@ class Tab2Replicates(QWidget):
             self._refresh_list()
             self._redraw_boxes()
             self._autosave()
-
-    # -- inspector -----------------------------------------------------------
-
-    def _on_frame_changed(self, idx: int):
-        if not self.isVisible():
-            return
-        t = idx / self.state.fps
-        self.ts_speed.set_cursor(t)
-        self.ts_band.set_cursor(t)
-
-    def _refresh_inspector(self):
-        rep = self._selected_rep()
-        if rep is None or not self.state.has_cache:
-            return
-        roi = self.state.roi_by_id(rep["id"])
-        if roi is None:
-            return
-        ctx = self.state.ctx
-        t = ctx.times_s()
-        self.ts_speed.set_series(t, self.state.roi_series(roi, "speed"),
-                                 f"{rep['label']} — speed (px/s)")
-        if self.state.band_features:
-            self.ts_band.set_series(
-                t, self.state.roi_series(roi, self.state.band_features[0]),
-                self.state.band_features[0])
-        freqs, psd = roi_psd(self.state.cache, ctx, roi, "speed")
-        band = None
-        if self.state.cfg.features.bands:
-            b = self.state.cfg.features.bands[0]
-            band = (b.lo_hz, b.hi_hz)
-        self.psd.set_psd(freqs, psd, nyquist=self.state.fps / 2, band=band)
 
     # -- io ------------------------------------------------------------------
 

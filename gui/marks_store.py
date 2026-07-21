@@ -6,12 +6,12 @@ region -- "region 2 was Flying from 1.5 s to 2.0 s" -- and the file is the
 ``state.video_sidecar`` and ``gui/track_store``: open a different clip and you
 get a different sidecar, so one clip's labels never ghost onto another.
 
-**The format is the shelved timeline's, on purpose.** ``gui/_shelved/timeline.py``
-reads and writes ``{"spans": {rid: [[t0, t1, label], ...]}, "colors": {...}}`` with
-spans in SECONDS keyed by region id. Batch R rehomes that widget onto this surface,
-and it must load what "Save detections" wrote without a converter, so this file
-speaks that dialect verbatim and only ADDS a ``provenance`` block (which the
-timeline ignores, being an unknown key).
+**The format is the retired timeline's, on purpose.** That widget read and wrote
+``{"spans": {rid: [[t0, t1, label], ...]}, "colors": {...}}`` with spans in SECONDS
+keyed by region id. Batch R rehomes that widget onto this surface, and it must load
+what "Save detections" wrote without a converter, so this file speaks that dialect
+verbatim and only ADDS a ``provenance`` block (which the timeline ignores, being an
+unknown key).
 
 **Provenance is why these marks can validate a detector rather than merely
 describe one.** Each label carries the detector settings that produced its

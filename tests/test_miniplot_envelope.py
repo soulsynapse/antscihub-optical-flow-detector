@@ -24,7 +24,7 @@ os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
 
 from PyQt6.QtWidgets import QApplication
 
-from gui.explorers.speed_explorer import MiniPlot, PixelBarPlot
+from gui.explorers.plots import MiniPlot, PixelBarPlot
 
 _APP = QApplication.instance() or QApplication([])
 
@@ -138,7 +138,7 @@ class MemoInvalidationTest(unittest.TestCase):
     def test_the_density_matrix_invalidates_the_base_memos(self):
         """DensityPlot.set_matrix writes self.y directly instead of going
         through set_series, so it is the writer most likely to forget."""
-        from gui.explorers.speed_explorer import DensityPlot
+        from gui.explorers.plots import DensityPlot
         dp = DensityPlot("t")
         dp.set_matrix(np.ones((40, 5), np.float32))
         v1 = dp._ver

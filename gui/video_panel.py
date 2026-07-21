@@ -426,23 +426,12 @@ class JumpSlider(QSlider):
 class VideoPanel(QWidget):
     """Frame view + transport. Overlays are supplied by whichever tab owns it."""
 
-    block_clicked = pyqtSignal(int, int)   # block y, x
-
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
-        self._overlay: np.ndarray | None = None       # (ny, nx) bool
-        self._overlay_color = (60, 200, 255)
-        self._roi_boxes: list[tuple[int, tuple, str]] = []
-        self._cache_frame: np.ndarray | None = None
-        self._cache_idx = -1
         self._pending = False
-        self._tint_cache: tuple | None = None
-        self._focus_mode = "source"
-        self._focus_work_size: tuple[int, int] | None = None
 
         self.view = FrameView()
-        self.view.clicked.connect(self._on_click)
 
         self.play_btn = QPushButton("Play")
         self.play_btn.setFixedWidth(70)
@@ -492,7 +481,6 @@ class VideoPanel(QWidget):
         self.timer.timeout.connect(self._advance)
 
         self.state.video_loaded.connect(self._on_video_loaded)
-        self.state.cache_opened.connect(self._on_video_loaded)
         self.state.frame_changed.connect(self._on_frame_changed)
 
     # -- overlays ------------------------------------------------------------
@@ -507,10 +495,9 @@ class VideoPanel(QWidget):
         grid): [(x0,y0,x1,y1, label, hex, selected)]."""
         self.view.set_boxes(boxes)
 
-    def set_focus_frac(self, frac: tuple[float, float, float, float] | None,
-                       work_size: tuple[int, int] | None = None) -> None:
+    def set_focus_frac(self, frac: tuple[float, float, float, float] | None
+                       ) -> None:
         """Focus the view on a source-frame fraction without changing click space."""
-        self._focus_work_size = work_size if frac is not None else None
         self.view.set_focus_frac(frac)
         self.refresh()
 
@@ -553,8 +540,6 @@ class VideoPanel(QWidget):
         self.state.set_frame(self.state.current_frame + delta)
 
     def _n_frames(self) -> int:
-        if self.state.cache is not None:
-            return self.state.cache.n_frames
         return self.state.source.info.frame_count if self.state.source else 1
 
     # -- rendering -----------------------------------------------------------
@@ -566,7 +551,6 @@ class VideoPanel(QWidget):
         self.scrubber.setRange(0, max(0, n - 1))
         self.scrubber.setValue(0)
         self.scrubber.blockSignals(False)
-        self._cache_idx = -1
         self.refresh()
 
     def _on_frame_changed(self, idx: int):
@@ -580,10 +564,9 @@ class VideoPanel(QWidget):
         """Request a repaint, coalescing multiple requests in the same event-loop
         turn into one.
 
-        A single frame step used to trigger three full repaints: this panel's own
-        frame_changed handler, the OTHER tab's panel (which is hidden but still
-        connected), and then again when the owning tab pushed a new overlay or ROI
-        box set. Each repaint is a full decode-scale-blend-QPixmap cycle. Debounce
+        A single frame step used to trigger two full repaints: this panel's own
+        frame_changed handler and the OTHER tab's panel (which is hidden but still
+        connected). Each repaint is a full decode-scale-QPixmap cycle. Debounce
         them, and skip entirely when the panel is not on screen.
         """
         if not self.state.has_video or self._pending:
@@ -603,46 +586,8 @@ class VideoPanel(QWidget):
         frame = self.state.display_frame(idx, focus_frac=focus)
         if frame is None:
             return
-        if focus is not None and self._focus_mode == "flow" and \
-                self._focus_work_size is not None:
-            from core.config import PipelineConfig
-            from core.preprocess import flow_input_preview
-            cfg = PipelineConfig.from_dict(
-                self.state.cache.meta.get("config", {})).preprocess
-            frame = flow_input_preview(frame, self._focus_work_size, cfg)
-        self._cache_frame = frame
-        self._cache_idx = idx
 
         img = frame.copy()
-        h, w = img.shape[:2]
-
-        if self._overlay is not None and self._overlay.any():
-            m = cv2.resize(self._overlay.astype(np.uint8) * 255, (w, h),
-                           interpolation=cv2.INTER_NEAREST)
-            # Blend with addWeighted + copyTo rather than boolean fancy indexing.
-            # `img[sel] = 0.45*img[sel] + 0.55*tint[sel]` builds several temporary
-            # arrays the size of the selection and runs the arithmetic in float64;
-            # this stays in uint8 inside OpenCV and is roughly an order of
-            # magnitude faster. The tint plane is constant, so cache it.
-            if self._tint_cache is None or self._tint_cache[0] != (h, w, self._overlay_color):
-                tint = np.empty_like(img)
-                tint[:, :] = self._overlay_color[::-1]   # to BGR
-                self._tint_cache = ((h, w, self._overlay_color), tint)
-            tint = self._tint_cache[1]
-            blended = cv2.addWeighted(img, 0.45, tint, 0.55, 0.0)
-            np.copyto(img, blended, where=(m > 0)[:, :, None])
-
-        if self._roi_boxes and self.state.cache is not None:
-            ny, nx = self.state.cache.grid
-            sy, sx = h / ny, w / nx
-            for roi_id, (y0, x0, y1, x1), col in self._roi_boxes:
-                bgr = tuple(int(col.lstrip("#")[i:i + 2], 16)
-                            for i in (4, 2, 0))
-                thick = 4 if roi_id == self.state.selected_roi else 2
-                cv2.rectangle(img, (int(x0 * sx), int(y0 * sy)),
-                              (int(x1 * sx), int(y1 * sy)), bgr, thick)
-                cv2.putText(img, f"#{roi_id}", (int(x0 * sx), int(y0 * sy) - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, bgr, 2)
 
         coordinate_size = None
         if self.state.source is not None:
@@ -660,16 +605,3 @@ class VideoPanel(QWidget):
             f"{int(cur // 60):02d}:{cur % 60:05.2f} / "
             f"{int(tot // 60):02d}:{tot % 60:05.2f}")
         self.time_label.setToolTip(f"frame {f} of {n}")
-
-    def _on_click(self, pt: QPoint):
-        if self.state.cache is None or self._cache_frame is None:
-            return
-        ny, nx = self.state.cache.grid
-        # FrameView reports coordinates in the image it was handed, which is the
-        # DOWNSCALED frame -- not the source. Dividing by the source dimensions
-        # here would place every click near the top-left corner.
-        w, h = self.view._src_size
-        by = int(pt.y() / h * ny)
-        bx = int(pt.x() / w * nx)
-        if 0 <= by < ny and 0 <= bx < nx:
-            self.block_clicked.emit(by, bx)

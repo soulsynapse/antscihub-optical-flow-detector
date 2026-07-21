@@ -80,6 +80,47 @@ class LiveChannelSourceTest(unittest.TestCase):
         # A live source never carries the pipeline's cached flow speed.
         self.assertNotIn("speed", cd.available)
 
+    def test_uv_primitives_match_tensor_speed_per_pixel(self):
+        # u, v are the signed flow components in px/s; tensor_speed is their
+        # magnitude. At block=1 (identity reduction) hypot(u, v) must equal
+        # tensor_speed exactly -- the invariant that pins u, v's units and sign
+        # source to the same *fps-scaled solve tensor_speed comes from.
+        cfg = PipelineConfig(flow=FlowConfig(block_size=1))
+        cd = live_channel_source(self.video, cfg, _full_frame_replicate(),
+                                 start=5, n=15)
+        self.assertIn("u", cd.available)
+        self.assertIn("v", cd.available)
+        mag = np.hypot(cd.channels["u"], cd.channels["v"])
+        np.testing.assert_allclose(mag, cd.channels["tensor_speed"],
+                                   rtol=1e-5, atol=1e-4)
+
+    def test_uv_block_reduce_is_the_mean_vector_not_the_mean_speed(self):
+        # Deliberate semantic: u, v block-reduce the flow COMPONENTS (the coarse-
+        # grained velocity field the gradient is taken of), whereas tensor_speed
+        # reduces the per-pixel SPEED. So |mean vector| <= mean speed, with strict
+        # inequality wherever directions vary inside a block. This is why u, v are
+        # their own channels rather than recoverable from tensor_speed.
+        cfg = PipelineConfig()                       # default (multi-pixel) block
+        cd = live_channel_source(self.video, cfg, _full_frame_replicate(),
+                                 start=5, n=15)
+        mag = np.hypot(cd.channels["u"], cd.channels["v"])
+        self.assertTrue((mag <= cd.channels["tensor_speed"] + 1e-4).all())
+        self.assertLess(float(mag.sum()), float(cd.channels["tensor_speed"].sum()))
+
+    def test_derived_velocity_gradient_available_from_uv(self):
+        # A live source carrying u, v can materialize the velocity-gradient family
+        # without re-extracting; a source lacking them is returned unchanged.
+        from core.channel_source import with_derived_channels
+        from core.channels import VELOCITY_GRADIENT
+        cfg = PipelineConfig()
+        cd = live_channel_source(self.video, cfg, _full_frame_replicate(),
+                                 start=5, n=15, channels=("change", "u", "v"))
+        out = with_derived_channels(cd, VELOCITY_GRADIENT)
+        for name in VELOCITY_GRADIENT:
+            self.assertIn(name, out.available)
+            self.assertEqual(out.channels[name].shape,
+                             cd.channels["u"].shape)
+
     def test_window_clamps_to_clip_end(self):
         cfg = PipelineConfig()
         cd = live_channel_source(self.video, cfg, _full_frame_replicate(),

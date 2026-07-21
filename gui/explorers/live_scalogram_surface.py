@@ -48,7 +48,10 @@ from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout,
                              QVBoxLayout, QWidget)
 
 from core.channel_source import (LIVE_CHANNELS, ChannelData,
-                                 live_channel_source, synth_live_meta)
+                                 live_channel_source, synth_live_meta,
+                                 with_derived_channels)
+from core.channels import REGISTRY as _DERIVED_CHANNELS
+from core.channels import VELOCITY_GRADIENT, needs_for
 from core.config import FlowConfig, PipelineConfig, PreprocessConfig
 from core.cost_model import CostModel, PassSample
 from core.scale_sweep import measure_scale
@@ -384,10 +387,19 @@ class _ProcessWorker(_StreamWorker):
             # downstream reads them, since detect_channel_region takes a single
             # channel_attr. On the detection default (``change``) this skips the
             # flow solve, the appearance residual and the min-eigen.
+            #
+            # A DERIVED channel (the velocity gradient) is not extractable itself:
+            # extract its base fields (u, v) instead, then derive it below --
+            # exactly the translation the live pass does in _channels_wanted.
+            attr = params["channel_attr"]
+            extract = (sorted(needs_for({attr})) if attr in _DERIVED_CHANNELS
+                       else [attr])
             cd = live_channel_source(
                 video_path, cfg, reps, start=start, n=n, width=w, height=h,
-                fps=fps, frame_count=fc, channels=[params["channel_attr"]],
+                fps=fps, frame_count=fc, channels=extract,
                 progress=tick)
+            if attr in _DERIVED_CHANNELS:
+                cd = with_derived_channels(cd, [attr])
             got = int(cd.n_frames)
             # A decode that ended early yields a SHORT span, not a padded one, so
             # the detector below runs over less video than was asked for and
@@ -1324,7 +1336,14 @@ class LiveScalogramSurface(QWidget):
         """
         if self.all_chan_chk.isChecked():
             return frozenset(LIVE_CHANNELS)
-        return frozenset({_ALWAYS_STREAM, self._selected_channel_attr()})
+        # A DERIVED channel (the velocity gradient) is not extractable itself; the
+        # pass must compute its base fields (u, v) and the window is derived from
+        # them afterwards (see _live_channel_data). So a selected derived channel
+        # expands to its declared ``needs`` rather than to itself -- otherwise the
+        # pass would be asked for a channel no extractor produces.
+        sel = self._selected_channel_attr()
+        base = needs_for({sel}) if sel in _DERIVED_CHANNELS else {sel}
+        return frozenset({_ALWAYS_STREAM, *base})
 
     def _request_live_window(self):
         """Ask for the trailing window the scalogram is recomputed over.
@@ -1859,9 +1878,14 @@ class LiveScalogramSurface(QWidget):
                 "truncated": self._stream_truncated,
                 "channels_computed": sorted(chans)}
         plan = self._stream_plan_obj
-        return ChannelData(
+        cd = ChannelData(
             meta=meta, channels=chans, window_start=first,
             approximated=bool(plan.approximated) if plan is not None else False)
+        # Fold in the velocity-gradient family when this window carried u, v (i.e.
+        # a vel_* channel is selected). Cheap spatial derivatives over the served
+        # window; deriving all three from the one flow means switching between
+        # them never forces a replan. A no-op when u, v were not computed.
+        return with_derived_channels(cd, VELOCITY_GRADIENT)
 
     def _show_live_window(self, win: dict, force: bool = False) -> None:
         """Put a served window on screen: build the explorer on the first one,
@@ -2349,7 +2373,11 @@ class LiveScalogramSurface(QWidget):
         old = self._explorer
         new = ScalogramExplorer.from_channel_data(
             cd, video_path=self.video_path, own_shortcuts=False,
-            own_status=False, on_demand_channels=LIVE_CHANNELS,
+            own_status=False,
+            # The velocity-gradient channels are producible on demand too: ticking
+            # one replans the pass to compute u, v (its base fields) and the window
+            # is derived from them. Without them here their checkboxes read as dead.
+            on_demand_channels=(*LIVE_CHANNELS, *VELOCITY_GRADIENT),
             parent=self._host)
         self._host_lay.addWidget(new)
         self._explorer = new

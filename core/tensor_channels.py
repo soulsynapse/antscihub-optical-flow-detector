@@ -39,8 +39,9 @@ from core.timing import Timer
 from core.video import (ClipAtlasSource, ReplicateVideoSource, VideoSource,
                         prefetch)
 
-CHANNELS = ("intensity", "change", "appearance", "texture", "tensor_speed")
-CHANNEL_VERSION = 3     # bump when the extraction math changes (sidecar key)
+CHANNELS = ("intensity", "change", "appearance", "texture", "tensor_speed",
+            "u", "v")
+CHANNEL_VERSION = 4     # bump when the extraction math changes (sidecar key)
 
 # What each channel costs beyond the frame itself, which is what makes selecting
 # one worth doing (FINDINGS.md section 1: tensor_products is ~7% of a pass, the
@@ -50,13 +51,17 @@ CHANNEL_VERSION = 3     # bump when the extraction math changes (sidecar key)
 #   change        J[2] -- needs the products and the spatial blur, nothing more.
 #   texture       min-eigen of J. Needs the blur, not the flow solve.
 #   tensor_speed  needs flow_from_tensor on top of the blur.
+#   u, v          the flow's signed components, same solve as tensor_speed but
+#                 kept as (px/s) vectors rather than collapsed to a magnitude --
+#                 the base fields the velocity-gradient derived channels read.
 #   appearance    needs the residual, and the flow to form it -- the tensor's own
 #                 (so: the solve) unless cached block flow was supplied.
 #
 # So the detection default, ``change``, skips the solve, the residual and the
 # min-eigen entirely.
-_NEEDS_TENSOR = frozenset({"change", "appearance", "texture", "tensor_speed"})
-_NEEDS_FLOW = frozenset({"tensor_speed", "appearance"})
+_NEEDS_TENSOR = frozenset({"change", "appearance", "texture", "tensor_speed",
+                           "u", "v"})
+_NEEDS_FLOW = frozenset({"tensor_speed", "appearance", "u", "v"})
 
 # Which of the six tensor components each read actually consumes, in COMPONENTS
 # order (xx, yy, tt, xy, xt, yt). Forming and blurring all six regardless was
@@ -489,6 +494,17 @@ def stream_channel_planes(video_path: str, plan: ChannelPlan, *,
                             speed = np.hypot(uv[..., 0], uv[..., 1]) * fps
                             planes["tensor_speed"][ay0:ay1, ax0:ax1] = \
                                 _reduce(speed, block, th, tw, tm)
+                        # Signed flow components in px/s (the same *fps scaling as
+                        # tensor_speed), block-reduced. These are the base fields
+                        # the velocity-gradient derived channels take spatial
+                        # gradients of; kept as vectors rather than a magnitude so
+                        # divergence/shear/vorticity are recoverable.
+                        if "u" in want:
+                            planes["u"][ay0:ay1, ax0:ax1] = \
+                                _reduce(uv[..., 0] * fps, block, th, tw, tm)
+                        if "v" in want:
+                            planes["v"][ay0:ay1, ax0:ax1] = \
+                                _reduce(uv[..., 1] * fps, block, th, tw, tm)
                         if "change" in want:
                             planes["change"][ay0:ay1, ax0:ax1] = \
                                 _reduce(J[2], block, th, tw, tm)
@@ -601,9 +617,9 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
     reproduced starting mid-clip).
 
     ``want`` restricts which channels are computed; ``None`` means all of them.
-    Every ``CHANNELS`` key is still returned -- this dict's shape is fixed, and
-    ``load_or_extract_channels``' sidecar depends on that -- but an unwanted
-    channel's array is a **zero-length** ``(0, ny, nx)`` placeholder. Length
+    Every ``CHANNELS`` key is still returned -- this dict's shape is fixed -- but
+    an unwanted channel's array is a **zero-length** ``(0, ny, nx)`` placeholder.
+    Length
     zero, not NaN-filled and not zero-filled: a full-length array of either
     still costs the memory the selection exists to save (~88 MB per channel per
     hour of 30 fps footage at a 41x5 grid), and a zero-FILLED one is worse than
@@ -663,26 +679,6 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
     return out
 
 
-def extract_channels(cache, sigma: float = 2.0, max_frames: int | None = None,
-                     progress=None) -> dict:
-    """Stream the clip once and return per-block (T, ny, nx) channel arrays.
-
-    ``cache`` is an open feature cache (its meta drives geometry and points at the
-    video). Appearance is measured against the cached block flow, and cached
-    texture is read straight through when present -- the full-clip, cache-backed
-    contract. ``progress(done, total)`` is called if given.
-    """
-    meta = cache.meta
-    U = np.asarray(cache.read("u"), np.float32)
-    V = np.asarray(cache.read("v"), np.float32)
-    cached_texture = None
-    if "texture_min_eigen" in set(meta.get("features", [])):
-        cached_texture = np.asarray(cache.read("texture_min_eigen"), np.float32)
-    return _stream_channels(meta["video_path"], meta, sigma=sigma, start=0,
-                            n=max_frames, cached_uv=(U, V),
-                            cached_texture=cached_texture, progress=progress)
-
-
 def extract_channels_live(video_path: str, meta: dict, *, start: int = 0,
                           n: int | None = None, sigma: float = 2.0,
                           clip_paths: list[str] | None = None,
@@ -709,49 +705,6 @@ def extract_channels_live(video_path: str, meta: dict, *, start: int = 0,
                             cached_uv=None, cached_texture=None,
                             clip_paths=clip_paths, want=channels, denoise="off",
                             progress=progress)
-
-
-def load_or_extract_channels(cache, sidecar_path: str | None = None,
-                             progress=None, **kwargs) -> dict:
-    """extract_channels with an on-disk sidecar so re-opens are instant.
-
-    The sidecar is keyed by frame count and channel version; a mismatch (cache
-    rebuilt, extraction math changed) is ignored and recomputed rather than
-    trusted, so a stale sidecar can never feed an explorer the wrong numbers.
-    """
-    import os
-
-    n = int(cache.meta["n_frames"])
-    if sidecar_path and os.path.exists(sidecar_path):
-        try:
-            data = np.load(sidecar_path, allow_pickle=True)
-            if (int(data["n_frames"]) == n and
-                    int(data["channel_version"]) == CHANNEL_VERSION):
-                res = {k: data[k] for k in CHANNELS}
-                res["meta"] = {"fps": float(data["fps"]), "block": int(data["block"]),
-                               "grid": tuple(data["grid"]), "n_frames": n,
-                               "channel_version": CHANNEL_VERSION,
-                               "approximated": bool(data["approximated"]),
-                               "sigma": float(data["sigma"])}
-                if progress:
-                    progress(n, n)
-                return res
-        except (KeyError, ValueError, OSError):
-            pass  # unreadable/old sidecar -> recompute
-
-    res = extract_channels(cache, progress=progress, **kwargs)
-    if sidecar_path:
-        try:
-            os.makedirs(os.path.dirname(sidecar_path), exist_ok=True)
-            m = res["meta"]
-            np.savez_compressed(
-                sidecar_path, n_frames=m["n_frames"], fps=m["fps"],
-                block=m["block"], grid=np.asarray(m["grid"]),
-                channel_version=m["channel_version"], approximated=m["approximated"],
-                sigma=m["sigma"], **{k: res[k] for k in CHANNELS})
-        except OSError:
-            pass  # read-only location -> just skip caching
-    return res
 
 
 def _reduce(field: np.ndarray, block: int, th: int, tw: int,

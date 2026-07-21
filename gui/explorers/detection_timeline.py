@@ -32,7 +32,7 @@ from PyQt6.QtGui import QFont, QImage, QPainter, QPen
 from PyQt6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
                              QWidget)
 
-from gui.explorers.speed_explorer import BG, CURSOR, PLOT_BG, TXT_DIM
+from gui.explorers.plots import BG, CURSOR, PLOT_BG, TXT_DIM
 
 # Examined-and-current. The clump ramp runs cool-to-hot; the gate band and the
 # "we looked" baseline are the same green so they read as one statement.

@@ -21,7 +21,7 @@ from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication
 
 from gui.explorers.scalogram_explorer import ScalogramPlot
-from gui.explorers.speed_explorer import DensityPlot, MiniPlot, PixelBarPlot
+from gui.explorers.plots import DensityPlot, MiniPlot, PixelBarPlot
 
 
 # Module-level, and deliberately so: a QApplication that only a local holds is

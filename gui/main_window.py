@@ -4,9 +4,9 @@ Hotkeys follow the reference color detector so the two tools feel the same:
 Space plays/pauses, arrows step a frame, shift+arrows step a second, Home/End
 jump to the ends, Ctrl+1/2 switch tabs.
 
-The flow-cache commit and Behavior Classification tabs were retired to
-gui/_shelved/ -- the tensor path does not read a flow cache, so both had lost
-the artefact they were built around. See gui/_shelved/README.md.
+The flow-cache commit and Behavior Classification tabs were retired and then
+deleted with the flow-cache subsystem -- the tensor path does not read a flow
+cache, so both had lost the artefact they were built around.
 """
 from __future__ import annotations
 
@@ -154,8 +154,6 @@ class MainWindow(QMainWindow):
             "camera.</p>")
 
     def closeEvent(self, e):
-        if self.state.cache is not None:
-            self.state.cache.close()
         if self.state.source is not None:
             self.state.source.release()
         super().closeEvent(e)

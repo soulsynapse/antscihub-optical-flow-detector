@@ -145,12 +145,10 @@ full-cube slice, windowed mean, region scoping) and the plumbing (window → pro
   retained, the band sum is not).
 
 **Workaround.** Verify detections by clicking into their windows (the loop is
-built for exactly this). For a behavior where a validated ethogram is required
-today, use the flow-cache Behavior tab.
+built for exactly this).
 
-**Planned work.** Accuracy validation against marks (next-steps §10), optional
-channel sidecar persistence (§11), and the deferred question of the Behavior tab
-consuming a tensor sidecar (§12).
+**Planned work.** Accuracy validation against marks (next-steps §10) and optional
+channel sidecar persistence (§11).
 
 **References:** `core/detection.py`, `core/channel_source.py`,
 `gui/explorers/live_scalogram_surface.py`; `docs/decisions.md` ("The

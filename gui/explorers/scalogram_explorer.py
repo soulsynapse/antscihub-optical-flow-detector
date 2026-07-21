@@ -45,19 +45,18 @@ import numpy as np
 from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
                          QShortcut)
-from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
-                             QGridLayout, QHBoxLayout, QLabel, QProgressDialog,
+from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
+                             QGridLayout, QHBoxLayout, QLabel,
                              QPushButton, QScrollArea, QSlider, QVBoxLayout,
                              QWidget)
 
-from core.channel_source import cache_channel_source
 from core.detection import (detect_gate, inband_count, largest_clump_per_frame,
                             rescale_count_band,
                             window_bounds, windowed_mean)
 from core.wavelet import (band_indices, coi_edge_samples, default_freqs,
                           morlet_power)
 from gui.video_panel import FrameView
-from gui.explorers.speed_explorer import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
+from gui.explorers.plots import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
                                           TXT, TXT_DIM, DensityPlot, MiniPlot,
                                           PixelBarPlot, _regions_from_meta)
 
@@ -78,7 +77,20 @@ CHANNELS = {
     "appearance energy": ("appearance", cv2.COLORMAP_TURBO),
     "tensor speed": ("tensor_speed", cv2.COLORMAP_TURBO),
     "intensity": ("intensity", cv2.COLORMAP_TURBO),
+    # Velocity-gradient family (core.channels), derived from the block flow u,v.
+    # ``vel_shear`` is a nonnegative deformation energy -- a detection channel on
+    # the same log-axis + tail-band footing as the others. ``vel_divergence`` and
+    # ``vel_vorticity`` are SIGNED (see _SIGNED_ATTRS): linear axis, no detection
+    # band -- diagnostic overlays, per the detection-channel design (a signed
+    # quantity has no heavy nonnegative tail to threshold).
+    "shear strain rate": ("vel_shear", cv2.COLORMAP_TURBO),
+    "divergence (signed)": ("vel_divergence", cv2.COLORMAP_TWILIGHT_SHIFTED),
+    "vorticity (signed)": ("vel_vorticity", cv2.COLORMAP_TWILIGHT_SHIFTED),
 }
+
+# Channels whose values are signed: a linear value axis and no tail-threshold
+# band. Everything else is a nonnegative energy (log1p axis, draggable band).
+_SIGNED_ATTRS = frozenset({"vel_divergence", "vel_vorticity"})
 
 # Warm scalogram ramp (0 -> plot bg, up to hot white), distinct from the cyan
 # density ramp so the two heatmaps never read as the same instrument.
@@ -102,8 +114,7 @@ class ScalogramPlot(MiniPlot):
         self.freqs = np.asarray(freqs, np.float64)
         # Required, not defaulted: the cone of influence is a width in SECONDS
         # converted to columns, so a wrong fps draws a confidently wrong wedge.
-        # Same reasoning as the cache_key provenance argument -- make the
-        # omission impossible rather than documented.
+        # Make the omission impossible rather than documented.
         self.fps = float(fps)
         self.matrix = np.zeros((0, 0), np.float32)     # (F, T) power
         self._img = None
@@ -311,9 +322,8 @@ class ScalogramExplorer(QWidget):
     # than only updating when a pass lands.
     frame_moved = pyqtSignal(int)
 
-    def __init__(self, cache=None, video_path: str | None = None, *,
-                 state=None, sidecar_path: str | None = None,
-                 channel_data=None, own_shortcuts: bool = True,
+    def __init__(self, video_path: str | None = None, *,
+                 state=None, channel_data=None, own_shortcuts: bool = True,
                  own_status: bool = True,
                  on_demand_channels: Iterable[str] | None = None, parent=None):
         super().__init__(parent)
@@ -321,13 +331,9 @@ class ScalogramExplorer(QWidget):
         # does not currently carry them -- the live surface's set is LIVE_CHANNELS,
         # because a live pass computes only the selected channel (+ _ALWAYS_STREAM)
         # and replans to add another. Such a channel is SELECTABLE though absent:
-        # checking it is what tells the host to compute it. Empty for a static
-        # cache explorer, which already carries every channel it lists.
+        # checking it is what tells the host to compute it.
         self._on_demand = frozenset(on_demand_channels or ())
-        if state is not None and cache is None and channel_data is None:
-            cache = state.cache
         self.state = state
-        self.cache = cache
         # When embedded in a host that owns Space (the live surface / main
         # window), skip our own Space shortcut so the two do not fight over it.
         self._own_shortcuts = own_shortcuts
@@ -344,28 +350,11 @@ class ScalogramExplorer(QWidget):
         self._own_status = own_status
         self._status_relay = None
 
-        # Source of geometry + channels. A ChannelData decouples us from the
-        # cache: it comes either from an open cache or a live windowed pass over
-        # a bare video. Both carry the four structure-tensor channels this panel
-        # plots; a cache additionally carries flow "speed", which this panel no
-        # longer offers (see CHANNELS).
+        # Source of geometry + channels. A ChannelData is a live windowed pass
+        # over a bare video, carrying the structure-tensor channels this panel
+        # plots (see CHANNELS).
         if channel_data is None:
-            if cache is None:
-                raise ValueError(
-                    "ScalogramExplorer requires a cache, state, or channel_data")
-            dlg = QProgressDialog("Extracting structure-tensor channels...", None,
-                                  0, int(cache.meta["n_frames"]), self)
-            dlg.setWindowModality(Qt.WindowModality.WindowModal)
-            dlg.setMinimumDuration(0)
-
-            def prog(done, total):
-                dlg.setMaximum(total)
-                dlg.setValue(done)
-                QApplication.processEvents()
-
-            channel_data = cache_channel_source(
-                cache, sidecar_path=sidecar_path, progress=prog)
-            dlg.close()
+            raise ValueError("ScalogramExplorer requires channel_data")
 
         self._cd = channel_data
         self.meta = channel_data.meta
@@ -551,12 +540,6 @@ class ScalogramExplorer(QWidget):
         # overlay now so the panel isn't blank until it lands (the cube-ready
         # path redraws again to add the in-band highlight).
         self._redraw_video()
-
-    @classmethod
-    def from_app_state(cls, state, parent=None) -> "ScalogramExplorer":
-        if not state.has_cache:
-            raise ValueError("Open a feature cache before creating this explorer")
-        return cls(state=state, parent=parent)
 
     @classmethod
     def from_channel_data(cls, channel_data, video_path: str | None = None,
@@ -789,7 +772,6 @@ class ScalogramExplorer(QWidget):
                 self.count_w_plot.band_committed,
                 self.sweep_win_slider.valueChanged,
                 self.centered_chk.stateChanged,
-                self.region_combo.currentIndexChanged,
                 self.chan_group.buttonToggled]
         srcs += [dp.band_committed for dp in self.density_plots.values()]
         for sig in srcs:
@@ -805,9 +787,7 @@ class ScalogramExplorer(QWidget):
         for the one case that is not a rebuild -- restoring the replicate a
         remembered session was tuned against when the clip is reopened.
         """
-        i = self.region_combo.findData(int(index))
-        if i >= 0:
-            self.region_combo.setCurrentIndex(i)
+        self._set_active_region(int(index))
 
     def reset_tuning(self) -> None:
         """Every tuned detection parameter back to a freshly-built explorer's:
@@ -1138,21 +1118,17 @@ class ScalogramExplorer(QWidget):
         trow.addWidget(self.rate_lbl)
         left.addLayout(trow)
 
+        # Passive readout, not a dropdown (T20): selection is by clicking the
+        # video tile (right-click un-focuses to the pooled scope), so a combo was
+        # a redundant second route to state the gestures already own. This only
+        # reflects the current focus.
         rrow = QHBoxLayout()
         rrow.addWidget(QLabel("Replicate:"))
-        self.region_combo = QComboBox()
-        if len(self.regions) > 1:
-            self.region_combo.addItem(
-                "— all replicates (click one to select) —", -1)
-        for i, r in enumerate(self.regions):
-            rid = r["id"]
-            suffix = f" (#{rid})" if rid is not None else ""
-            self.region_combo.addItem(f"{r['label']}{suffix}", i)
-        idx = self.region_combo.findData(self.active_region_index)
-        self.region_combo.setCurrentIndex(max(0, idx))
-        self.region_combo.currentIndexChanged.connect(self._on_region_changed)
-        rrow.addWidget(self.region_combo, 1)
+        self.region_lbl = QLabel()
+        self.region_lbl.setStyleSheet("font-size:11px; color:#bbb;")
+        rrow.addWidget(self.region_lbl, 1)
         left.addLayout(rrow)
+        self._sync_region_label()
 
         hrow = QHBoxLayout()
         self.hi_chk = QCheckBox("Highlight blocks in band")
@@ -1256,7 +1232,14 @@ class ScalogramExplorer(QWidget):
             self._sync_channel_check(name)
             grid.addWidget(cb, r, 0, Qt.AlignmentFlag.AlignCenter)
             dp = DensityPlot(name)
-            dp.set_log_axis(True)
+            # Signed channels (divergence/vorticity) get a linear value axis and
+            # no detection band -- log1p is meaningless on negatives and a tail
+            # threshold has no heavy nonnegative tail to bite. They stay viewable
+            # diagnostic overlays; every energy channel keeps log axis + band.
+            signed = CHANNELS[name][0] in _SIGNED_ATTRS
+            dp.set_log_axis(not signed)
+            if signed:
+                dp.set_band_active(False)
             dp.seek_requested.connect(self._seek)
             dp.band_changed.connect(partial(self._on_density_band_changed, name))
             dp.band_committed.connect(
@@ -2237,11 +2220,25 @@ class ScalogramExplorer(QWidget):
                 f"Re-drag it, or widen it, to tune against this replicate.")
             self.band_note.setVisible(True)
 
-    def _on_region_changed(self, _index):
+    def _set_active_region(self, new_index: int):
+        """The single sink every selection gesture routes through -- click-to-
+        select, right-click-to-pool, and session restore (T20 removed the
+        dropdown that used to be a second route to the same state).
+
+        ``new_index`` is a region index, or a negative value for the pooled
+        scope (which only exists with more than one replicate; with one it
+        collapses to that replicate). An out-of-range or no-op index is ignored,
+        matching the old combo's silent suppression of a same-index set."""
+        new_index = int(new_index)
+        if new_index < 0:
+            new_index = -1 if len(self.regions) > 1 else 0
+        elif new_index >= len(self.regions):
+            return
+        if new_index == self.active_region_index:
+            return
         old_index = self.active_region_index
         self._stash_bands(old_index)
-        data = self.region_combo.currentData()
-        self.active_region_index = int(data) if data is not None else 0
+        self.active_region_index = new_index
         self._restore_bands(old_index)
         # A different replicate is a different set of blocks, so the accumulated
         # axis bounds do not describe it. Carrying them over would put one
@@ -2252,8 +2249,25 @@ class ScalogramExplorer(QWidget):
         self.video_view.set_focus_frac(focus)
         self._sync_video_boxes()
         self._sync_window_title()
+        self._sync_region_label()
         self._rebuild_scalograms()   # _refresh_densities syncs the off-range note
         self._redraw_video()
+        # Region is one of the knobs capture_view_state persists, so a switch is
+        # a tuning change; the old combo emitted this via the relay in
+        # _wire_tuning_changed, which no longer has a widget to hang off.
+        self.tuning_changed.emit()
+
+    def _sync_region_label(self):
+        """Reflect the focused replicate in the passive readout that replaced the
+        dropdown. The pooled scope reads as a hint to click, since clicking is now
+        the only way in."""
+        if self.active_region_index < 0:
+            self.region_lbl.setText("all — click a replicate to select")
+            return
+        r = self.regions[self.active_region_index]
+        rid = r.get("id")
+        suffix = f" (#{rid})" if rid is not None else ""
+        self.region_lbl.setText(f"{r['label']}{suffix}")
 
     def _on_channel_toggled(self, button, checked: bool):
         # buttonToggled fires for both the newly-unchecked and newly-checked
@@ -2316,15 +2330,12 @@ class ScalogramExplorer(QWidget):
         for i, region in enumerate(self.regions):
             x0, y0, x1, y1 = region["frac"]
             if x0 <= fx <= x1 and y0 <= fy <= y1:
-                idx = self.region_combo.findData(i)
-                if idx >= 0:
-                    self.region_combo.setCurrentIndex(idx)
+                self._set_active_region(i)
                 return
 
     def _clear_region_focus(self):
-        idx = self.region_combo.findData(-1)
-        if idx >= 0:                       # selection scope exists: back to it
-            self.region_combo.setCurrentIndex(idx)
+        if len(self.regions) > 1:          # pooled scope exists: back to it
+            self._set_active_region(-1)
         else:
             self.video_view.set_focus_frac(None)
 
