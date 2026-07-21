@@ -73,6 +73,13 @@ class AppState(QObject):
 
         # Propose a band the footage can actually resolve. A 15-30 Hz default on
         # 60 fps footage would sit on the Nyquist limit and alias.
+        #
+        # INERT as written: this is the only writer of ``cfg.features.bands`` and
+        # there is no reader -- the explorer's band comes from the user dragging
+        # on an axis that ``core.wavelet.default_freqs`` has already capped at
+        # 0.45*fps, which is what actually keeps a band below Nyquist. Kept
+        # because the proposal is the right seed IF the picker is ever wired to
+        # it; do not cite it as the aliasing guard until then.
         band = self.cfg.features.suggest_band(self.source.info.fps)
         self.cfg = self.cfg.with_band(band)
 

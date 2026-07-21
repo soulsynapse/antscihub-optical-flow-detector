@@ -241,9 +241,21 @@ support than a six-box grasshopper layout does.
 ## Frequency and camera-motion constraints
 
 No method can recover frequency above the Nyquist limit. At 59.94 fps the limit
-is 29.97 Hz, so the old 15–30 Hz suggestion sits directly on the boundary. The
-tool proposes 12–24 Hz at 60 fps, warns above 80% of Nyquist and rejects bands
-above Nyquist. Faster behavior needs faster capture.
+is 29.97 Hz, so the old 15–30 Hz suggestion sits directly on the boundary.
+Faster behavior needs faster capture; the About dialog says so, because no code
+can fix it.
+
+The guard that is actually live is **structural, not a warning**: the scalogram's
+frequency bank is capped at `0.45 × fps` (`core.wavelet.default_freqs`), so the
+axis does not extend to Nyquist and a band above it cannot be dragged in the
+first place. The `butter` channel path separately clamps to 0.999 × Nyquist
+(`core/channels.py`).
+
+Be aware that `FeatureConfig.suggest_band` (the 12–24 Hz proposal) and
+`FeatureConfig.validate_bands` (warn above 80% of Nyquist, reject above it) are
+**dead code**: `validate_bands` has no callers, and the band `suggest_band`
+returns is written to `cfg.features.bands` by `gui/state.py` and read by nothing.
+Do not cite either as a safety property until something calls them.
 
 The corresponding raw reference clip contains strong slow camera motion:
 
