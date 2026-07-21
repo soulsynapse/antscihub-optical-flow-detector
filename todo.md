@@ -29,16 +29,16 @@ to the relevant section rather than restating it.
 | ~~**T16**~~ | ~~On a detection, show a `DETECTED` badge (green bg, bold black) bottom-right of the viewer box.~~ **FIXED** — see Batch E; the shift-held exemption is pinned by a pixel test. |
 | ~~**T17**~~ | ~~Whole-video processing resets the detection threshold bands when navigating.~~ **FIXED** — see Batch F. |
 | ~~**T18**~~ | ~~"Process whole video" computes every channel regardless of the selected one.~~ **FIXED** — see Batch F. |
-| **T20** | ~~Drop the replicate dropdown — redundant with click navigation.~~ **RESCOPED, and it is not in the file this entry assumed** (`FINDINGS.md` §19). There is no dropdown on the replicate tab. The widget is `region_combo` in **five explorers**, where it is not redundant with click navigation but *is* the selection state — `active_region_index` reads `currentData()`, click-to-select is `setCurrentIndex`, and it carries a **pooled scope (`-1`) with no click gesture at all**. Deleting it means rehoming three things. Belongs with the explorers, not Batch G. |
+| **T20** | **Delete the `region_combo` dropdown in the five explorers.** Earlier thought blocked because the combo was the only route to pooled scope (`-1`) — it is **not**: right-click already reaches the pooled view, so the dropdown is redundant with both click-to-select and right-click-to-pool and can just go. `active_region_index` (reads `currentData()`) and `setCurrentIndex` rehome onto the click / right-click gestures. Small explorer cleanup; unblocks nothing. |
 | **T21** | Suspected runaway memory issue somewhere on the replicate tab. **Not reproduced by inspection** — `_refresh_list` was the obvious suspect and is clean (14x14 swatch pixmaps, `list.clear()` releases the items). Needs an actual measurement, not more code reading; do not guess at a fix. |
 | ~~**T22**~~ | ~~New **viewer tab** consuming a fully-processed video.~~ **DROPPED** (2026-07-19) — scope, not value. A convenience shell over a `DetectionResult` that nothing else depends on; never started. Re-open only if day-to-day review actually stalls without it. |
 | ~~**T23**~~ | ~~**ROI pre-transcode**: cut each source once into per-replicate clips + manifest.~~ **DONE** — see Batch I. Works, and **the premise it was justified on turned out false**: the 25x isolated decode win is **1.06x end to end** (`FINDINGS.md` §16). Not the lever that moves the floor at scale 1.0. |
 | ~~**T24**~~ | ~~**Headless batch driver**: no-GUI entry point, file-level partitioning, N-worker throughput.~~ **DONE** — all three slices landed; throughput measured in `FINDINGS.md` §14 (**~130 fps / 5.4x realtime, ceiling at 8 workers**). |
 | ~~**T29**~~ | ~~**Streaming live surface** — display immediately, process forward continuously, plots fill as frames arrive, instead of extract-a-window-then-block.~~ **DONE — Batches P and Q are both closed (2026-07-20).** Foundations `e11a4cb` (`core/stream_buffer.py`); Batch P `73ac827` (`stream_channel_planes` + `ChannelPlan`, §22, cost measured at nil); Batch Q slices 1–5 `aefa8cc` → `249fce1` → `8f2d198` → `d944cad` → `c7634c1` (§23, §24). T35 closed by slice 4. Suite 655 passing on a clean run. |
-| **T30** | **The mark corpus is not a corpus.** `marks.json` holds **one** 0.39 s span, and **no animal-absent spans at all** — so occupancy's whole claim (present-but-still ≠ empty) cannot be tested, and neither can any supervised channel comparison. Needs flying / still-with-animal / animal-absent / wingbeat, several each, across replicates. `rep6-no-flying` is a ready-made negative control. **This blocks T31 and T32, and no amount of channel-building substitutes for it.** |
-| **T31** | **Validate occupancy and the ratio channels against marked footage**, using the **tail statistic, not region means** (`FINDINGS.md` §20 — this was got wrong once already). Gates Batch S. |
-| **T32** | **Supervised signature fitting.** With a real corpus, fit LDA / L1-logistic per labelled behaviour over the (channel × spatial scale × temporal scale) grid. The weight vector *is* an interpretable, tunable signature and drops into a template detector with the existing `DetectionResult` shape. Cheap, and it tells you which channels earn their place before the unsupervised map is built around them. |
-| **T33** | **Rebuild marking on the streaming surface** (Batch R). `gui/timeline.py` still has the full span model; `gui/_shelved/tab3_behavior.py` has the persistence and label picker. |
+| ~~**T30**~~ | ~~The mark corpus is not a corpus.~~ **CORPUS LAID DOWN (2026-07-20).** `Videos/Stabilized/rep3_intermittent_crop.marks.json` holds **152 hand-verified Flying bouts** (scrubbed repeatedly — Kendrick reports more accurate than hand-labelled), 49% of frames, with real not-flying between them. Enough to validate the wingbeat band (T31). **Still missing for the occupancy claim:** still-with-animal / animal-absent spans — see the **Occupancy** item. `rep6-no-flying` is the ready negative control. |
+| **T31** | **Validate channels against marked footage on the tail statistic** (`FINDINGS.md` §20). **DONE for flying-vs-not (2026-07-20):** wingbeat band [13.66–25 Hz] separates flying near-perfectly, is **frequency-specific** (low [1–5 Hz] band degrades — intensity drops to chance), and **`butter`+`filtfilt` ≈ Morlet** — measured via the channel lab (now `scripts/channel_lab.py`). **Caveat: the contrast is saturated** (flight is gross whole-crop motion), so it validates the *band* but does not rank channels finely. |
+| **T32** | **Supervised signature fitting. Large — its own branch.** Fit LDA / L1-logistic per labelled behaviour over the (channel × spatial scale × temporal scale) grid. The weight vector *is* an interpretable, tunable signature and drops into a template detector with the existing `DetectionResult` shape. Tells you which channels earn their place before the unsupervised map is built around them. |
+| **Occupancy** (future) | **Test present-but-still vs animal-absent on the tail statistic** — the half of `FINDINGS.md` §20 the rep3 corpus cannot reach (the animal is always present). Needs still-with-animal / absent spans; `rep6-no-flying` is the ready negative control. Deferred. |
 | ~~**T26**~~ | ~~**The container frame count is not the decodable frame count.**~~ **FIXED** — see Batch O. The cut and a full-length headless pass both run clean on `GX010047c2` now; `FINDINGS.md` §15 records the fix, §16 the clip-backed throughput it unblocked. |
 
 ## 2. Standing decisions
@@ -360,25 +360,6 @@ knob, not only a cost knob.
 
 ---
 
-### Batch R — marking, rehomed onto the streaming surface · `gui/timeline.py` + surface
-
-**Goal.** Get labelling back, on the live surface rather than the retired tab.
-
-Mostly rehoming, not writing: `gui/timeline.py` already has the whole span model
-(`marks`, `marks_to_dict`, `set_marks_from_dict`, middle-drag to lay spans,
-per-label colours), and `docs/archive/`-era `gui/_shelved/tab3_behavior.py` has the
-persistence, the label picker and the video-scoped sidecar path
-(`state.video_sidecar("marks")`). Read both before writing anything.
-
-**Preserve the scoping contract.** Marks live next to the video and are scoped to
-it; opening a different clip must load ITS marks or none, never inherit the previous
-clip's. That is the one behaviour the shelved tab got right and is easy to lose.
-
-**T30 is the point of this batch** — the corpus, not the widget. A marking UI with
-nothing marked in it does not unblock anything.
-
----
-
 ### Batch G — replicate tab (~~T11~~, ~~T12~~, T20, T21) · `tab2_replicates` + `video_panel`
 **T11 and T12 landed. T20 left the batch, T21 is untouched — G is NOT closed.**
 Full write-up in `FINDINGS.md` §19; what matters here:
@@ -569,8 +550,11 @@ produces either avoidance or silent degradation.
 (2026-07-20) — T29 and T35 with them. G is half done: T11 and T12 landed, T20
 left the batch, T21 is untouched.**
 
-**Next: Batch R + T30** — marking rehomed onto the streaming surface, and an
-actual corpus laid down. Then T31 → T32.
+**Corpus laid down and the wingbeat band validated (T30, T31 — 2026-07-20).**
+Marking rehoming onto the old span model is **dropped** — the future marking
+surface will look different and is out of scope here. **Next: the velocity
+gradient tensor channel** (strain rate + vorticity from block flow — see the
+current thread below). Signature fitting (T32) is its own branch.
 
 ---
 
@@ -720,14 +704,18 @@ thread below as the near-term order.
    2 (surface + `set_channel_data`, `249fce1`), 3 (COI, `8f2d198`), 4 (the
    whole-video rebuild — `core/live_track.py`, coverage, staleness, the strip
    as seeker, `d944cad`), 5 (continuous plots — the axis registration and the
-   10 Hz rate, `c7634c1`). See `FINDINGS.md` §23 and §24. **Next is Batch R +
-   T30.**
-3. **Batch R + T30** — marking rehomed, and **an actual corpus laid down**. The
-   widget without the corpus unblocks nothing.
-4. **T31** — validate occupancy/ratios against that corpus, on the tail statistic.
-5. **T32** — supervised signature fitting; decides which channels earn their place.
-6. **Batch S** (unwritten, gated on T31) — velocity gradient tensor: strain rate and
-   vorticity from the block flow. `∇v` is **translation-invariant by construction**,
+   10 Hz rate, `c7634c1`). See `FINDINGS.md` §23 and §24.
+3. ~~**Batch R + T30** — marking rehomed, and an actual corpus laid down.~~
+   **T30 DONE (2026-07-20): rep3 flying / not-flying corpus, 152 hand-verified
+   bouts.** Marking rehoming is dropped — the future marking surface will look
+   different, so its plan was removed rather than carried.
+4. ~~**T31**~~ **DONE (2026-07-20)** — wingbeat band validated on the tail
+   statistic via the channel lab (`scripts/channel_lab.py`, `scripts/run_lab.py`).
+   Frequency-specific, `butter` ≈ Morlet; contrast saturated so it validates the
+   band, not a fine channel ranking. Occupancy half deferred (see Open items).
+5. **T32** — supervised signature fitting. **Large; its own branch.**
+6. **Velocity gradient tensor channel — NEXT** (was Batch S; T31 unblocked it).
+   Strain rate and vorticity from the block flow. `∇v` is **translation-invariant by construction**,
    so it measures posture change with no tracker and no body frame — the one
    configural read available in the low-resolution regime. `features.py` already has
    `_divergence`/`_curl` for the flow path; neither is exposed on the tensor path.
