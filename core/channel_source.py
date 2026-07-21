@@ -1,20 +1,14 @@
-"""Decouple the scalogram/tensor path from the feature cache.
+"""The scalogram/tensor path's data source: a live windowed structure-tensor pass.
 
-The scalogram explorer historically took an open feature cache and read both the
-geometry contract (``meta``) and the flow arrays from it. But the tensor channels
-it detects on -- change, tensor_speed, intensity, and the appearance residual --
-need only the geometry and the video, not the expensive flow solve. A
-``ChannelData`` carries exactly that: cache-meta-shaped geometry plus per-block
-channel time series, from EITHER an existing cache or a live windowed pass over a
-bare video.
+The tensor channels detection runs on -- change, tensor_speed, intensity, and the
+appearance residual -- need only the geometry and the video, not any precomputed
+flow cache. A ``ChannelData`` carries exactly that: cache-meta-shaped geometry plus
+per-block channel time series from a live windowed pass over a bare video.
 
-  * ``cache_channel_source`` -- today's behaviour. All five channels, including
-    the pipeline's cached flow ``speed`` and appearance measured against cached
-    flow.
-  * ``live_channel_source`` -- geometry via ``build_layout`` (cheap, no flow),
-    then a windowed structure-tensor pass. Appearance is measured against the
-    tensor's own flow; cached-flow ``speed`` is absent. This is the seam that lets
-    the explorer open any video, any window, with no cache.
+  * ``live_channel_source`` -- geometry via ``build_layout`` (cheap), then a
+    windowed structure-tensor pass. Appearance is measured against the tensor's own
+    flow. This is the seam that lets the explorer open any video, any window, with
+    no cache.
 
 See docs/expanded_cache_plan.md and the branch plan for the larger restructure.
 """
@@ -27,8 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from core.replicates import build_layout
-from core.tensor_channels import (_tiles_from_meta, extract_channels_live,
-                                  load_or_extract_channels)
+from core.tensor_channels import _tiles_from_meta, extract_channels_live
 from core.video import VideoSource
 
 # Channels a live (cacheless) source provides, in the explorer's UI order. All are
@@ -92,23 +85,6 @@ def with_derived_channels(cd: "ChannelData", names) -> "ChannelData":
     return ChannelData(meta=meta, channels=channels,
                        window_start=cd.window_start,
                        approximated=cd.approximated)
-
-
-def cache_channel_source(cache, sidecar_path: str | None = None,
-                         progress=None) -> ChannelData:
-    """Today's five-channel, cache-backed source: structure-tensor channels via
-    the sidecar-memoized extractor plus the pipeline's cached flow ``speed``."""
-    ch = load_or_extract_channels(cache, sidecar_path=sidecar_path,
-                                  progress=progress)
-    channels = {
-        "change": np.asarray(ch["change"], np.float32),
-        "appearance": np.asarray(ch["appearance"], np.float32),
-        "tensor_speed": np.asarray(ch["tensor_speed"], np.float32),
-        "intensity": np.asarray(ch["intensity"], np.float32),
-        "speed": np.asarray(cache.read("speed"), np.float32),
-    }
-    return ChannelData(meta=cache.meta, channels=channels, window_start=0,
-                       approximated=bool(ch["meta"].get("approximated", False)))
 
 
 def synth_live_meta(video_path: str, cfg, replicates: list[dict], *,

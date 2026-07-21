@@ -1,8 +1,8 @@
 """Replicates tab: manual experimental-unit bounding boxes.
 
-The histogram-driven automatic ROI discovery is shelved in
-gui/_shelved/tab2_roi_auto.py -- it worked, but on footage where the behavior is
-everywhere and the camera moves, drawing the replicate regions by hand is faster
+The histogram-driven automatic ROI discovery was retired -- it worked, but on
+footage where the behavior is everywhere and the camera moves, drawing the
+replicate regions by hand is faster
 and less error-prone than tuning a filter to segment them. Each box becomes a
 replicate: a spatial region present for the whole clip, which Tab 3 then
 classifies exactly as it would an auto-discovered ROI.

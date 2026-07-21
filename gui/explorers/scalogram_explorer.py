@@ -46,11 +46,10 @@ from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
                          QShortcut)
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
-                             QGridLayout, QHBoxLayout, QLabel, QProgressDialog,
+                             QGridLayout, QHBoxLayout, QLabel,
                              QPushButton, QScrollArea, QSlider, QVBoxLayout,
                              QWidget)
 
-from core.channel_source import cache_channel_source
 from core.detection import (detect_gate, inband_count, largest_clump_per_frame,
                             rescale_count_band,
                             window_bounds, windowed_mean)
@@ -324,9 +323,8 @@ class ScalogramExplorer(QWidget):
     # than only updating when a pass lands.
     frame_moved = pyqtSignal(int)
 
-    def __init__(self, cache=None, video_path: str | None = None, *,
-                 state=None, sidecar_path: str | None = None,
-                 channel_data=None, own_shortcuts: bool = True,
+    def __init__(self, video_path: str | None = None, *,
+                 state=None, channel_data=None, own_shortcuts: bool = True,
                  own_status: bool = True,
                  on_demand_channels: Iterable[str] | None = None, parent=None):
         super().__init__(parent)
@@ -334,13 +332,9 @@ class ScalogramExplorer(QWidget):
         # does not currently carry them -- the live surface's set is LIVE_CHANNELS,
         # because a live pass computes only the selected channel (+ _ALWAYS_STREAM)
         # and replans to add another. Such a channel is SELECTABLE though absent:
-        # checking it is what tells the host to compute it. Empty for a static
-        # cache explorer, which already carries every channel it lists.
+        # checking it is what tells the host to compute it.
         self._on_demand = frozenset(on_demand_channels or ())
-        if state is not None and cache is None and channel_data is None:
-            cache = state.cache
         self.state = state
-        self.cache = cache
         # When embedded in a host that owns Space (the live surface / main
         # window), skip our own Space shortcut so the two do not fight over it.
         self._own_shortcuts = own_shortcuts
@@ -357,28 +351,11 @@ class ScalogramExplorer(QWidget):
         self._own_status = own_status
         self._status_relay = None
 
-        # Source of geometry + channels. A ChannelData decouples us from the
-        # cache: it comes either from an open cache or a live windowed pass over
-        # a bare video. Both carry the four structure-tensor channels this panel
-        # plots; a cache additionally carries flow "speed", which this panel no
-        # longer offers (see CHANNELS).
+        # Source of geometry + channels. A ChannelData is a live windowed pass
+        # over a bare video, carrying the structure-tensor channels this panel
+        # plots (see CHANNELS).
         if channel_data is None:
-            if cache is None:
-                raise ValueError(
-                    "ScalogramExplorer requires a cache, state, or channel_data")
-            dlg = QProgressDialog("Extracting structure-tensor channels...", None,
-                                  0, int(cache.meta["n_frames"]), self)
-            dlg.setWindowModality(Qt.WindowModality.WindowModal)
-            dlg.setMinimumDuration(0)
-
-            def prog(done, total):
-                dlg.setMaximum(total)
-                dlg.setValue(done)
-                QApplication.processEvents()
-
-            channel_data = cache_channel_source(
-                cache, sidecar_path=sidecar_path, progress=prog)
-            dlg.close()
+            raise ValueError("ScalogramExplorer requires channel_data")
 
         self._cd = channel_data
         self.meta = channel_data.meta
@@ -564,12 +541,6 @@ class ScalogramExplorer(QWidget):
         # overlay now so the panel isn't blank until it lands (the cube-ready
         # path redraws again to add the in-band highlight).
         self._redraw_video()
-
-    @classmethod
-    def from_app_state(cls, state, parent=None) -> "ScalogramExplorer":
-        if not state.has_cache:
-            raise ValueError("Open a feature cache before creating this explorer")
-        return cls(state=state, parent=parent)
 
     @classmethod
     def from_channel_data(cls, channel_data, video_path: str | None = None,
