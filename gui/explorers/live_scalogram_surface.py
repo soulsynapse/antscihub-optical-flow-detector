@@ -44,8 +44,8 @@ from enum import Enum
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout,
-                             QLabel, QPushButton, QSpinBox, QVBoxLayout,
-                             QWidget)
+                             QInputDialog, QLabel, QPushButton, QSpinBox,
+                             QVBoxLayout, QWidget)
 
 from core.channel_source import (LIVE_CHANNELS, ChannelData,
                                  live_channel_source, synth_live_meta)
@@ -72,6 +72,7 @@ from core.wavelet import default_freqs
 from gui.explorers.detection_timeline import DetectionNavigator
 from gui.explorers.scalogram_explorer import CHANNELS as _DISPLAY_CHANNELS
 from gui.explorers.scalogram_explorer import ScalogramExplorer
+from gui.marks_store import add_detection_spans, load_marks, save_marks
 # The worker base moved to gui/stream_worker.py so the continuous worker could
 # share it without importing this module. The base and Cancelled are re-bound to
 # the private names the rest of this file, and its tests, already use.
@@ -500,6 +501,9 @@ class LiveScalogramSurface(QWidget):
 
         self._explorer: ScalogramExplorer | None = None
         self._proc_worker: _ProcessWorker | None = None
+        # Prefill for the next "Save detections" label prompt, so laying down
+        # several spans of the same behaviour does not retype it each time.
+        self._last_mark_label = ""
         # Tuning remembered for THIS clip (see gui/tuning_store). Loaded before
         # the strip is built so the controls come up on it.
         self._saved = load_tuning(video_path)
@@ -699,6 +703,7 @@ class LiveScalogramSurface(QWidget):
         self.navigator = DetectionNavigator()
         self.navigator.set_span(self.frame_count, self.fps)
         self.navigator.focus_requested.connect(self._focus_frame)
+        self.navigator.save_requested.connect(self._save_detections)
         self.navigator.scrubbed.connect(self._on_scrubbed)
         self.navigator.pressed.connect(self._on_strip_pressed)
         self.navigator.seek_committed.connect(self._on_seek_committed)
@@ -1566,6 +1571,63 @@ class LiveScalogramSurface(QWidget):
 
     def _repaint_track(self) -> None:
         self.navigator.set_track(self._track)
+
+    def _save_detections(self) -> None:
+        """Commit the current-settings detections to the clip's marks sidecar.
+
+        This is the corpus-building gesture (todo.md Batch R / T30): the detector
+        proposes the spans, tuning them until happy is the curation, and Save
+        writes what is on the strip as labelled ground truth. Only the intervals
+        the CURRENT settings produced are written -- a stale detection is on the
+        strip because it happened, but it is not an answer to the question the
+        knobs now ask, so it is not what "Save these detections" means.
+
+        The label is asked for here rather than picked from a permanent control:
+        one save pass is one behaviour, so the question belongs at the moment of
+        saving. The detector settings ride along as provenance so a later fit
+        knows which configuration's output each label is.
+        """
+        intervals = self._track.detected_intervals(current_only=True)
+        stamp, _ = self._current_stamp()
+        if not intervals or stamp is None:
+            # The button is disabled without current detections, so this is the
+            # race where settings changed between enabling it and the click.
+            self.status_lbl.setText("No current-settings detections to save.")
+            return
+        label, ok = QInputDialog.getText(
+            self, "Save detections",
+            "Behaviour label for these detections:", text=self._last_mark_label)
+        label = (label or "").strip()
+        if not ok or not label:
+            return
+        self._last_mark_label = label
+
+        fps = max(self.fps, 1e-6)
+        spans_s = [(s / fps, e / fps) for (s, e) in intervals]
+        p = self._explorer.detection_params()
+        provenance = {
+            "channel": stamp.channel,
+            "freq_band_hz": list(stamp.freq_band_hz),
+            "value_band": list(p["value_band"]),
+            "count_band": list(p["count_band"]),
+            "detect_window": int(p["detect_window"]),
+            "grid": list(stamp.grid),
+            "region_index": stamp.region_index,
+            "region_blocks": stamp.region_blocks,
+            "downsample": stamp.downsample,
+            "block_size": stamp.block_size,
+            "fps": self.fps,
+        }
+        doc = load_marks(self.video_path)
+        add_detection_spans(doc, stamp.region_index, label, spans_s, provenance)
+        wrote, note = save_marks(self.video_path, doc)
+        if not wrote:
+            self.status_lbl.setText(note or "Could not save detections.")
+            return
+        n = len(spans_s)
+        self.status_lbl.setText(
+            f"Saved {n} detection{'s' if n != 1 else ''} as '{label}' "
+            f"(region {stamp.region_index}).")
 
     def _save_track(self) -> None:
         """Write the detection track's sidecar, and SAY when something was lost.

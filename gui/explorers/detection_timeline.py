@@ -236,13 +236,12 @@ class DetectionNavigator(QWidget):
     pressed = pyqtSignal(int)               # mouse-down: jump here now
     seek_committed = pyqtSignal(int)        # expensive: load this position
     focus_requested = pyqtSignal(int)       # a detection was chosen
+    save_requested = pyqtSignal()           # commit current detections to marks
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.fps = 30.0
         self._intervals: list[tuple[int, int]] = []
-        self._by_strength: list[int] = []
-        self._cur = -1
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -257,20 +256,16 @@ class DetectionNavigator(QWidget):
         lay.addWidget(self.strip)
 
         row = QHBoxLayout()
-        self.prev_btn = QPushButton("◀ Prev strongest")
-        self.next_btn = QPushButton("Next strongest ▶")
-        self.prev_btn.clicked.connect(lambda: self._step(-1))
-        self.next_btn.clicked.connect(lambda: self._step(+1))
-        self.prev_btn.setEnabled(False)
-        self.next_btn.setEnabled(False)
-        row.addWidget(self.prev_btn)
-        row.addWidget(self.next_btn)
-        row.addStretch(1)
         self.legend = QLabel()
         self.legend.setStyleSheet("color:#8a8a96; font-size:10px;")
         self.legend.setText("▁ lit = examined · gray = other settings · "
                             "dark = not examined · bar height log")
         row.addWidget(self.legend)
+        row.addStretch(1)
+        self.save_btn = QPushButton("Save detections")
+        self.save_btn.clicked.connect(self.save_requested)
+        self.save_btn.setEnabled(False)
+        row.addWidget(self.save_btn)
         lay.addLayout(row)
 
     def set_span(self, n_frames: int, fps: float) -> None:
@@ -282,11 +277,6 @@ class DetectionNavigator(QWidget):
         self.fps = float(track.fps) or self.fps
         self.strip.set_track(track)
         self._intervals = track.detected_intervals(current_only=True)
-        clump = np.asarray(track.clump, np.float32)
-        strengths = [float(clump[s:e].max()) if e > s else 0.0
-                     for (s, e) in self._intervals]
-        self._by_strength = list(np.argsort(strengths)[::-1]) if strengths else []
-        self._cur = -1
         n = len(self._intervals)
         cov = track.coverage_fraction()
         det_s = float(np.asarray(track.gate)[track.current].sum()) / max(self.fps, 1e-6)
@@ -301,8 +291,7 @@ class DetectionNavigator(QWidget):
                 f"{cov * 100:.0f}% of the clip examined · "
                 f"{n} detection{'s' if n != 1 else ''} · "
                 f"{det_s:.1f} s detected{stale_note}")
-        self.prev_btn.setEnabled(n > 0)
-        self.next_btn.setEnabled(n > 0)
+        self.save_btn.setEnabled(n > 0)
 
     def set_cursor(self, frame: int) -> None:
         self.strip.set_cursor(frame)
@@ -316,10 +305,3 @@ class DetectionNavigator(QWidget):
                 self.focus_requested.emit(int((iv[0] + iv[1]) // 2))
                 return
         self.seek_committed.emit(int(frame))
-
-    def _step(self, delta: int):
-        if not self._by_strength:
-            return
-        self._cur = (self._cur + delta) % len(self._by_strength)
-        s, e = self._intervals[self._by_strength[self._cur]]
-        self.focus_requested.emit(int((s + e) // 2))

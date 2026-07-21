@@ -16,7 +16,8 @@ os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
 
 from PyQt6.QtWidgets import QApplication
 
-from gui.explorers.detection_timeline import _BASE_ROWS, _GATE_ROWS, _Strip
+from gui.explorers.detection_timeline import (_BASE_ROWS, _GATE_ROWS,
+                                              DetectionNavigator, _Strip)
 
 
 class _Track:
@@ -106,6 +107,56 @@ class LogBarHeightTests(unittest.TestCase):
         got = [int(h[i * 20 + 3]) for i in range(5)]
         self.assertEqual(got, sorted(got))
         self.assertEqual(len(set(got)), len(got), f"heights collapsed: {got}")
+
+
+class _NavTrack(_Track):
+    """A track that also answers the navigator's summary/interval reads."""
+
+    def __init__(self, clump, intervals, stale=None, **kw):
+        super().__init__(clump, **kw)
+        self._intervals = list(intervals)
+        n = self.clump.size
+        self.stale = np.zeros(n, bool) if stale is None else np.asarray(stale, bool)
+
+    def detected_intervals(self, current_only=True):
+        return list(self._intervals)
+
+    def coverage_fraction(self):
+        return float(self.covered.mean())
+
+
+class SaveButtonTests(unittest.TestCase):
+    """The strongest-stepping buttons are gone; a Save button sits where the
+    legend was, enabled only when there is something to save."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_the_strongest_stepping_buttons_are_gone(self):
+        nav = DetectionNavigator()
+        self.assertFalse(hasattr(nav, "prev_btn"))
+        self.assertFalse(hasattr(nav, "next_btn"))
+        self.assertFalse(hasattr(nav, "_step"))
+
+    def test_save_is_disabled_until_a_detection_exists(self):
+        nav = DetectionNavigator()
+        self.assertFalse(nav.save_btn.isEnabled())
+        gate = np.zeros(64, np.float32)
+        gate[10:20] = 1.0
+        nav.set_track(_NavTrack(np.zeros(64), [(10, 20)], gate=gate))
+        self.assertTrue(nav.save_btn.isEnabled())
+        # And back off when a re-tune leaves no current detection.
+        nav.set_track(_NavTrack(np.zeros(64), []))
+        self.assertFalse(nav.save_btn.isEnabled())
+
+    def test_clicking_save_emits_save_requested(self):
+        nav = DetectionNavigator()
+        fired = []
+        nav.save_requested.connect(lambda: fired.append(True))
+        nav.save_btn.setEnabled(True)
+        nav.save_btn.click()
+        self.assertEqual(fired, [True])
 
 
 if __name__ == "__main__":

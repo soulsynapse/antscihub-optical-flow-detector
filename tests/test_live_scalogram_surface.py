@@ -279,9 +279,9 @@ class ParkedNavigationTests(_SurfaceTestCase):
         surface.start_stream.assert_not_called()
 
     def test_focusing_a_detection_while_stopped_loads_the_window(self):
-        """'Next strongest' is a verb. It moves the slider AND loads the window
-        centred on the event, so the plots show it for verification rather than
-        staying on the previous span."""
+        """Focusing a detection (releasing a click inside one) is a verb. It
+        moves the slider AND loads the window centred on the event, so the plots
+        show it for verification rather than staying on the previous span."""
         surface = self._surface()
         surface.len_spin.setValue(0.5)
         surface._focus_frame(20)
@@ -307,6 +307,95 @@ class ParkedNavigationTests(_SurfaceTestCase):
         # Stopped, the cursor is the only feedback there is, so it still moves.
         surface._on_scrubbed(300)
         surface._explorer.seek_absolute.assert_called_once_with(300)
+
+
+class SaveDetectionsTests(_SurfaceTestCase):
+    """Save detections -> labelled marks in the clip's sidecar (Batch R / T30).
+    The detector proposes the spans; Save writes the current-settings ones as
+    ground truth under a behaviour label the user is asked for."""
+
+    def _armed(self, surface, intervals):
+        """A surface whose track reports ``intervals`` under a real stamp."""
+        from core.live_track import TrackStamp
+        surface.fps = 30.0
+        surface._track = MagicMock()
+        surface._track.detected_intervals.return_value = intervals
+        surface._explorer = MagicMock()
+        surface._explorer.detection_params.return_value = {
+            "value_band": (0.1, 0.9), "count_band": (5.0, 1e9),
+            "detect_window": 3}
+        stamp = TrackStamp(channel="change", freq_band_hz=(0.5, 5.0),
+                           grid=(8, 8), region_index=0, region_blocks=29,
+                           downsample=1.0, block_size=64)
+        surface._current_stamp = MagicMock(return_value=(stamp, None))
+        self.addCleanup(self._drop_marks)
+
+    def _drop_marks(self):
+        from gui.marks_store import marks_path
+        try:
+            os.remove(marks_path(self.video))
+        except OSError:
+            pass
+
+    def _saved(self):
+        from gui.marks_store import load_marks
+        return load_marks(self.video)
+
+    def test_save_writes_current_detections_as_labelled_marks(self):
+        from gui.marks_store import marks_path
+        surface = self._surface()
+        self._armed(surface, [(30, 60), (90, 105)])
+        with patch.object(live_scalogram_surface, "QInputDialog") as dlg:
+            dlg.getText.return_value = ("flying", True)
+            surface._save_detections()
+        self.assertTrue(os.path.exists(marks_path(self.video)))
+        doc = self._saved()
+        # 30 fps -> seconds; keyed by the region the detector was scoped to.
+        self.assertEqual(doc["spans"]["0"],
+                         [[1.0, 2.0, "flying"], [3.0, 3.5, "flying"]])
+        self.assertEqual(doc["provenance"]["flying"]["channel"], "change")
+        self.assertIn("flying", surface.status_lbl.text())
+
+    def test_cancelling_the_label_prompt_writes_nothing(self):
+        from gui.marks_store import marks_path
+        surface = self._surface()
+        self._armed(surface, [(30, 60)])
+        with patch.object(live_scalogram_surface, "QInputDialog") as dlg:
+            dlg.getText.return_value = ("", False)
+            surface._save_detections()
+        self.assertFalse(os.path.exists(marks_path(self.video)))
+
+    def test_a_blank_label_writes_nothing(self):
+        from gui.marks_store import marks_path
+        surface = self._surface()
+        self._armed(surface, [(30, 60)])
+        with patch.object(live_scalogram_surface, "QInputDialog") as dlg:
+            dlg.getText.return_value = ("   ", True)
+            surface._save_detections()
+        self.assertFalse(os.path.exists(marks_path(self.video)))
+
+    def test_no_current_detections_is_reported_not_written(self):
+        from gui.marks_store import marks_path
+        surface = self._surface()
+        self._armed(surface, [])            # settings changed under the click
+        with patch.object(live_scalogram_surface, "QInputDialog") as dlg:
+            dlg.getText.return_value = ("flying", True)
+            surface._save_detections()
+        dlg.getText.assert_not_called()
+        self.assertFalse(os.path.exists(marks_path(self.video)))
+        self.assertIn("No current", surface.status_lbl.text())
+
+    def test_the_prompt_prefills_the_last_used_label(self):
+        surface = self._surface()
+        self._armed(surface, [(30, 60)])
+        with patch.object(live_scalogram_surface, "QInputDialog") as dlg:
+            dlg.getText.return_value = ("wingbeat", True)
+            surface._save_detections()
+            self._armed(surface, [(30, 60)])
+            surface._save_detections()
+            # Second prompt is seeded with the first save's label.
+            self.assertEqual(dlg.getText.call_args.kwargs.get("text"),
+                             "wingbeat")
 
 
 class ResumeWhereStoppedTests(_SurfaceTestCase):
