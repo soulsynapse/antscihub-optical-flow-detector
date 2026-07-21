@@ -102,8 +102,9 @@ def normalize_params(d: dict) -> dict:
     ch = d.get("channel_attr", DEFAULT_CHANNEL)
     if ch not in LIVE_CHANNELS:
         raise BatchError(
-            f"channel_attr {ch!r} is not one of {LIVE_CHANNELS}. (The cached-flow "
-            "'speed' channel needs a pipeline cache and is not on the live path.)")
+            f"channel_attr {ch!r} is not one of {LIVE_CHANNELS}. (The old "
+            "'speed' channel came from the retired flow cache and no longer "
+            "exists; 'tensor_speed' is the equivalent read from the tensor.)")
     win = int(d.get("detect_window", 1))
     if win < 1:
         raise BatchError(f"detect_window must be >= 1, got {win}")

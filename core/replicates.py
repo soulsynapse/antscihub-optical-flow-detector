@@ -3,13 +3,14 @@
 Replicate boxes are the ownership boundary.  A pipeline run may use temporary
 synthetic pixels outside a box to give dense flow an edge neighbourhood, but it
 must never read source pixels from another replicate.  Only the exact box is
-reduced to blocks and cached.
+reduced to blocks.
 
-The individual block grids are packed into one sparse atlas on disk.  This keeps
-the existing time-major cache and feature machinery while every expensive image
-operation is still performed independently per replicate.  Atlas coordinates
-are an internal storage detail; source-frame fractions remain the public
-geometry used by the GUI and exports.
+The individual block grids are packed into one sparse atlas in memory, so every
+expensive image operation is performed once over a single array while remaining
+independent per replicate.  Atlas coordinates are an internal layout detail;
+source-frame fractions remain the public geometry used by the GUI and exports.
+The atlas is what makes a derived channel's spatial derivative stop at a
+replicate seam -- see ``core.channels``.
 """
 from __future__ import annotations
 

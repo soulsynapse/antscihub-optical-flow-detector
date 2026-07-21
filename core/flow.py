@@ -1,9 +1,17 @@
 """Pluggable dense optical flow backends behind one interface.
 
+**Mostly dormant.** These backends served the retired flow cache. The live
+detection path solves flow from the structure tensor instead
+(``core.structure_tensor.flow_from_tensor``), and the only thing imported from
+this module today is ``reduce_scalar_to_blocks``, used by
+``core.tensor_channels``. ``FlowConfig.backend`` still accepts
+farneback/dis/raft, but nothing on the tensor path consults it -- do not read
+that field as a claim that the solver is selectable.
+
 Every backend takes two preprocessed grayscale float32 frames and returns a
 HxWx2 float32 flow field in pixels/frame (u = horizontal, v = vertical).
 Conversion to physical units (px/s) happens once, at block-reduction time,
-because the cache is in seconds and Hz, never frames.
+because everything downstream is in seconds and Hz, never frames.
 
 Availability is probed rather than assumed: RAFT needs torch + a GPU, and
 selecting it without one must fail with a clear message rather than silently
@@ -152,11 +160,11 @@ def forward_backward_error(forward: np.ndarray,
     ``forward`` maps frame t -> t+1 and ``backward`` maps t+1 -> t.  The
     backward vector must therefore be sampled at x + F(x) before the two vectors
     are added.  Pixels whose forward endpoint leaves the image are assigned a
-    large finite error rather than NaN/inf so cached histograms remain usable.
+    large finite error rather than NaN/inf so downstream histograms remain usable.
 
     This is deliberately a continuous diagnostic.  The absolute/relative
-    rejection threshold belongs at analysis time and is not baked into the raw
-    cached flow.
+    rejection threshold belongs at analysis time and is never baked into the raw
+    flow field.
     """
     if forward.shape != backward.shape or forward.ndim != 3 \
             or forward.shape[2] != 2:

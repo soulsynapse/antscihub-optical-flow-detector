@@ -222,8 +222,9 @@ def flow_input_preview(bgr: np.ndarray, work_size: tuple[int, int],
 
     Downsampling, grayscale conversion and contrast normalization are replayed
     exactly. Registration, temporal denoising, background subtraction and masks
-    need run history/reference assets that are not stored in the feature cache,
-    so this diagnostic intentionally omits those stateful/contextual steps.
+    need run history or fitted reference assets that a single frame cannot
+    reconstruct, so this diagnostic intentionally omits those stateful and
+    contextual steps.
     """
     work_w, work_h = map(int, work_size)
     h, w = bgr.shape[:2]

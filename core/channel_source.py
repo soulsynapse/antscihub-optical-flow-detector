@@ -1,16 +1,19 @@
 """The scalogram/tensor path's data source: a live windowed structure-tensor pass.
 
 The tensor channels detection runs on -- change, tensor_speed, intensity, and the
-appearance residual -- need only the geometry and the video, not any precomputed
-flow cache. A ``ChannelData`` carries exactly that: cache-meta-shaped geometry plus
-per-block channel time series from a live windowed pass over a bare video.
+appearance residual -- need only the geometry and the video. A ``ChannelData``
+carries exactly that: a geometry contract plus per-block channel time series from
+a live windowed pass over a bare video.
 
   * ``live_channel_source`` -- geometry via ``build_layout`` (cheap), then a
     windowed structure-tensor pass. Appearance is measured against the tensor's own
-    flow. This is the seam that lets the explorer open any video, any window, with
-    no cache.
+    flow. This is the seam that lets the explorer open any video, any window.
 
-See docs/expanded_cache_plan.md and the branch plan for the larger restructure.
+The ``meta`` dict's shape is inherited from the retired feature cache's metadata,
+which is why several helpers here are named ``*_meta`` and why the fields read
+like a storage header. It is now an in-memory contract between the extractor,
+the explorer and the detector rather than anything's on-disk header. (The
+headless path writes a *summary*, not this dict -- see ``core.batch``.)
 """
 from __future__ import annotations
 
@@ -24,9 +27,10 @@ from core.replicates import build_layout
 from core.tensor_channels import _tiles_from_meta, extract_channels_live
 from core.video import VideoSource
 
-# Channels a live (cacheless) source provides, in the explorer's UI order. All are
-# video-derived; appearance rides the tensor's own flow. The pipeline's cached
-# flow ``speed`` is added only by the cache-backed source. ``u``/``v`` are the
+# Channels the source provides, in the explorer's UI order. All are video-derived;
+# appearance rides the tensor's own flow. (The retired cache also offered a
+# ``speed`` channel from the pipeline's stored flow; there is no such source now,
+# which is why nothing here or in the explorer menu lists it.) ``u``/``v`` are the
 # signed flow components (px/s) -- extracted primitives, not shown on their own,
 # but the base fields the velocity-gradient DERIVED channels read (see
 # core.channels). They ride the same flow solve as ``tensor_speed``.
@@ -90,9 +94,8 @@ def with_derived_channels(cd: "ChannelData", names) -> "ChannelData":
 def synth_live_meta(video_path: str, cfg, replicates: list[dict], *,
                     width: int, height: int, fps: float,
                     frame_count: int) -> dict:
-    """Build a cache-meta-shaped geometry contract for a bare video + config,
-    without running (or writing) any flow cache. ``n_frames`` is the FULL clip;
-    the extraction window is applied separately."""
+    """Build the geometry contract for a bare video + config, decode-free.
+    ``n_frames`` is the FULL clip; the extraction window is applied separately."""
     scale = cfg.preprocess.resolve_downsample(width)
     block = cfg.flow.resolve_block_size(scale)
     layout = build_layout(replicates, width, height, scale, block)
@@ -280,8 +283,8 @@ def reduce_channel_data(pp: ChannelData, cfg, replicates: list[dict]
     if int(src.get("block_size", 0)) != 1:
         raise ValueError("reduce_channel_data expects a block_size=1 source")
     w, h = int(src["src_width"]), int(src["src_height"])
-    # Track the scale the cached pixels were actually extracted at, not the one
-    # in cfg: this reduces an existing atlas, so its own meta is authoritative.
+    # Track the scale the pixels were actually extracted at, not the one in cfg:
+    # this reduces an existing atlas, so its own meta is authoritative.
     block = cfg.flow.resolve_block_size(float(src["downsample"]))
     if block <= 1:
         return pp                                    # already pixel-level

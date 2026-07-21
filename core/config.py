@@ -1,10 +1,14 @@
-"""Configuration objects for the flow pipeline.
+"""Configuration objects for the processing pipeline.
 
-Every config here is a frozen dataclass so it can be hashed. The feature cache
-on disk is keyed by (video_hash, replicate_geometry, preprocess_config,
-flow_config, feature_config)
-so that retuning downstream histogram filters never triggers recomputation, but
-changing anything upstream does.
+Every config here is a frozen dataclass so it can be hashed. That hashability
+existed for the feature cache's identity key, which is **gone** along with the
+cache -- ``PipelineConfig.cache_key`` was deleted once it had no consumers. It is
+kept because the same property makes a config safe to use as a dict key and to
+compare for staleness, which the live path's ``TrackStamp`` does.
+
+If something here ever caches a clip-derived result again, its key MUST fold in
+``meta["clip_provenance"]``: below ``lossless``, a clip-derived and a
+source-derived result are different measurements (FINDINGS.md section 10).
 
 Time is in SECONDS and frequency is in HZ throughout. Frame indices appear only
 at the video-decode boundary and in tooltips.
@@ -143,12 +147,15 @@ class FlowConfig:
 
 @dataclass(frozen=True)
 class FeatureConfig:
-    """What gets written to disk.
+    """Band and diagnostic settings, largely inert since the flow cache went.
 
-    The core arrays (u, v, speed) are always cached: they are fundamental and
-    everything else in the registry derives from them cheaply. Band-power is
-    cached because recomputing an STFT over the full clip on every histogram
-    drag would not be interactive.
+    This described what the feature cache wrote to disk. Nothing writes to disk
+    now, so most fields below are retained only for round-tripping serialized
+    configs (see the flags' own comments). Measured, not assumed: the only member
+    with a production consumer is ``suggest_band`` (and ``nyquist_hz`` beneath
+    it), called once from ``gui/state.py`` to seed the band picker. ``bands``,
+    ``window_s``, ``hop_s``, ``dtype``, ``compression`` and both ``cache_*``
+    diagnostics have no callers outside this file.
     """
     bands: tuple[Band, ...] = (Band(12.0, 25.0),)
 
@@ -166,10 +173,10 @@ class FeatureConfig:
     cache_spectral_flatness: bool = False
     cache_direction_oscillation: bool = False
 
-    # Standardization diagnostics that genuinely require frame access. Both are
-    # continuous, inspectable fields: analysis-time thresholds remain tunable.
-    # Forward/backward error roughly doubles flow compute, while texture adds one
-    # cheap structure-tensor pass and one block-grid plane to the cache.
+    # Standardization diagnostics that genuinely require frame access. Also inert
+    # now -- they gated cache writes, and nothing reads them. Retained for the
+    # same round-trip reason as the flags above. Note that ``texture`` survives as
+    # a live channel in core.tensor_channels; only this write flag is dead.
     cache_fb_error: bool = False
     cache_texture: bool = False
 
@@ -186,6 +193,14 @@ class FeatureConfig:
         A band whose upper edge approaches Nyquist cannot be trusted: real motion
         above Nyquist aliases and folds back down into the band as a false
         signal. We warn above 0.8*Nyquist and reject above Nyquist.
+
+        **UNCALLED.** No production code invokes this, and it reads ``self.bands``
+        which only ``gui/state.py`` writes and nothing reads. The live aliasing
+        guard is structural instead: ``core.wavelet.default_freqs`` caps the
+        frequency bank at 0.45*fps, so an above-Nyquist band is unreachable on
+        the axis rather than warned about. Retained because the prose is the
+        clearest statement of why the limit matters -- but wire it up before
+        treating it as a check that runs.
         """
         warnings: list[str] = []
         nyq = self.nyquist_hz(fps)
@@ -214,7 +229,12 @@ class FeatureConfig:
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    """The full pipeline config. This is what gets hashed into the cache key."""
+    """The full pipeline config.
+
+    Was hashed into the feature cache's identity key; ``cache_key`` is deleted
+    and this is now just the settings bundle the live pass and the headless CLI
+    are configured from.
+    """
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     flow: FlowConfig = field(default_factory=FlowConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)

@@ -306,13 +306,14 @@ class Manifest:
     def provenance_key(self) -> str:
         """Stable identity for everything that can change a clip's pixels.
 
-        The flow cache key does not include the decoder or its bit depth
+        The retired flow cache's key did not include the decoder or its bit depth
         (``FINDINGS.md`` section 3 trap 3), which is why caches built across that
         change had to be rebuilt by hand. Reading from a pre-transcoded clip is a
-        third provenance axis on top of that one, so a consumer that caches
-        anything derived from these clips must fold this in -- otherwise a result
-        computed from a live crop and one computed from a clip cut under a
-        different rule compare as equal.
+        third provenance axis on top of that one. Nothing caches clip-derived
+        results today, so this key currently has no consumer -- but the first
+        thing that does MUST fold it in, otherwise a result computed from a live
+        crop and one computed from a clip cut under a different rule compare as
+        equal. It travels as ``meta["clip_provenance"]`` in the meantime.
 
         ``quality`` is in the key for the same reason and a sharper one: at any
         setting below lossless the clip's pixels differ from the source's, and

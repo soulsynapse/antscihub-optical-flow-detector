@@ -24,7 +24,8 @@ What each read recovers:
   * change    -- tt directly: the derivative energy <I_t^2>. Fast-weighted, so it
                  is the flicker/appearance channel, NOT amplitude variance. The DC
                  level the gradient discards (hence amplitude variance) must come
-                 from a separately cached mean intensity.
+                 from the separate ``intensity`` channel, which is the block-mean
+                 of the preprocessed frame and carries no gradient at all.
 
 Gradients use central differences for I_x, I_y and a one-frame forward difference
 for I_t, so flow comes out in pixels/frame -- the same units the flow backends
