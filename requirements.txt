@@ -1,8 +1,4 @@
 numpy
 opencv-python
 PyQt6
-h5py
-hdf5plugin
-zarr
-numcodecs
 scipy
