@@ -1,13 +1,15 @@
 # Current design decisions
 
-Status: current as of 2026-07-17. This document describes the live configuration
+Status: current as of 2026-07-20. This document describes the live configuration
 version 3 workflow. The archived handoffs are historical inputs, not overrides.
 
-The flow pipeline below remains the path for flow-derived features and the
-Behavior tab. Alongside it, a **tensor/scalogram detection path** now runs the
-whole isolate-a-behavior loop without an optical-flow cache; its decisions are in
-"The tensor/scalogram path runs without a flow cache" and "Commit means running
-the detector, not building a cache" near the end of this document.
+**The flow cache has been removed.** The **tensor/scalogram detection path** is
+now the only detection path — it runs the whole isolate-a-behavior loop without an
+optical-flow cache (see "The tensor/scalogram path runs without a flow cache" and
+"Commit means running the detector, not building a cache" near the end). The
+flow-pipeline and cache sections below ("Cache raw evidence", "Cache precision
+stops at float16", "Zarr and sparse atlases", "Cache compatibility is explicit")
+describe that removed subsystem and are retained only as historical rationale.
 
 ## Replicates come before flow
 
@@ -165,11 +167,11 @@ cached-flow-speed channel and the residual measured against *cached* flow. So th
 detection loop was decoupled from the cache.
 
 `core.channel_source.ChannelData` carries what the scalogram explorer needs —
-cache-meta-shaped geometry plus per-block channel time series — from either an
-open cache (`cache_channel_source`, five channels) or a live windowed pass over a
-bare video (`live_channel_source`, four channels). The explorer takes a
-`ChannelData`, not a cache, and greys out the channels a live source cannot
-provide. The appearance residual on the live path is measured against the tensor's
+cache-meta-shaped geometry plus per-block channel time series — from a live
+windowed pass over a bare video (`live_channel_source`). The cache-backed source
+(`cache_channel_source`) was removed with the rest of the flow-cache subsystem;
+the live pass is now the only source. The explorer takes a `ChannelData`, not a
+cache. The appearance residual on the live path is measured against the tensor's
 **own** per-pixel flow (`I_t + ∇I·v` with `v` from `flow_from_tensor`), not cached
 `u`/`v`, which removes the last flow-array dependency; this is the
 `flow_residual(J)` flavor anticipated in the expanded-cache plan.

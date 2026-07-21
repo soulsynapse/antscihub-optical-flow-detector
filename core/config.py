@@ -159,7 +159,10 @@ class FeatureConfig:
     window_s: float = 1.0
     hop_s: float = 0.25
 
-    # Optional cached expansions. Each one costs disk; the UI shows the cost.
+    # Inert flow-cache expansion flags. The flow cache they configured is gone
+    # (its derived-feature compute lived in the deleted core.features); these are
+    # retained only so a config dict serialized with them -- e.g. a marks-file
+    # provenance block -- still round-trips through from_dict without error.
     cache_coherence: bool = False
     cache_divergence_curl: bool = False
     cache_spectral_flatness: bool = False

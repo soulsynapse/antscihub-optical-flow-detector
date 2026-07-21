@@ -24,8 +24,8 @@ The velocity-gradient channels decompose the block velocity gradient ``∇v`` in
 its three 2-D invariant parts -- divergence (trace), shear (deviatoric strain,
 the symmetric traceless part), and vorticity (the antisymmetric part). ``∇v`` is
 translation-invariant by construction, so it measures posture/configural change
-with no tracker and no body frame. Mirrors ``core.features._divergence`` /
-``_curl`` (the retired flow path) but computes the full gradient tensor, per
+with no tracker and no body frame. Where the retired flow cache computed only
+divergence and curl per region, this computes the full gradient tensor, per
 atlas region so a spatial derivative never crosses a replicate separator.
 """
 from __future__ import annotations
