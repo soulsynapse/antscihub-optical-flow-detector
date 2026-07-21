@@ -154,8 +154,6 @@ class MainWindow(QMainWindow):
             "camera.</p>")
 
     def closeEvent(self, e):
-        if self.state.cache is not None:
-            self.state.cache.close()
         if self.state.source is not None:
             self.state.source.release()
         super().closeEvent(e)
