@@ -63,6 +63,23 @@ still frame is mostly per-pixel noise. Do not estimate a corpus from one
 replicate: rep3 alone reads 1.602 bpp and extrapolates to 86% of source, a third
 under the true 131%.
 
+**A clip belongs in its replicate's home** (``core/replicate_home.py``), which is
+the ``clip_layout="home"`` default: ``<stem>_rep01/<stem>.mkv`` rather than the
+flat ``<stem>__rep01.mkv`` beside the source. The home already exists the moment
+the box is drawn and already holds that replicate's track, marks and tuning, so
+the cut stops being a mode that changes the layout and becomes what it always
+should have been -- one more optional file dropped into a directory that is
+already there. ``clip_layout`` is deliberately NOT in :meth:`Manifest.provenance_key`:
+it moves a file, it does not change a pixel, and two cuts that differ only in
+where they put the same bytes must compare as equal.
+
+Nor is the layout recorded as a manifest field. Each ``ClipEntry.filename`` is
+the record -- a POSIX-relative path from the clip directory rather than a
+basename -- and a second copy of the same fact is the state duplication this
+project keeps deleting rather than keeping in step. It also means a manifest cut
+under the old flat layout still reads and still resolves, because a basename is a
+valid relative path, which is why this needed no ``PRETRANSCODE_VERSION`` bump.
+
 **Crop only; never scale here.** Cropping discards pixels no replicate owns, so
 it cannot change any detection result. Rescaling would bake a sensitivity
 decision into an artifact that costs a full re-decode to regenerate, which the
@@ -82,6 +99,7 @@ from dataclasses import dataclass, field, asdict
 
 import cv2
 
+from core.replicate_home import HOME_FMT
 from core.replicates import build_layout, geometry_hash, validate_replicates
 
 
@@ -143,6 +161,18 @@ QUALITY_PRESETS: dict[str, dict] = {
 
 DEFAULT_QUALITY = "high"
 
+# Where a clip is written, relative to the clip directory.
+#
+#   "home" -> <stem>_rep01/<stem>.mkv   the replicate's home; the default
+#   "flat" -> <stem>__rep01.mkv         one directory, as cuts before Batch S
+#
+# ``flat`` is kept rather than removed because manifests written under it are
+# still readable and still resolve -- see the module docstring -- so a corpus cut
+# months ago does not have to be re-cut to be used. It is not the default: the
+# home is where every other artefact about a replicate already lives.
+CLIP_LAYOUTS = ("home", "flat")
+DEFAULT_CLIP_LAYOUT = "home"
+
 
 class PretranscodeError(RuntimeError):
     pass
@@ -167,6 +197,10 @@ class ClipEntry:
     source_box: tuple[int, int, int, int]   # x0, y0, x1, y1 in source pixels
     width: int
     height: int
+    # Path RELATIVE to the clip directory, in POSIX form -- ``rep01/stem.mkv``
+    # under the home layout, a bare basename under the flat one and in every
+    # manifest written before Batch S. Resolve it with :func:`clip_path`, never
+    # with a plain ``os.path.join``, and never assume it has no directory part.
     filename: str
     # Frames actually written, probed after the cut, and the file's size on disk.
     #
@@ -455,8 +489,36 @@ def _as_rational(fps: float) -> tuple[int, int]:
     return fr.numerator, fr.denominator
 
 
-def clip_filename(stem: str, replicate_id: int) -> str:
-    return f"{stem}__rep{int(replicate_id):02d}.mkv"
+def clip_filename(stem: str, replicate_id: int,
+                  layout: str = DEFAULT_CLIP_LAYOUT) -> str:
+    """A clip's path relative to the clip directory, in POSIX form.
+
+    POSIX separators regardless of platform, because this string is written into
+    a JSON manifest that a Windows cut and a Linux pass may both read. A
+    backslash is a legal filename character on POSIX, so a Windows-written
+    ``rep01\\clip.mkv`` would resolve there as one absurdly-named file in the
+    wrong directory rather than failing -- and the failure would be a missing
+    clip reported against a manifest that verifies. :func:`clip_path` is the only
+    supported way back to a real path.
+    """
+    rid = int(replicate_id)
+    if layout == "flat":
+        return f"{stem}__rep{rid:02d}.mkv"
+    if layout != "home":
+        raise PretranscodeError(
+            f"unknown clip layout {layout!r}; expected one of {sorted(CLIP_LAYOUTS)}")
+    return f"{HOME_FMT.format(stem=stem, rid=rid)}/{stem}.mkv"
+
+
+def clip_path(clip_dir: str, filename: str) -> str:
+    """Resolve a manifest's POSIX-relative ``filename`` against ``clip_dir``.
+
+    Splitting on ``/`` rather than handing the whole string to ``os.path.join``:
+    the join would produce ``dir\\rep01/clip.mkv`` on Windows, which *opens*
+    fine and so passes every test, but is not a path anyone can print, compare,
+    or hand to ffmpeg's argument parser without surprises.
+    """
+    return os.path.join(clip_dir, *str(filename).split("/"))
 
 
 def manifest_path_for(video_path: str, out_dir: str) -> str:
@@ -537,6 +599,7 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
                        scale_rule: str = "scale-1.0-default",
                        block_size: int = 64,
                        quality: str = DEFAULT_QUALITY,
+                       clip_layout: str = DEFAULT_CLIP_LAYOUT,
                        progress=None, should_cancel=None,
                        overwrite: bool = False) -> Manifest:
     """Cut ``video_path`` into per-replicate clips in ``out_dir`` and write a manifest.
@@ -545,8 +608,18 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
     it returns true, the ffmpeg child is terminated and partial clips removed --
     a half-written clip that looked complete would be indistinguishable from a
     real one to every later pass.
+
+    ``clip_layout`` chooses where inside ``out_dir`` each clip lands; see
+    :data:`CLIP_LAYOUTS`. Under ``"home"`` the home directories are created here
+    if missing, so a cut works on a source the GUI has never opened -- but when
+    ``out_dir`` is the default (beside the video) they are the SAME directories
+    ``core.replicate_home`` writes tracks and marks into, which is the point.
     """
     preset = resolve_quality(quality)
+    if clip_layout not in CLIP_LAYOUTS:
+        raise PretranscodeError(
+            f"unknown clip layout {clip_layout!r}; expected one of "
+            f"{sorted(CLIP_LAYOUTS)}")
     validate_replicates(replicates)
     if not os.path.isfile(video_path):
         raise PretranscodeError(f"no such video: {video_path}")
@@ -562,13 +635,20 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
     layout = build_layout(replicates, w, h, 1.0, block_size)
 
     stem = os.path.splitext(os.path.basename(video_path))[0]
-    out_paths = [os.path.join(out_dir, clip_filename(stem, t.replicate_id))
+    rel_names = [clip_filename(stem, t.replicate_id, clip_layout)
                  for t in layout.tiles]
+    out_paths = [clip_path(out_dir, r) for r in rel_names]
     existing = [p for p in out_paths if os.path.exists(p)]
     if existing and not overwrite:
         raise PretranscodeError(
             f"{len(existing)} clip(s) already exist in {out_dir}; "
             "pass overwrite=True to replace them")
+    # ffmpeg does not create output directories; without this the whole cut
+    # fails at the first write, minutes in on a real source. Created before the
+    # child starts rather than lazily, so the failure -- a read-only footage
+    # directory -- is reported before anything is decoded.
+    for p in out_paths:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
 
     cmd = clip_command(video_path, layout.tiles, out_paths, quality)
     if overwrite:
@@ -709,9 +789,10 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
                       source_box=t.source_box,
                       width=t.source_box[2] - t.source_box[0],
                       height=t.source_box[3] - t.source_box[1],
-                      filename=os.path.basename(p),
+                      filename=rel,
                       frame_count=nf, size_bytes=os.path.getsize(p))
-            for t, p, nf in zip(layout.tiles, out_paths, clip_frames)),
+            for t, p, rel, nf in zip(layout.tiles, out_paths, rel_names,
+                                     clip_frames)),
     )
     write_manifest(man, manifest_path_for(video_path, out_dir))
 
@@ -851,6 +932,14 @@ def _kill(proc) -> None:
 
 
 def _cleanup(paths: list[str]) -> None:
+    """Remove partial clips. Never the directories holding them.
+
+    Under the home layout the parent is a replicate's home, which may already
+    hold that replicate's track and marks -- and Batch S ruling 2 forbids
+    deleting one regardless. An empty directory left behind by a failed cut
+    costs nothing; the alternative risks a curated corpus on a cancelled
+    transcode.
+    """
     for p in paths:
         try:
             if os.path.exists(p):
@@ -906,7 +995,7 @@ def verify_manifest(man: Manifest, out_dir: str, replicates: list[dict] | None =
     if (man.source_sha256 if deep else man.quick_sig) != sig:
         raise PretranscodeError("source file contents have changed since the cut")
     for c in man.clips:
-        p = os.path.join(out_dir, c.filename)
+        p = clip_path(out_dir, c.filename)
         if not os.path.isfile(p):
             raise PretranscodeError(f"clip is missing: {p}")
         if c.size_bytes and os.path.getsize(p) != c.size_bytes:

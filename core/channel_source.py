@@ -135,7 +135,7 @@ def resolve_clip_paths(manifest, clip_dir: str, replicates: list[dict],
     signature, not a re-hash of an 11 GB file) precisely so that a live surface
     starting a pass on every knob edit can afford it.
     """
-    from core.pretranscode import verify_manifest
+    from core.pretranscode import clip_path, verify_manifest
 
     verify_manifest(manifest, clip_dir, replicates)
     paths = []
@@ -156,7 +156,9 @@ def resolve_clip_paths(manifest, clip_dir: str, replicates: list[dict],
                 f"clip {entry.filename} records {entry.width}x{entry.height} "
                 f"but replicate {t['id']}'s box is {x1-x0}x{y1-y0}; "
                 "re-run the pre-transcode")
-        paths.append(os.path.join(clip_dir, entry.filename))
+        # clip_path, not os.path.join: ``filename`` is a POSIX-relative path and
+        # carries a directory part under the home layout.
+        paths.append(clip_path(clip_dir, entry.filename))
     return paths
 
 

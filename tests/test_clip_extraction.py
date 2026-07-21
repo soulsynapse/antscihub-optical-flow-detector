@@ -207,8 +207,12 @@ class ClipExtractionTest(unittest.TestCase):
 
     def test_missing_clip_is_refused(self):
         d = os.path.join(self._dir, "partial")
-        os.makedirs(d, exist_ok=True)
-        shutil.copy(os.path.join(self.clip_dir, self.man.clips[0].filename), d)
+        # Copy the FIRST clip only, at its own relative path -- a flat copy would
+        # leave both clips unresolvable and the test would pass without ever
+        # exercising the "one present, one absent" case it is named for.
+        first = pt.clip_path(d, self.man.clips[0].filename)
+        os.makedirs(os.path.dirname(first), exist_ok=True)
+        shutil.copy(pt.clip_path(self.clip_dir, self.man.clips[0].filename), first)
         with self.assertRaises(pt.PretranscodeError):
             resolve_clip_paths(self.man, d, REPS,
                                _tiles_from_meta(self._meta()))
@@ -221,8 +225,8 @@ class ClipExtractionTest(unittest.TestCase):
         victim = self.man.clips[0].filename
         subprocess.run(
             ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-             "-i", os.path.join(self.clip_dir, victim),
-             "-frames:v", str(frames), "-c", "copy", os.path.join(d, victim)],
+             "-i", pt.clip_path(self.clip_dir, victim),
+             "-frames:v", str(frames), "-c", "copy", pt.clip_path(d, victim)],
             check=True, capture_output=True)
         return d
 
@@ -258,7 +262,7 @@ class ClipExtractionTest(unittest.TestCase):
         documented way past the manifest checks.
         """
         d = self._truncated_clips("truncated_decode")
-        paths = [os.path.join(d, c.filename) for c in self.man.clips]
+        paths = [pt.clip_path(d, c.filename) for c in self.man.clips]
         meta = self._meta()
         res = extract_channels_live(self.video, meta, start=0, n=28,
                                     clip_paths=paths)
@@ -278,7 +282,7 @@ class ClipExtractionTest(unittest.TestCase):
             self.assertEqual(c.frame_count, self.man.frame_count)
             self.assertEqual(
                 c.size_bytes,
-                os.path.getsize(os.path.join(self.clip_dir, c.filename)))
+                os.path.getsize(pt.clip_path(self.clip_dir, c.filename)))
 
     def test_clips_are_frame_aligned_with_the_source(self):
         """``-fps_mode passthrough`` at the cut, checked end to end.

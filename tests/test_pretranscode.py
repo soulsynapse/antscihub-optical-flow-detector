@@ -195,6 +195,91 @@ class TestManifest(unittest.TestCase):
                 pt.read_manifest(p)
 
 
+class TestClipLayout(unittest.TestCase):
+    """Where a clip is written, and how a manifest's ``filename`` resolves."""
+
+    def test_home_layout_names_the_replicates_home(self):
+        """Same directory ``core.replicate_home`` puts the track and marks in --
+        derived from HOME_FMT rather than re-spelled, so the two cannot drift."""
+        from core.replicate_home import home_name
+        rel = pt.clip_filename("GX010047", 1)
+        self.assertEqual(rel, "GX010047_rep01/GX010047.mkv")
+        self.assertEqual(rel.split("/")[0], home_name("x/GX010047.MP4", 1))
+
+    def test_flat_layout_is_the_pre_batch_s_name(self):
+        self.assertEqual(pt.clip_filename("GX010047", 1, "flat"),
+                         "GX010047__rep01.mkv")
+
+    def test_relative_paths_are_posix_on_every_platform(self):
+        """The manifest is JSON and may be written on Windows and read on Linux,
+        where a backslash is a legal filename character -- so a native separator
+        would resolve there as one absurdly-named file rather than failing."""
+        self.assertNotIn("\\", pt.clip_filename("v", 3))
+
+    def test_unknown_layout_is_refused_by_name(self):
+        with self.assertRaises(pt.PretranscodeError) as cm:
+            pt.clip_filename("v", 1, "nested")
+        self.assertIn("home", str(cm.exception))
+
+    def test_clip_path_resolves_a_bare_basename(self):
+        """Manifests cut before Batch S carry basenames and must still resolve;
+        that is why widening ``filename`` needed no version bump."""
+        self.assertEqual(pt.clip_path("out", "v__rep01.mkv"),
+                         os.path.join("out", "v__rep01.mkv"))
+
+    def test_clip_path_splits_the_relative_path_into_real_components(self):
+        got = pt.clip_path("out", "v_rep01/v.mkv")
+        self.assertEqual(got, os.path.join("out", "v_rep01", "v.mkv"))
+        # The point of not using os.path.join on the whole string: on Windows
+        # that leaves a mixed-separator path that opens fine and so passes every
+        # test, while being unprintable and uncomparable.
+        self.assertEqual(os.path.dirname(got), os.path.join("out", "v_rep01"))
+
+
+class TestCliLayoutPlumbing(unittest.TestCase):
+    """The CLI half of slice 4, without running a transcode."""
+
+    def _man(self, names):
+        return pt.Manifest(
+            version=pt.PRETRANSCODE_VERSION, source_path="/v.mp4",
+            source_size=10, source_sha256="a" * 64, quick_sig="b" * 32,
+            src_width=160, src_height=120, fps_num=24, fps_den=1,
+            frame_count=24, geometry_hash="h", resolved_scale=1.0,
+            scale_rule="scale-1.0-default", codec="c", lossless=False,
+            quality="high", quality_rms=1.0,
+            clips=tuple(pt.ClipEntry(i + 1, "x", (0, 0, 1, 1), (0, 0, 8, 6),
+                                     8, 6, n) for i, n in enumerate(names)))
+
+    def test_default_layout_is_the_home(self):
+        from cli.pretranscode import _build_parser
+        self.assertEqual(_build_parser().parse_args(["v.mp4"]).layout,
+                         pt.DEFAULT_CLIP_LAYOUT)
+        self.assertEqual(pt.DEFAULT_CLIP_LAYOUT, "home")
+
+    def test_superseded_names_clips_a_relayout_orphaned(self):
+        """A flat->home re-cut leaves the old clips on disk, silently doubling
+        the storage the report just quoted."""
+        import tempfile
+        from cli.pretranscode import _superseded
+        with tempfile.TemporaryDirectory() as d:
+            old = pt.clip_path(d, "v__rep01.mkv")
+            open(old, "wb").close()
+            new = pt.clip_path(d, "v_rep01/v.mkv")
+            os.makedirs(os.path.dirname(new))
+            open(new, "wb").close()
+            got = _superseded(self._man(["v__rep01.mkv"]),
+                              self._man(["v_rep01/v.mkv"]), d)
+            self.assertEqual(got, [old])
+
+    def test_superseded_is_empty_when_the_layout_did_not_change(self):
+        import tempfile
+        from cli.pretranscode import _superseded
+        with tempfile.TemporaryDirectory() as d:
+            man = self._man(["v_rep01/v.mkv"])
+            self.assertEqual(_superseded(man, man, d), [])
+            self.assertEqual(_superseded(None, man, d), [])
+
+
 class _FakeProc:
     """Minimal Popen stand-in: canned stdout lines, no real child."""
 
@@ -314,7 +399,7 @@ class TestEndToEnd(unittest.TestCase):
         man = pt.build_pretranscode(self.src, REPS, self.out)
         self.assertEqual(len(man.clips), 2)
         for c in man.clips:
-            self.assertTrue(os.path.isfile(os.path.join(self.out, c.filename)))
+            self.assertTrue(os.path.isfile(pt.clip_path(self.out, c.filename)))
         self.assertTrue(os.path.isfile(pt.manifest_path_for(self.src, self.out)))
 
     # -- Batch O: the two halves of the replaced guard ------------------------
@@ -409,7 +494,7 @@ class TestEndToEnd(unittest.TestCase):
         for c in man.clips:
             x0, y0, x1, y1 = c.source_box
             self.assertEqual((c.width, c.height), (x1 - x0, y1 - y0))
-            arr = _gray(os.path.join(self.out, c.filename), c.width, c.height)
+            arr = _gray(pt.clip_path(self.out, c.filename), c.width, c.height)
             self.assertGreater(len(arr), 0)
             self.assertEqual(arr.shape[1:], (c.height, c.width))
 
@@ -424,7 +509,7 @@ class TestEndToEnd(unittest.TestCase):
              "-vf", f"crop={x1-x0}:{y1-y0}:{x0}:{y0}:exact=1,format=gray",
              "-c:v", "ffv1", "-pix_fmt", "gray", ref_path],
             check=True, capture_output=True)
-        got = _gray(os.path.join(self.out, c.filename), c.width, c.height)
+        got = _gray(pt.clip_path(self.out, c.filename), c.width, c.height)
         ref = _gray(ref_path, c.width, c.height)
         n = min(len(got), len(ref))
         self.assertGreater(n, 0)
@@ -435,8 +520,8 @@ class TestEndToEnd(unittest.TestCase):
         crop to every output, which the dimension checks alone would not catch."""
         man = pt.build_pretranscode(self.src, REPS, self.out, quality="lossless")
         a, b = man.clip_for(1), man.clip_for(2)
-        ga = _gray(os.path.join(self.out, a.filename), a.width, a.height)
-        gb = _gray(os.path.join(self.out, b.filename), b.width, b.height)
+        ga = _gray(pt.clip_path(self.out, a.filename), a.width, a.height)
+        gb = _gray(pt.clip_path(self.out, b.filename), b.width, b.height)
         self.assertFalse(np.array_equal(ga, gb))
 
     def test_refuses_to_clobber_existing_clips_unless_asked(self):
@@ -444,6 +529,42 @@ class TestEndToEnd(unittest.TestCase):
         with self.assertRaises(pt.PretranscodeError):
             pt.build_pretranscode(self.src, REPS, self.out)
         pt.build_pretranscode(self.src, REPS, self.out, overwrite=True)
+
+    def test_cut_writes_each_clip_into_its_replicates_home(self):
+        """Slice 4: the clip joins the track, marks and tuning rather than
+        introducing a layout of its own."""
+        from core.replicate_home import home_name
+        man = pt.build_pretranscode(self.src, REPS, self.out)
+        for c in man.clips:
+            self.assertEqual(c.filename,
+                             f"{home_name(self.src, c.replicate_id)}/v.mkv")
+            self.assertTrue(os.path.isfile(pt.clip_path(self.out, c.filename)))
+
+    def test_flat_layout_still_cuts_and_verifies(self):
+        man = pt.build_pretranscode(self.src, REPS, self.out, clip_layout="flat")
+        self.assertEqual(sorted(c.filename for c in man.clips),
+                         ["v__rep01.mkv", "v__rep02.mkv"])
+        pt.verify_manifest(man, self.out, REPS)
+
+    def test_layout_does_not_change_the_provenance_key(self):
+        """It moves bytes, not pixels. Two cuts that differ only in where the
+        same clip sits MUST compare as equal, or every clip-derived cache entry
+        would be invalidated by a filesystem decision."""
+        home = pt.build_pretranscode(self.src, REPS, self.out, quality="lossless")
+        flat = pt.build_pretranscode(self.src, REPS, self.out, quality="lossless",
+                                     clip_layout="flat", overwrite=True)
+        self.assertNotEqual(home.clips[0].filename, flat.clips[0].filename)
+        self.assertEqual(home.provenance_key(), flat.provenance_key())
+
+    def test_a_failed_cut_removes_its_clips_but_not_the_home(self):
+        """Batch S ruling 2: a home may already hold a curated corpus, so a
+        cancelled or failed transcode must never take the directory with it."""
+        with self._forced_stats(dup=1):
+            with self.assertRaises(pt.PretranscodeError):
+                pt.build_pretranscode(self.src, REPS, self.out)
+        home = os.path.join(self.out, "v_rep01")
+        self.assertTrue(os.path.isdir(home))
+        self.assertEqual(os.listdir(home), [])
 
     def test_verify_accepts_a_fresh_cut(self):
         man = pt.build_pretranscode(self.src, REPS, self.out)
@@ -459,7 +580,7 @@ class TestEndToEnd(unittest.TestCase):
 
     def test_verify_rejects_a_missing_clip(self):
         man = pt.build_pretranscode(self.src, REPS, self.out)
-        os.remove(os.path.join(self.out, man.clips[0].filename))
+        os.remove(pt.clip_path(self.out, man.clips[0].filename))
         with self.assertRaises(pt.PretranscodeError):
             pt.verify_manifest(man, self.out, REPS)
 

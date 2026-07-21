@@ -7,10 +7,19 @@ path could be read but not written.
 
     python -m cli.pretranscode footage/*.MP4
 
-Writes ``<stem>__rep<NN>.mkv`` clips plus a ``<stem>.pretranscode.json`` manifest
+Writes one clip per replicate **into that replicate's home** --
+``<stem>_rep01/<stem>.mkv`` -- plus a ``<stem>.pretranscode.json`` manifest, all
 **beside each video by default**, which is where ``core/shard.find_manifest``
 looks. Move them with ``--out-dir`` and later passes need ``--clip-dir`` to match;
 leave it alone and ``cli.run`` picks them up with no flag at all.
+
+The home is the directory that already holds that replicate's track, marks and
+tuning (``core/replicate_home.py``), so the cut adds a file to a directory that
+exists rather than introducing a layout of its own. ``--layout flat`` restores
+the old ``<stem>__rep<NN>.mkv`` naming; manifests written either way still read,
+so nothing already cut needs re-cutting. **Note that ``--out-dir`` moves the
+homes too** -- clips land in ``<out-dir>/<stem>_rep01/`` and no longer sit
+alongside that replicate's other artefacts.
 
 Boxes come from each video's ``.rois.json`` sidecar. A video with no sidecar is a
 failure, not a skip -- there is no sensible default framing.
@@ -48,9 +57,10 @@ import sys
 import time
 
 from core.batch import BatchError, default_replicate_path, load_replicates
-from core.pretranscode import (DEFAULT_QUALITY, QUALITY_PRESETS,
+from core.pretranscode import (CLIP_LAYOUTS, DEFAULT_CLIP_LAYOUT,
+                               DEFAULT_QUALITY, QUALITY_PRESETS,
                                PretranscodeError, build_pretranscode,
-                               manifest_path_for, read_manifest,
+                               clip_path, manifest_path_for, read_manifest,
                                verify_manifest)
 from core.shard import expand_videos
 
@@ -68,6 +78,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--replicates",
                    help="replicate box JSON. Applies to ONE video only -- see the "
                         "error text if you pass it with several.")
+    p.add_argument("--layout", default=DEFAULT_CLIP_LAYOUT,
+                   choices=sorted(CLIP_LAYOUTS),
+                   help=f"where each clip is written (default: "
+                        f"{DEFAULT_CLIP_LAYOUT}). 'home' puts it in the "
+                        "replicate's own directory beside its track and marks; "
+                        "'flat' is the pre-Batch-S naming. Moves bytes, not "
+                        "pixels -- a clip cut either way is the same clip.")
     p.add_argument("--quality", default=DEFAULT_QUALITY,
                    choices=sorted(QUALITY_PRESETS),
                    help=f"storage/fidelity preset (default: {DEFAULT_QUALITY}). "
@@ -106,6 +123,29 @@ def _clip_bytes(man) -> int:
     twice -- and a stat loop that skips what it cannot find would understate the
     total instead of failing."""
     return sum(int(c.size_bytes or 0) for c in man.clips)
+
+
+def _clip_paths(man, out_dir: str) -> dict[str, str]:
+    """Comparison key -> path as written, for every clip a manifest names."""
+    return {os.path.normcase(os.path.abspath(clip_path(out_dir, c.filename))):
+            clip_path(out_dir, c.filename) for c in man.clips}
+
+
+def _superseded(prev, man, out_dir: str) -> list[str]:
+    """Clips the PREVIOUS cut wrote that this one did not replace.
+
+    Only ``--layout`` produces these, and it produces them silently: a re-cut
+    from flat to home writes new files and leaves the old ones on disk, so a
+    corpus quietly costs twice the storage the report just quoted. They are
+    named rather than deleted -- ffmpeg's ``-y`` overwrote everything this cut
+    actually claims, and a CLI that removes video files it was not asked about
+    is a worse trade than a line of output.
+    """
+    if prev is None:
+        return []
+    current = _clip_paths(man, out_dir)
+    return sorted(p for key, p in _clip_paths(prev, out_dir).items()
+                  if key not in current and os.path.exists(p))
 
 
 def _existing_state(video: str, out_dir: str,
@@ -202,9 +242,16 @@ def main(argv: list[str] | None = None) -> int:
                     f"clips exist but cannot be trusted -- {detail}. Pass "
                     "--overwrite to re-cut them.")
 
+            # Read before the cut replaces it: the only record of where the
+            # previous cut put its clips is the manifest about to be rewritten.
+            try:
+                prev = read_manifest(manifest_path_for(path, out_dir))
+            except (PretranscodeError, OSError, ValueError):
+                prev = None
+
             man = build_pretranscode(
                 path, reps, out_dir, quality=args.quality,
-                overwrite=args.overwrite,
+                clip_layout=args.layout, overwrite=args.overwrite,
                 progress=None if args.quiet else _progress_printer(name))
         except KeyboardInterrupt:
             # build_pretranscode removes partial clips on the way out; a
@@ -232,6 +279,13 @@ def main(argv: list[str] | None = None) -> int:
                   f"grey-level RMS) -> "
                   f"{os.path.basename(manifest_path_for(path, out_dir))}",
                   file=sys.stderr)
+            old = _superseded(prev, man, out_dir)
+            if old:
+                print(f"  note: {len(old)} clip(s) from the previous cut are no "
+                      f"longer referenced and still occupy disk; delete them by "
+                      f"hand:", file=sys.stderr)
+                for p in old:
+                    print(f"    {p}", file=sys.stderr)
 
     if failures:
         print(f"\n{len(failures)} video(s) could not be cut:", file=sys.stderr)
