@@ -1,26 +1,41 @@
-"""Precompute the structure-tensor temporal channels a feature cache does not
-store, so an explorer can read them like any other per-block time series.
+"""Compute the structure-tensor per-block channels straight from the video.
 
-The flow pipeline caches motion (u, v, speed) and optionally texture, but not the
-temporal-change family the tool-3 explorer needs:
+This is the extraction pass the whole detection path is built on. Every channel
+below is derived from one decode + tensor pass over a bare video -- there is no
+precomputed store to read from, and nothing here writes one:
 
     intensity   mean block intensity            -> amplitude variance (windowed)
     change      <I_t^2> per block               -> fast change energy (J_tt)
     appearance  <r^2>, r = I_t + grad(I).v      -> change no motion explains
-    texture     spatial min-eigen               -> read from cache if present
-    tensor_speed Lucas-Kanade speed from J       -> independent flow-speed read
+    texture     spatial min-eigen               -> spatial structure strength
+    tensor_speed Lucas-Kanade speed from J       -> flow speed from the tensor
+    u, v        the same solve's signed parts   -> base fields for core.channels
 
-``appearance`` uses the flow ALREADY in the cache (block flow, upsampled), not a
-fresh solve, so the residual is measured against exactly the motion the pipeline
-committed to -- the same "no second flow implementation to mistrust" contract the
-other explorers keep.
+``appearance`` measures its residual against THE TENSOR'S OWN flow
+(``flow_from_tensor``), so it needs the flow solve and is the most expensive
+channel here -- ~24% of a pass. There is still only one flow implementation to
+trust, which was the point when the residual was measured against a cached field
+instead.
+
+**Channel selection is a real cost lever.** ``plan_channel_stream`` resolves
+which tensor components and which downstream stages each requested channel
+actually needs, so asking for ``intensity`` alone does not pay for the solve.
+See ``_COMPONENTS`` and ``_NEEDS_FLOW``.
 
 Preprocessing replays downsampling, grayscale conversion, temporal denoising and
 contrast normalization. Denoising is exactly reproducible because extraction
 streams the same frames in the same order. Registration, background subtraction
-and within-replicate masks need reference/model assets that the cache does not
-retain, so those steps are omitted and the returned metadata flags the channels
-as approximated when any of them were configured.
+and within-replicate masks need fitted reference/model assets that cannot be
+reconstructed from the frames, so those steps are omitted and the returned
+metadata flags the channels as approximated when any of them were configured.
+
+Historical note: this module used to take ``cached_uv`` / ``cached_texture``, the
+seam where the retired flow cache handed in its own block flow and texture so the
+pass could skip work. Both were removed once the cache went and nothing supplied
+them; if a future store ever wants to short-circuit the solve again, note that
+the parameter was threaded through THREE signatures and gated ``need_flow``,
+``need_texture`` and ``comps`` -- reintroduce it as one explicit object, not as
+two optional arrays.
 """
 from __future__ import annotations
 
@@ -55,7 +70,8 @@ CHANNEL_VERSION = 4     # bump when the extraction math changes (sidecar key)
 #                 kept as (px/s) vectors rather than collapsed to a magnitude --
 #                 the base fields the velocity-gradient derived channels read.
 #   appearance    needs the residual, and the flow to form it -- the tensor's own
-#                 (so: the solve) unless cached block flow was supplied.
+#                 (so: the solve). Measured at ~24% of a pass, which is why it
+#                 is the one channel that drops the live surface behind playback.
 #
 # So the detection default, ``change``, skips the solve, the residual and the
 # min-eigen entirely.
@@ -267,15 +283,11 @@ class ChannelPlan:
 
 def plan_channel_stream(meta: dict, *, start: int = 0, n: int | None = None,
                         want: frozenset | None = None,
-                        cached_uv: tuple[np.ndarray, np.ndarray] | None = None,
-                        cached_texture: np.ndarray | None = None,
                         denoise: str | None = None) -> ChannelPlan:
     """Resolve geometry, window and per-channel gating for a pass.
 
     Cheap and decode-free, so a caller can build the plan, size a buffer from it
-    and only then start the (expensive) stream. ``cached_uv`` and
-    ``cached_texture`` are inspected for presence only -- they change what work
-    is needed, and are passed again to the stream itself, which reads them.
+    and only then start the (expensive) stream.
     """
     fps = float(meta["fps"])
     block = int(meta["block_size"])
@@ -308,24 +320,16 @@ def plan_channel_stream(meta: dict, *, start: int = 0, n: int | None = None,
         # cheap no-op: it costs a full pass and returns frames with no channels
         # in them, which a ring buffer cannot even be constructed to hold.
         raise ValueError(f"no channels requested; pick from {sorted(CHANNELS)}")
-    # What the selection actually buys, resolved once. ``appearance`` needs the
-    # flow solve only when no cached block flow was handed in to form the
-    # residual against; with cached_uv it rides the supplied field.
-    #
-    # Read _NEEDS_FLOW rather than restating its members here, so adding a
-    # flow-dependent channel to the table above is enough to make it work.
-    # ``appearance`` is the one exception the table cannot express: it needs the
-    # solve only to form its own flow, so a supplied cached field excuses it.
-    need_flow = bool((want & _NEEDS_FLOW) -
-                     ({"appearance"} if cached_uv is not None else set()))
-    need_texture = "texture" in want and cached_texture is None
+    # What the selection actually buys, resolved once. Read _NEEDS_FLOW rather
+    # than restating its members here, so adding a flow-dependent channel to the
+    # table above is enough to make it work. ``appearance`` is in that set
+    # because it forms its residual against the tensor's OWN flow, so it pays for
+    # the solve like any other flow channel.
+    need_flow = bool(want & _NEEDS_FLOW)
+    need_texture = "texture" in want
 
     # The components actually consumed, so the products and the blur can skip the
-    # rest. Note what is NOT here: ``appearance`` against a supplied ``cached_uv``
-    # reads no tensor component at all -- it forms its own spatial gradient and
-    # rides the cached field -- so the cache-backed path now builds no tensor for
-    # it. Against the tensor's own flow it needs the solve, and so all six, which
-    # ``need_flow`` already covers.
+    # rest.
     comps: set[int] = set()
     if "change" in want:
         comps |= _COMPONENTS["change"]
@@ -337,9 +341,9 @@ def plan_channel_stream(meta: dict, *, start: int = 0, n: int | None = None,
         fps=fps, block=block, ny=ny, nx=nx, scale=scale, start=start, n=n,
         want=want, approximated=approximated, tiles=tuple(tiles),
         pre_cfg=pre_cfg, comps=frozenset(comps),
-        # Derived from ``comps`` rather than from ``want``: the two disagree
-        # exactly in the appearance-with-cached-flow case above, and ``comps`` is
-        # the one that reflects the work.
+        # Derived from ``comps`` rather than from ``want``: ``comps`` is the one
+        # that reflects the work, so a channel that needs no tensor component
+        # cannot accidentally force the products and the blur.
         need_tensor=bool(comps),
         need_flow=need_flow, need_texture=need_texture,
         # Appearance is gated separately from the tensor for the same reason.
@@ -348,8 +352,6 @@ def plan_channel_stream(meta: dict, *, start: int = 0, n: int | None = None,
 
 def stream_channel_planes(video_path: str, plan: ChannelPlan, *,
                           sigma: float = 2.0,
-                          cached_uv: tuple[np.ndarray, np.ndarray] | None = None,
-                          cached_texture: np.ndarray | None = None,
                           clip_paths: list[str] | None = None, progress=None):
     """Yield ``(absolute_index, {channel: (ny, nx)})`` as each frame is measured.
 
@@ -467,9 +469,6 @@ def stream_channel_planes(video_path: str, plan: ChannelPlan, *,
                     if "intensity" in want:
                         planes["intensity"][ay0:ay1, ax0:ax1] = \
                             _reduce(g, block, th, tw, tm)
-                    if "texture" in want and cached_texture is not None:
-                        planes["texture"][ay0:ay1, ax0:ax1] = \
-                            cached_texture[i, ay0:ay1, ax0:ax1]
                     if gp is not None and (need_tensor or need_appearance):
                         # Form and spatially smooth the tensor components this
                         # selection reads, at a small scale, solve LK per pixel,
@@ -508,21 +507,13 @@ def stream_channel_planes(video_path: str, plan: ChannelPlan, *,
                         if "change" in want:
                             planes["change"][ay0:ay1, ax0:ax1] = \
                                 _reduce(J[2], block, th, tw, tm)
-                        # Appearance residual r = I_t + grad(I).v. Against cached
-                        # block flow (px/s -> px/frame, upsampled) when given, else
-                        # against the tensor's own per-pixel flow (already px/frame).
+                        # Appearance residual r = I_t + grad(I).v, measured against
+                        # the tensor's own per-pixel flow (already px/frame). One
+                        # flow implementation, so the residual and ``tensor_speed``
+                        # can never disagree about what motion was assumed.
                         if "appearance" in want:
                             with tm.span("appearance"):
-                                if cached_uv is not None:
-                                    U, V = cached_uv
-                                    ub = cv2.resize(U[i, ay0:ay1, ax0:ax1] / fps,
-                                                    (g.shape[1], g.shape[0]),
-                                                    interpolation=cv2.INTER_NEAREST)
-                                    vb = cv2.resize(V[i, ay0:ay1, ax0:ax1] / fps,
-                                                    (g.shape[1], g.shape[0]),
-                                                    interpolation=cv2.INTER_NEAREST)
-                                else:
-                                    ub, vb = uv[..., 0], uv[..., 1]
+                                ub, vb = uv[..., 0], uv[..., 1]
                                 iy, ix = np.gradient(g)
                                 r = (g - gp) + ix * ub + iy * vb
                             planes["appearance"][ay0:ay1, ax0:ax1] = \
@@ -593,8 +584,6 @@ def stream_channel_planes(video_path: str, plan: ChannelPlan, *,
 
 def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
                      start: int = 0, n: int | None = None,
-                     cached_uv: tuple[np.ndarray, np.ndarray] | None = None,
-                     cached_texture: np.ndarray | None = None,
                      clip_paths: list[str] | None = None,
                      want: frozenset | None = None,
                      denoise: str | None = None, progress=None) -> dict:
@@ -604,14 +593,9 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
     channel. Everything about *how* a frame is measured lives there; this is the
     consumer that waits for all of them.
 
-    Geometry comes from ``meta`` (the same shape a feature cache carries); the
-    video is streamed directly, so this needs no cache -- it is the seam that lets
-    the tensor/scalogram path run on a bare video.
+    Geometry comes from ``meta``; the video is streamed directly, which is what
+    lets the tensor/scalogram path run on a bare video.
 
-    ``cached_uv`` is the pipeline's block flow (u, v) in px/s, indexed by absolute
-    frame, used for the appearance residual; pass ``None`` to measure the residual
-    against the tensor's OWN per-pixel flow instead (px/frame, no cache needed).
-    ``cached_texture`` is read straight through when present, else computed.
     ``denoise`` overrides the config's temporal-denoise mode (the live/windowed
     path forces it off, since denoise is stateful from frame zero and cannot be
     reproduced starting mid-clip).
@@ -639,13 +623,10 @@ def _stream_channels(video_path: str, meta: dict, *, sigma: float = 2.0,
     ``meta`` describing how they were built.
     """
     plan = plan_channel_stream(meta, start=start, n=n, want=want,
-                               cached_uv=cached_uv,
-                               cached_texture=cached_texture, denoise=denoise)
+                               denoise=denoise)
     out = {k: np.zeros((plan.n if k in plan.want else 0, plan.ny, plan.nx),
                        np.float32) for k in CHANNELS}
     planes = stream_channel_planes(video_path, plan, sigma=sigma,
-                                   cached_uv=cached_uv,
-                                   cached_texture=cached_texture,
                                    clip_paths=clip_paths, progress=progress)
     # Driven by hand rather than with a ``for``, because the pass metadata is the
     # generator's RETURN value and a ``for`` loop discards it.
@@ -702,7 +683,6 @@ def extract_channels_live(video_path: str, meta: dict, *, start: int = 0,
     channels come back as zero-LENGTH placeholders (never zero-filled ones);
     read ``meta['channels_computed']``. See ``_stream_channels``."""
     return _stream_channels(video_path, meta, sigma=sigma, start=start, n=n,
-                            cached_uv=None, cached_texture=None,
                             clip_paths=clip_paths, want=channels, denoise="off",
                             progress=progress)
 
