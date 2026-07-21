@@ -1,18 +1,24 @@
-"""A pluggable channel-testing lab, decoupled from core.detection.
+"""Offline scoring harness for the derived-channel registry.
 
-Two layers so candidate channels are cheap to add and cheap to run:
+The registry itself now lives in ``core.channels`` (``Channel``, ``@channel``,
+``REGISTRY``, and the ``morlet_band`` / ``butter_band_energy`` filters) so
+production and this lab share ONE definition of a channel. What stays here is the
+part that is only about scoring candidates against a labelled corpus:
 
-  * BASE FIELDS -- the expensive, shared per-block time series a decode+flow pass
-    produces (intensity, change, appearance, tensor_speed). Extracted once and
-    cached to .npy by extract_base_fields.py; a channel never re-decodes.
-  * CHANNEL -- a registered pure function (fields, meta) -> (T, B). The temporal
-    filter is PART of the channel, not assumed to be Morlet, so a butter+filtfilt
-    band-energy channel or a Welch feature is a first-class channel, not a special
-    case. A channel declares which base fields it needs; the store loads only those.
+  * BASE FIELDS -- the expensive shared per-block time series a decode+flow pass
+    produces (intensity, change, appearance, tensor_speed, and the signed flow
+    u/v). Extracted once and cached to ``.npy`` by ``extract_base_fields.py``; a
+    channel never re-decodes. ``FieldStore`` memmaps them and serves them in the
+    ``(T, ny, nx)`` shape ``core.channels`` expects.
+  * The harness applies the SAME reductions (a mean control + tail statistics)
+    and the SAME span-level AUC to every registered channel, so a candidate is
+    scored on equal footing. Adding a channel is one function + ``@channel(...)``,
+    exactly as in production.
 
-The harness applies the SAME reductions (a mean control + tail statistics) and the
-SAME span-level AUC to every registered channel, so a candidate is scored on equal
-footing. Adding a channel is one function + @channel(...).
+A channel returns ``(T, ny, nx)``; the reductions want the per-block distribution,
+so the harness flattens to ``(T, B)`` before reducing -- which is why a spatial
+channel (the velocity gradient) and a per-block one (a band energy) are both
+scorable here.
 
 AUC = P[a random flying sample outranks a random not-flying sample]; 0.5 chance.
 Span-level (mean score per flying bout vs per still bout) is the honest number
@@ -22,28 +28,27 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
-from scipy.ndimage import uniform_filter1d
-from scipy.signal import butter, filtfilt
 from scipy.stats import rankdata
 
+# Re-exported so ``run_lab`` and other seed scripts keep importing the channel
+# interface from here, even though it is defined in core now.
+from core.channels import (REGISTRY, Channel, butter_band_energy,  # noqa: F401
+                           channel, evaluate, morlet_band, reset_registry)
 from core.detection import largest_clump_per_frame, windowed_mean
-from core.wavelet import band_indices, default_freqs, morlet_band_power
 
 # ------------------------------------------------------------------ base fields
-BASE_FIELDS = ("intensity", "change", "appearance", "tensor_speed")
+BASE_FIELDS = ("intensity", "change", "appearance", "tensor_speed", "u", "v")
 
 
 class FieldStore:
-    """Lazy per-block base fields (T, B) + geometry, from a t31_extract cache dir.
+    """Lazy per-block base fields (T, ny, nx) + geometry, from a t31_extract cache.
 
-    Fields are memmapped and materialized on first use, then held; a whole-clip
-    field is ~1.6 GB, so a caller sweeping many channels over a few base fields
-    pays the read once. ``block_grid`` is the (ny, nx, gy, gx) a clump statistic
-    needs, derived from the cached meta."""
+    Fields are materialized on first use, then held; a whole-clip field is ~1.6 GB,
+    so a caller sweeping many channels over a few base fields pays the read once.
+    Served as ``(T, ny, nx)`` -- the shape ``core.channels`` channels take -- with
+    ``block_grid`` giving the ``(ny, nx, gy, gx)`` a clump statistic needs."""
 
     def __init__(self, cache_dir: str):
         self.dir = cache_dir
@@ -54,11 +59,12 @@ class FieldStore:
         self._cache: dict[str, np.ndarray] = {}
 
     def field(self, name: str) -> np.ndarray:
-        """(T, B) per-block time series for one base field."""
+        """(T, ny, nx) per-block time series for one base field."""
         if name not in self._cache:
             arr = np.load(os.path.join(self.dir, f"chan_{name}.npy"),
                           mmap_mode="r")
-            self._cache[name] = np.asarray(arr).reshape(arr.shape[0], -1)
+            self._cache[name] = np.asarray(arr).reshape(arr.shape[0],
+                                                        self.ny, self.nx)
         return self._cache[name]
 
     @property
@@ -66,69 +72,16 @@ class FieldStore:
         gy, gx = np.mgrid[0:self.ny, 0:self.nx]
         return self.ny, self.nx, gy.ravel(), gx.ravel()
 
+    def compute(self, name: str) -> np.ndarray:
+        """Evaluate a registered channel to a flat ``(T, B)`` field for reduction.
 
-# --------------------------------------------------------------------- registry
-@dataclass(frozen=True)
-class Channel:
-    name: str
-    needs: tuple[str, ...]
-    fn: Callable[[dict, dict], np.ndarray]   # (fields, meta) -> (T, B)
-
-    def compute(self, store: FieldStore) -> np.ndarray:
-        fields = {k: store.field(k) for k in self.needs}
-        out = self.fn(fields, store.meta)
-        return np.asarray(out, np.float32)
-
-
-REGISTRY: dict[str, Channel] = {}
-
-
-def channel(name: str, needs: tuple[str, ...]):
-    """Decorator: register a candidate channel. ``needs`` names its base fields."""
-    def deco(fn):
-        REGISTRY[name] = Channel(name=name, needs=tuple(needs), fn=fn)
-        return fn
-    return deco
-
-
-def reset_registry():
-    REGISTRY.clear()
-
-
-# ----------------------------------------------------------- temporal filters
-# Reusable building blocks a channel body calls. Each maps a per-block (T, B)
-# field to another (T, B) field; the choice of filter is what a channel IS.
-
-def morlet_band(field: np.ndarray, fps: float, band: tuple[float, float]
-                ) -> np.ndarray:
-    """Morlet scalogram power summed over [lo, hi] Hz, per block per frame."""
-    freqs = default_freqs(fps)
-    i, j = band_indices(freqs, band[0], band[1])
-    return morlet_band_power(np.asarray(field, np.float32), fps, freqs, i, j)
-
-
-def butter_band_energy(field: np.ndarray, fps: float, band: tuple[float, float],
-                       order: int = 4, smooth_frames: int = 4,
-                       col_chunk: int = 2048) -> np.ndarray:
-    """Zero-phase Butterworth band-pass energy, per block per frame.
-
-    The butter analogue of ``morlet_band``: filtfilt the block's time series in
-    [lo, hi] Hz (zero phase, so no group-delay smear across a flight onset),
-    square, then smooth over ``smooth_frames`` to get instantaneous band power on
-    the same footing as the wavelet's. Chunked over block columns because
-    ``filtfilt`` upcasts to float64 internally (a whole (T, B) at once is ~3 GB)."""
-    nyq = 0.5 * fps
-    lo, hi = band[0] / nyq, min(band[1] / nyq, 0.999)
-    b, a = butter(order, [lo, hi], btype="band")
-    x = np.asarray(field, np.float32)
-    T, B = x.shape
-    out = np.empty((T, B), np.float32)
-    for c0 in range(0, B, col_chunk):
-        c1 = min(B, c0 + col_chunk)
-        seg = filtfilt(b, a, x[:, c0:c1], axis=0)
-        e = (seg * seg).astype(np.float32)
-        out[:, c0:c1] = uniform_filter1d(e, smooth_frames, axis=0, mode="nearest")
-    return out
+        The channel produces ``(T, ny, nx)`` (``core.channels`` contract); the
+        reductions below want the per-block distribution, so it is flattened here.
+        Only the channel's declared base fields are read."""
+        ch = REGISTRY[name]
+        fields = {k: self.field(k) for k in ch.needs}
+        out = ch.compute(fields, self.meta)
+        return np.asarray(out, np.float32).reshape(out.shape[0], -1)
 
 
 # ------------------------------------------------------------------ reductions
@@ -227,8 +180,7 @@ def validate(store: FieldStore, marks_path: str, *, guard_s=0.15,
 
     rows, best_series = [], {}
     for name in names:
-        ch = REGISTRY[name]
-        field = ch.compute(store)
+        field = store.compute(name)
         reds = _reductions(field, store)
         best = None
         for st, series in reds.items():

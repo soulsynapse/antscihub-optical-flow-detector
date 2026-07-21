@@ -280,6 +280,37 @@ class LiveStreamWorkerTest(unittest.TestCase):
         self.assertEqual(last["frontier"], N_FRAMES)
         self.assertEqual(last["first"] + last["band_power"].shape[0], N_FRAMES)
 
+    def test_a_derived_channel_is_built_from_buffered_base_fields(self):
+        # Detecting on the velocity gradient: the pass streams u, v (its base
+        # fields, requested because the channel was selected) and the worker
+        # derives vel_shear from the buffered window before the transform, rather
+        # than requiring it to be a streamed channel. Without the derive path this
+        # request would be silently dropped (vel_shear is never in the buffer).
+        plan = plan_channel_stream(self.meta, start=0, n=N_FRAMES,
+                                   want=frozenset({"change", "u", "v"}))
+        w = LiveStreamWorker(self.video, plan, capacity=N_FRAMES + 8)
+        w.request_detect(N_FRAMES, "vel_shear", self.meta, 0,
+                         default_freqs(float(self.meta["fps"])), (0.5, 8.0),
+                         token="d")
+        seen = self._run_worker(w)
+        self.assertTrue(seen["detected"], "derived-channel detect was dropped")
+        msg = seen["detected"][-1]
+        self.assertEqual(msg["band_power"].ndim, 2)
+        ny, nx = (int(v) for v in self.meta["grid"])
+        self.assertEqual(msg["band_power"].shape[1], ny * nx)
+        self.assertEqual(msg["token"], "d")
+
+    def test_a_derived_channel_without_its_base_fields_is_dropped(self):
+        # The base fields were NOT streamed (a plain change pass), so vel_shear
+        # cannot be built -- dropped like any unavailable channel, never raising.
+        plan = self._plan(start=0, n=N_FRAMES)          # want = intensity, change
+        w = LiveStreamWorker(self.video, plan, capacity=64)
+        w.request_detect(16, "vel_shear", self.meta, 0,
+                         default_freqs(float(self.meta["fps"])), (0.5, 8.0))
+        seen = self._run_worker(w)
+        self.assertEqual(seen["detected"], [])
+        self.assertIsNone(seen["failed"])
+
     def test_an_unknown_channel_is_dropped_rather_than_raising(self):
         plan = self._plan(start=0, n=N_FRAMES)
         w = LiveStreamWorker(self.video, plan, capacity=64)

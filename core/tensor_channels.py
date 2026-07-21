@@ -39,8 +39,9 @@ from core.timing import Timer
 from core.video import (ClipAtlasSource, ReplicateVideoSource, VideoSource,
                         prefetch)
 
-CHANNELS = ("intensity", "change", "appearance", "texture", "tensor_speed")
-CHANNEL_VERSION = 3     # bump when the extraction math changes (sidecar key)
+CHANNELS = ("intensity", "change", "appearance", "texture", "tensor_speed",
+            "u", "v")
+CHANNEL_VERSION = 4     # bump when the extraction math changes (sidecar key)
 
 # What each channel costs beyond the frame itself, which is what makes selecting
 # one worth doing (FINDINGS.md section 1: tensor_products is ~7% of a pass, the
@@ -50,13 +51,17 @@ CHANNEL_VERSION = 3     # bump when the extraction math changes (sidecar key)
 #   change        J[2] -- needs the products and the spatial blur, nothing more.
 #   texture       min-eigen of J. Needs the blur, not the flow solve.
 #   tensor_speed  needs flow_from_tensor on top of the blur.
+#   u, v          the flow's signed components, same solve as tensor_speed but
+#                 kept as (px/s) vectors rather than collapsed to a magnitude --
+#                 the base fields the velocity-gradient derived channels read.
 #   appearance    needs the residual, and the flow to form it -- the tensor's own
 #                 (so: the solve) unless cached block flow was supplied.
 #
 # So the detection default, ``change``, skips the solve, the residual and the
 # min-eigen entirely.
-_NEEDS_TENSOR = frozenset({"change", "appearance", "texture", "tensor_speed"})
-_NEEDS_FLOW = frozenset({"tensor_speed", "appearance"})
+_NEEDS_TENSOR = frozenset({"change", "appearance", "texture", "tensor_speed",
+                           "u", "v"})
+_NEEDS_FLOW = frozenset({"tensor_speed", "appearance", "u", "v"})
 
 # Which of the six tensor components each read actually consumes, in COMPONENTS
 # order (xx, yy, tt, xy, xt, yt). Forming and blurring all six regardless was
@@ -489,6 +494,17 @@ def stream_channel_planes(video_path: str, plan: ChannelPlan, *,
                             speed = np.hypot(uv[..., 0], uv[..., 1]) * fps
                             planes["tensor_speed"][ay0:ay1, ax0:ax1] = \
                                 _reduce(speed, block, th, tw, tm)
+                        # Signed flow components in px/s (the same *fps scaling as
+                        # tensor_speed), block-reduced. These are the base fields
+                        # the velocity-gradient derived channels take spatial
+                        # gradients of; kept as vectors rather than a magnitude so
+                        # divergence/shear/vorticity are recoverable.
+                        if "u" in want:
+                            planes["u"][ay0:ay1, ax0:ax1] = \
+                                _reduce(uv[..., 0] * fps, block, th, tw, tm)
+                        if "v" in want:
+                            planes["v"][ay0:ay1, ax0:ax1] = \
+                                _reduce(uv[..., 1] * fps, block, th, tw, tm)
                         if "change" in want:
                             planes["change"][ay0:ay1, ax0:ax1] = \
                                 _reduce(J[2], block, th, tw, tm)

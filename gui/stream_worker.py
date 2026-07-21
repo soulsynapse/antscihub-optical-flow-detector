@@ -296,9 +296,23 @@ class LiveStreamWorker(StreamWorker):
         if req is None:
             return
         n, channel, meta, region_index, freqs, band, token = req
-        if channel not in buf.channels:
-            return
-        planes, first = buf.latest(n, channel)
+        if channel in buf.channels:
+            planes, first = buf.latest(n, channel)
+        else:
+            # A DERIVED channel (the velocity gradient) is not streamed into the
+            # buffer; build it here from the base fields the pass DID stream (u,
+            # v), which are present because _channels_wanted requested them when
+            # this channel was selected. Same window, so latest() returns each
+            # base aligned to the same first index.
+            from core.channels import REGISTRY, evaluate, needs_for
+            base = sorted(needs_for({channel}))
+            if channel not in REGISTRY or not base or \
+                    any(b not in buf.channels for b in base):
+                return
+            fields, first = {}, None
+            for b in base:
+                fields[b], first = buf.latest(n, b)
+            planes = evaluate(fields, meta, [channel])[channel]
         if planes.shape[0] < 2:
             # One frame is not a time series. Transforming it would return a
             # padding response and the accumulator would record it as examined.

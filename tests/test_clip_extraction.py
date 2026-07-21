@@ -101,6 +101,14 @@ class ClipExtractionTest(unittest.TestCase):
         Normalized because the channels carry wildly different units --
         ``tensor_speed`` is px/s and ``change`` is squared grey levels -- so a
         raw RMS would compare nothing meaningful across them.
+
+        The signed flow components ``u``/``v`` are normalized by the flow
+        MAGNITUDE scale rather than their own max. A component that is ~0
+        everywhere (``v`` on a horizontally-moving fixture) has a degenerate
+        self-scale, and dividing a tiny decode difference by it manufactures a
+        large relative error that reflects the fixture's geometry, not a
+        divergence of the two decode routes. The physical question -- how big is
+        the disagreement next to the motion being measured -- uses ``tensor_speed``.
         """
         cfg = PipelineConfig()
         live = live_channel_source(self.video, cfg, REPS, start=start, n=n)
@@ -109,10 +117,13 @@ class ClipExtractionTest(unittest.TestCase):
                                     manifest=man, clip_dir=d)
         self.assertEqual(live.n_frames, clips.n_frames)
         self.assertEqual(set(live.channels), set(clips.channels))
+        speed_scale = max(float(np.abs(live.channels["tensor_speed"]).max()),
+                          1e-12)
         out = {}
         for name, a in live.channels.items():
             b = clips.channels[name]
-            scale = max(float(np.abs(a).max()), 1e-12)
+            scale = (speed_scale if name in ("u", "v")
+                     else max(float(np.abs(a).max()), 1e-12))
             out[name] = float(np.sqrt(np.mean((b - a) ** 2)) / scale)
         return out
 

@@ -78,7 +78,20 @@ CHANNELS = {
     "appearance energy": ("appearance", cv2.COLORMAP_TURBO),
     "tensor speed": ("tensor_speed", cv2.COLORMAP_TURBO),
     "intensity": ("intensity", cv2.COLORMAP_TURBO),
+    # Velocity-gradient family (core.channels), derived from the block flow u,v.
+    # ``vel_shear`` is a nonnegative deformation energy -- a detection channel on
+    # the same log-axis + tail-band footing as the others. ``vel_divergence`` and
+    # ``vel_vorticity`` are SIGNED (see _SIGNED_ATTRS): linear axis, no detection
+    # band -- diagnostic overlays, per the detection-channel design (a signed
+    # quantity has no heavy nonnegative tail to threshold).
+    "shear strain rate": ("vel_shear", cv2.COLORMAP_TURBO),
+    "divergence (signed)": ("vel_divergence", cv2.COLORMAP_TWILIGHT_SHIFTED),
+    "vorticity (signed)": ("vel_vorticity", cv2.COLORMAP_TWILIGHT_SHIFTED),
 }
+
+# Channels whose values are signed: a linear value axis and no tail-threshold
+# band. Everything else is a nonnegative energy (log1p axis, draggable band).
+_SIGNED_ATTRS = frozenset({"vel_divergence", "vel_vorticity"})
 
 # Warm scalogram ramp (0 -> plot bg, up to hot white), distinct from the cyan
 # density ramp so the two heatmaps never read as the same instrument.
@@ -1256,7 +1269,14 @@ class ScalogramExplorer(QWidget):
             self._sync_channel_check(name)
             grid.addWidget(cb, r, 0, Qt.AlignmentFlag.AlignCenter)
             dp = DensityPlot(name)
-            dp.set_log_axis(True)
+            # Signed channels (divergence/vorticity) get a linear value axis and
+            # no detection band -- log1p is meaningless on negatives and a tail
+            # threshold has no heavy nonnegative tail to bite. They stay viewable
+            # diagnostic overlays; every energy channel keeps log axis + band.
+            signed = CHANNELS[name][0] in _SIGNED_ATTRS
+            dp.set_log_axis(not signed)
+            if signed:
+                dp.set_band_active(False)
             dp.seek_requested.connect(self._seek)
             dp.band_changed.connect(partial(self._on_density_band_changed, name))
             dp.band_committed.connect(

@@ -44,6 +44,10 @@ def main():
         "window_start": int(cd.window_start),
         "truncated": bool(meta.get("truncated", False)),
         "channels": sorted(cd.channels),
+        # Carried so the lab's velocity-gradient channels take their spatial
+        # derivatives per replicate region rather than across an atlas seam
+        # (core.channels._regions reads this).
+        "replicate_tiles": meta.get("replicate_tiles", []),
     }
     with open(os.path.join(OUT, "meta.json"), "w") as f:
         json.dump(side, f, indent=2)

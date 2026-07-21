@@ -33,8 +33,11 @@ from core.video import VideoSource
 
 # Channels a live (cacheless) source provides, in the explorer's UI order. All are
 # video-derived; appearance rides the tensor's own flow. The pipeline's cached
-# flow ``speed`` is added only by the cache-backed source.
-LIVE_CHANNELS = ("change", "appearance", "tensor_speed", "intensity")
+# flow ``speed`` is added only by the cache-backed source. ``u``/``v`` are the
+# signed flow components (px/s) -- extracted primitives, not shown on their own,
+# but the base fields the velocity-gradient DERIVED channels read (see
+# core.channels). They ride the same flow solve as ``tensor_speed``.
+LIVE_CHANNELS = ("change", "appearance", "tensor_speed", "intensity", "u", "v")
 
 
 @dataclass
@@ -59,6 +62,36 @@ class ChannelData:
     @property
     def n_frames(self) -> int:
         return int(self.meta["n_frames"])
+
+
+def with_derived_channels(cd: "ChannelData", names) -> "ChannelData":
+    """Fold registered DERIVED channels into a ChannelData, from base fields it
+    already carries.
+
+    A derived channel (``core.channels`` -- e.g. the velocity-gradient family) is
+    a pure function of the extracted primitives. This evaluates each requested
+    channel whose declared base fields are ALL present and adds the result to
+    ``.channels`` (and ``channels_computed``); a channel whose bases were not
+    computed on this pass is skipped, not fabricated, so ``.available`` keeps
+    meaning "this is real data". Returns the input unchanged when nothing is
+    derivable, so a caller can call it unconditionally.
+
+    ``cd.meta`` must carry the geometry a channel needs (``grid`` and, for the
+    velocity gradient, ``replicate_tiles`` for its per-region derivatives) -- a
+    live or cache ChannelData already does.
+    """
+    from core.channels import evaluate, needs_for
+
+    present = set(cd.channels)
+    want = [n for n in names if needs_for({n}) and needs_for({n}) <= present]
+    if not want:
+        return cd
+    derived = evaluate(cd.channels, cd.meta, want)
+    channels = {**cd.channels, **derived}
+    meta = {**cd.meta, "channels_computed": sorted(channels)}
+    return ChannelData(meta=meta, channels=channels,
+                       window_start=cd.window_start,
+                       approximated=cd.approximated)
 
 
 def cache_channel_source(cache, sidecar_path: str | None = None,
