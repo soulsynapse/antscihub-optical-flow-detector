@@ -19,8 +19,12 @@ it. Unbounded band endpoints are ``null``.
     }
 
 Boxes come from the video's ``.rois.json`` sidecar unless ``--replicates`` names
-one. Pass ``--manifest`` to decode pre-transcoded ROI clips (Batch I) instead of
-the source -- same math, roughly 25x less decode.
+one. Pre-transcoded ROI clips are picked up automatically from the video's
+``.pretranscode.json`` manifest -- same math, roughly 25x less decode -- unless
+``--no-clips`` says not to. ``--manifest`` is only for a manifest that is not
+beside the video. A manifest that exists but no longer verifies (moved boxes, a
+changed source, a truncated clip) is a hard error, not a quiet fallback to the
+source: below ``lossless`` those are not the same pixels.
 
 Exit codes are meant to be read by a job runner: **0** success, **1** the job
 could not be trusted (bad params, moved boxes, short decode), **2** bad usage.
@@ -36,7 +40,8 @@ import time
 from core.batch import (BatchError, config_from_overrides,
                         default_replicate_path, load_params, load_replicates,
                         run_video, write_result)
-from core.pretranscode import PretranscodeError, read_manifest
+from core.pretranscode import PretranscodeError
+from core.source_route import resolve_source
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -54,10 +59,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--replicates-only", metavar="IDS",
                    help="comma-separated replicate ids to detect over "
                         "(default: all). Ids, not positions.")
-    p.add_argument("--manifest", help="pre-transcode manifest; decode ROI clips "
-                                      "instead of the source")
-    p.add_argument("--clip-dir", help="directory holding the manifest's clips "
-                                      "(default: the manifest's own directory)")
+    p.add_argument("--manifest", help="pre-transcode manifest naming the ROI "
+                   "clips to decode. Only needed when the manifest is not "
+                   "beside the video (or in --clip-dir), where it is found "
+                   "automatically.")
+    p.add_argument("--clip-dir", help="directory holding the manifest and its "
+                   "clips (default: beside the video)")
+    p.add_argument("--no-clips", action="store_true",
+                   help="ignore any pre-transcode manifest and decode the "
+                        "source. Not the same pixels below lossless.")
     p.add_argument("--start", type=int, default=0, help="first frame")
     p.add_argument("--frames", type=int, help="frame count (default: to the end)")
     p.add_argument("--downsample", type=float,
@@ -117,11 +127,22 @@ def main(argv: list[str] | None = None) -> int:
                 raise BatchError(f"--replicates-only wants integer ids, got "
                                  f"{args.replicates_only!r}")
 
-        manifest = clip_dir = None
-        if args.manifest:
-            manifest = read_manifest(args.manifest)
-            clip_dir = args.clip_dir or os.path.dirname(
-                os.path.abspath(args.manifest))
+        # Contradictory rather than merely redundant: --no-clips would win
+        # silently, and the operator who typed both would get a full-source
+        # decode having asked by name for a specific manifest.
+        if args.no_clips and (args.manifest or args.clip_dir):
+            raise BatchError("--no-clips contradicts --manifest/--clip-dir: "
+                             "pass one or the other")
+        # Explicit when --manifest names one, discovered otherwise: a video whose
+        # clips are sitting in their replicate homes (Batch S slice 4) no longer
+        # needs to be pointed at them. Either way the route is derived now and
+        # verified now -- a named manifest that does not describe this video, or
+        # a stale one, raises rather than quietly costing 25x the decode.
+        route = resolve_source(args.video, replicates, clip_dir=args.clip_dir,
+                               allow_clips=not args.no_clips,
+                               manifest_path=args.manifest)
+        if not args.quiet and route.reason and (args.clip_dir or args.manifest):
+            print(f"warning: {route.reason}", file=sys.stderr)
 
         out = args.out or os.path.join(
             args.out_dir,
@@ -129,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
 
         res = run_video(args.video, replicates, cfg, params,
-                        regions=only, manifest=manifest, clip_dir=clip_dir,
+                        regions=only, **route.extract_kwargs,
                         start=args.start, n=args.frames,
                         allow_truncated=args.allow_truncated,
                         replicate_path=rep_path,
@@ -150,10 +171,15 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet:
         total = sum(r.n_detected_frames for r in res.regions)
         fps = res.covered_frames / res.extract_seconds if res.extract_seconds else 0
+        # The route is named on every run, not only when it is unusual: which
+        # pixels a number came from is part of the number below lossless
+        # (FINDINGS.md section 10), and a summary that mentions it only
+        # sometimes is one an operator learns to stop reading.
         print(f"{os.path.basename(args.video)}: {len(res.regions)} region(s), "
               f"{total} detected frame(s) over {res.covered_frames} examined "
               f"({res.extract_seconds:.1f}s extract at {fps:.1f} fps, "
-              f"{res.detect_seconds:.1f}s detect) -> {out}", file=sys.stderr)
+              f"{res.detect_seconds:.1f}s detect) from {route.describe()} "
+              f"-> {out}", file=sys.stderr)
         for w in res.warnings:
             print(f"warning: {w}", file=sys.stderr)
     return 0

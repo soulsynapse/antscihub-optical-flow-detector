@@ -265,8 +265,14 @@ def load_sidecar(video_path: str) -> FrameCountRecord | None:
     return rec
 
 
-def _manifest_describes(manifest, video_path: str) -> bool:
+def manifest_describes(manifest, video_path: str) -> bool:
     """Whether ``manifest`` was cut from the bytes currently at ``video_path``.
+
+    Public because :mod:`core.source_route` asks the same question one tier up,
+    when deciding whether a *discovered* manifest is this video's at all. The
+    two must not drift into disagreeing about which manifest belongs to which
+    file, so there is one implementation and it lives here, where the stricter
+    consumer (a frame count used as a coverage denominator) already needed it.
 
     Path equality is not enough, and matching only on it would make the
     best-trusted source the least-checked one. A source re-exported or
@@ -317,7 +323,7 @@ def resolve_frame_count(video_path: str, container_frames: int, *,
     different questions. It is simply not used when something better exists.
     """
     container = max(0, int(container_frames))
-    if manifest is not None and _manifest_describes(manifest, video_path):
+    if manifest is not None and manifest_describes(manifest, video_path):
         n = int(getattr(manifest, "frame_count", 0) or 0)
         if n > 0:
             return ResolvedCount(count=n, verified=True, source=SOURCE_MANIFEST,

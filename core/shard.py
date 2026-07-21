@@ -45,8 +45,8 @@ from dataclasses import dataclass, field
 from core.batch import (BatchError, default_replicate_path, load_replicates,
                         params_to_json, run_video, write_result)
 from core.config import PipelineConfig
-from core.pretranscode import (PretranscodeError, manifest_path_for,
-                               read_manifest)
+from core.pretranscode import PretranscodeError
+from core.source_route import resolve_source
 
 VIDEO_SUFFIXES = (".mp4", ".mov", ".avi", ".mkv", ".m4v", ".mpg", ".mpeg")
 
@@ -281,21 +281,6 @@ def _stem_with_parents(video_path: str, depth: int) -> str:
     return "_".join(keep + [output_stem(video_path)])
 
 
-def find_manifest(video_path: str, clip_dir: str | None) -> str | None:
-    """A Batch I manifest for this video, if one is there to be found.
-
-    A manifest belongs to exactly one source, so a shard cannot take a single
-    ``--manifest`` the way ``cli/detect.py`` does; it discovers one per video by
-    the naming convention ``build_pretranscode`` writes.
-    """
-    for d in ([clip_dir] if clip_dir else []) + [os.path.dirname(
-            os.path.abspath(video_path))]:
-        cand = manifest_path_for(video_path, d)
-        if os.path.exists(cand):
-            return cand
-    return None
-
-
 # -- resume ------------------------------------------------------------------
 
 def _resolved_settings(cfg: PipelineConfig) -> tuple[float, int]:
@@ -508,25 +493,24 @@ def run_shard(videos: list[str], cfg: PipelineConfig, params: dict, *,
                     f".rois.json sidecar next to {video}")
             replicates = load_replicates(rep_path)
 
-            manifest = man_dir = None
-            if use_clips:
-                mp = find_manifest(video, clip_dir)
-                if mp:
-                    manifest = read_manifest(mp)
-                    man_dir = clip_dir or os.path.dirname(os.path.abspath(mp))
-                    used_clips = True
-                elif clip_dir:
-                    # Asked for clips by naming a clip dir and got none. Silence
-                    # here means paying ~25x the decode AND crossing a
-                    # provenance boundary (FINDINGS.md section 10) invisibly, so
-                    # the fallback is recorded rather than merely happening.
-                    job_warnings.append(
-                        f"no pre-transcode manifest found for this video in "
-                        f"{clip_dir} or beside it; decoded the SOURCE instead "
-                        f"of ROI clips (slower, and not the same pixels)")
+            # Derived here, per video, per run -- never read from a recorded
+            # pointer. A stale manifest raises out of this call and fails THIS
+            # video (JOB_ERRORS below), which is the point: the shard-mates keep
+            # running, and the operator gets told to re-cut rather than getting
+            # a silent full-decode run over pixels they thought were cut away.
+            route = resolve_source(video, replicates, clip_dir=clip_dir,
+                                   allow_clips=use_clips)
+            used_clips = route.uses_clips
+            # Recorded rather than merely happening: falling back means paying
+            # ~25x the decode AND crossing a provenance boundary (FINDINGS.md
+            # section 10) invisibly. Only warned about when clips were plainly
+            # wanted -- a run that never had a clip directory does not need a
+            # warning per video saying so.
+            if route.reason and clip_dir and use_clips:
+                job_warnings.append(route.reason)
 
             res = run_video(video, replicates, cfg, params, regions=regions,
-                            manifest=manifest, clip_dir=man_dir,
+                            **route.extract_kwargs,
                             start=start, n=frames,
                             allow_truncated=allow_truncated,
                             replicate_path=rep_path)

@@ -87,6 +87,61 @@ class _SurfaceTestCase(_QtTestCase):
         return surface
 
 
+class SourceRouteTests(_SurfaceTestCase):
+    """Which pixels a pass reads is an OPT-IN claim the user makes (Batch S
+    slice 5), because below lossless a clip and a live crop are not the same
+    pixels -- so it is never decided for them by what happens to be on disk."""
+
+    def test_the_clips_control_is_off_and_disabled_without_a_cut(self):
+        surface = self._surface()
+        self.assertFalse(surface.clips_chk.isChecked())
+        self.assertFalse(surface.clips_chk.isEnabled())
+
+    def test_the_default_route_is_the_source(self):
+        surface = self._surface()
+        route = surface._route()
+        self.assertFalse(route.uses_clips)
+        self.assertEqual(route.extract_kwargs,
+                         {"manifest": None, "clip_dir": None})
+
+    def test_a_stale_manifest_REFUSES_the_pass_rather_than_using_the_source(self):
+        """The checkbox is a claim about which pixels this session's numbers came
+        from. Quietly answering it with the other set is the provenance failure
+        the opt-in exists to make visible, so the pass does not start."""
+        from core.pretranscode import PretranscodeError
+        surface = self._surface()
+        surface.clips_chk.setEnabled(True)
+        surface.clips_chk.setChecked(True)
+        del surface.start_stream                 # exercise the real launcher
+        with patch("core.source_route.resolve_source",
+                   side_effect=PretranscodeError("boxes moved")):
+            self.assertIsNone(surface._route())
+            surface.start_stream()
+        # No pass, and the refusal names the reason and the way out.
+        self.assertIsNone(surface._stream_worker)
+        self.assertIn("boxes moved", surface.status_lbl.text())
+        # It stays TICKED. Unticking for them would silently answer the claim
+        # with the other pixel set, which is the thing being refused.
+        self.assertTrue(surface.clips_chk.isChecked())
+
+    def test_toggling_the_source_restarts_a_running_pass(self):
+        """The frames already in the ring were measured from the other source;
+        below lossless that makes them different measurements, not older ones."""
+        surface = self._surface()
+        surface.restart_stream = MagicMock()
+        surface._stream_worker = MagicMock()
+        surface.clips_chk.setEnabled(True)
+        surface.clips_chk.setChecked(True)
+        surface.restart_stream.assert_called_once()
+        surface._stream_worker = None
+
+    def test_toggling_with_nothing_running_only_states_what_is_next(self):
+        surface = self._surface()
+        surface.clips_chk.setEnabled(True)
+        surface.clips_chk.setChecked(True)
+        self.assertIn("clips", surface.status_lbl.text())
+
+
 class TypedKnobCommitTests(_SurfaceTestCase):
     """Typing into a knob must not fire a pass per keystroke, and pressing Enter
     must hand focus back: while a spin box's line edit holds focus it eats the
@@ -652,9 +707,17 @@ class CostSampleTests(_SurfaceTestCase):
     """
 
     @staticmethod
-    def _row(scale, block, wall, frames=100, spans=None, truncated=False):
+    def _row(scale, block, wall, frames=100, spans=None, truncated=False,
+             source_kind="source", channels=()):
         return ScalePass(scale=scale, block=block, grid=(4, 4), frames=frames,
-                         wall=wall, spans=spans or {}, truncated=truncated)
+                         wall=wall, spans=spans or {}, truncated=truncated,
+                         source_kind=source_kind, channels=tuple(channels))
+
+    @staticmethod
+    def _key(scale, block, source_kind="source", channels=()):
+        """The sample key: scale and block, then the two regime axes that are
+        properties of the pass rather than of the caller's intent."""
+        return (scale, block, source_kind, tuple(channels))
 
     def _record(self, surface, scale, block, wall, regime=..., **kw):
         """One sweep row at a stated regime. ``regime`` defaults to "tracked"
@@ -666,7 +729,8 @@ class CostSampleTests(_SurfaceTestCase):
         surface = self._surface()
         self._record(surface, 1.0, 64, 4.0)
         self._record(surface, 0.5, 32, 2.0)
-        self.assertEqual(set(surface._cost_samples), {(1.0, 64), (0.5, 32)})
+        self.assertEqual(set(surface._cost_samples),
+                         {self._key(1.0, 64), self._key(0.5, 32)})
 
     def test_a_pass_with_no_measured_wall_is_not_a_sample(self):
         # A zero-cost point drags the fitted decode floor toward zero, which is
@@ -692,7 +756,7 @@ class CostSampleTests(_SurfaceTestCase):
         self._record(surface, 1.0, 32, 4.0, regime=32)
         self._record(surface, 1.0, 32, 4.1, regime=32)
         self._record(surface, 0.5, 16, 2.0, regime=16)
-        self.assertEqual(surface._last_cost_key, (0.5, 16))
+        self.assertEqual(surface._last_cost_key, self._key(0.5, 16))
         # Both are pinned, but to DIFFERENT blocks, so they are two regimes of
         # one sample each and neither can be fitted.
         model, _block = surface._cost_model()
@@ -722,7 +786,7 @@ class CostSampleTests(_SurfaceTestCase):
         self._record(surface, 1.0, 1, 8.0, regime=1)
         self._record(surface, 0.5, 1, 3.0, regime=1)
         self._record(surface, 0.25, 64, 1.5, regime=64)   # newest, alone
-        self.assertEqual(surface._last_cost_key, (0.25, 64))
+        self.assertEqual(surface._last_cost_key, self._key(0.25, 64))
         model, block = surface._cost_model()
         self.assertFalse(model.provisional)
         self.assertEqual(model.n_samples, 2)
@@ -952,9 +1016,15 @@ class SweepTests(_SurfaceTestCase):
         self.assertEqual(dlg.add_sweep_row.call_count, 2)
         rows = [c.args[0] for c in dlg.add_sweep_row.call_args_list]
         self.assertEqual([r.scale for r in rows], [1.0, 0.5])
-        # Each row is also a sample, keyed at the block a production run uses.
-        self.assertEqual(set(surface._cost_samples), {(1.0, 64), (0.5, 32)})
-        self.assertTrue(all(b > 1 for _s, b in surface._cost_samples))
+        # Each row is also a sample, keyed at the block a production run uses --
+        # and by the two regime axes, so a later sweep over clips or a different
+        # channel set lands beside these rather than overwriting them.
+        self.assertEqual({(s, b) for s, b, _k, _c in surface._cost_samples},
+                         {(1.0, 64), (0.5, 32)})
+        self.assertTrue(all(b > 1 for _s, b, _k, _c in surface._cost_samples))
+        # A GUI sweep decodes the source, and records that it did.
+        self.assertEqual({k for _s, _b, k, _c in surface._cost_samples},
+                         {"source"})
 
     def test_the_sweep_needs_no_tuned_detector_or_selected_replicate(self):
         """Dropping the detector is what makes this true: the sweep only times

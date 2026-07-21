@@ -484,6 +484,25 @@ class RunShardTest(unittest.TestCase):
                             "source fallback was not recorded")
         self.assertIn("used_clips", rep.to_summary()["videos"][0])
 
+    def test_a_stale_manifest_fails_only_its_own_video(self):
+        """Batch S slice 5: a manifest that no longer verifies raises rather
+        than falling back to the source. Inside a shard that must isolate to the
+        one video -- the shard-mates keep running, and the operator is told to
+        re-cut instead of getting a silent full-decode run over pixels they
+        thought were cut away."""
+        from core.pretranscode import PretranscodeError
+
+        def route(video, *a, **k):
+            if os.path.basename(video) == "b.mp4":
+                raise PretranscodeError("replicate geometry has changed")
+            from core.source_route import SOURCE, SourceRoute
+            return SourceRoute(video_path=video, kind=SOURCE)
+
+        with unittest.mock.patch("core.shard.resolve_source", route):
+            rep = self._run(lambda *a, **k: _FakeResult())
+        self.assertEqual([len(rep.ok), len(rep.failed)], [2, 1])
+        self.assertIn("geometry has changed", rep.failed[0].error)
+
     def test_no_clip_dir_means_no_fallback_warning(self):
         """Not asking for clips is not a fallback, so it must not warn."""
         rep = self._run(lambda *a, **k: _FakeResult())

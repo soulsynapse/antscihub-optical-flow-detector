@@ -15,7 +15,7 @@ from core.config import FlowConfig
 from core.replicates import build_layout
 from core.cost_model import (CostModel, PassSample, atlas_cells, boxes_from_tiles,
                              format_bytes, format_duration, grid_cells,
-                             storage_bytes_per_hour,
+                             mixing_error, storage_bytes_per_hour,
                              working_px_per_body_length)
 
 
@@ -120,6 +120,60 @@ def test_fit_never_returns_negative_coefficients():
     m = CostModel.fit(noisy)
     assert m.fixed_s >= 0 and m.per_pixel_s >= 0
     assert m.knee_scale() is None or 0 < m.knee_scale() <= 1.0
+
+
+# -- what may not share a fit (Batch S slice 5) ------------------------------
+def test_a_fit_refuses_to_mix_source_and_clip_passes():
+    """fixed_s IS the decode floor, and cutting ROI clips moves it ~25x. A fit
+    over both reads that step as scale, which moves the knee toward
+    'downsampling is free' -- the one direction this model must never err in."""
+    before = PassSample(scale=1.0, frames=100, wall=4.0)
+    after = PassSample(scale=0.5, frames=100, wall=1.0, source_kind="clips:abc")
+    with pytest.raises(ValueError, match="different sources"):
+        CostModel.fit([before, after])
+
+
+def test_a_fit_refuses_to_mix_channel_sets():
+    """A change-only pass measured 1.59x faster than the full four."""
+    one = PassSample(scale=1.0, frames=100, wall=4.0, channels=("change",))
+    four = PassSample(scale=0.5, frames=100, wall=3.0,
+                      channels=("appearance", "change"))
+    with pytest.raises(ValueError, match="channel sets"):
+        CostModel.fit([one, four])
+
+
+def test_two_clip_cuts_at_different_quality_do_not_share_a_fit():
+    """The token is the manifest's provenance_key, not a bare 'clips': below
+    lossless they are different pixels and a different floor."""
+    assert mixing_error([PassSample(scale=1.0, frames=1, wall=1.0,
+                                    source_kind="clips:aaa"),
+                         PassSample(scale=0.5, frames=1, wall=1.0,
+                                    source_kind="clips:bbb")])
+
+
+def test_an_unrecorded_channel_set_mixes_with_anything():
+    """Empty means UNRECORDED, not 'no channels'. Refusing on absence would
+    reject every sample built before the field existed, turning a provenance
+    improvement into a regression for archived and hand-built samples."""
+    assert mixing_error([PassSample(scale=1.0, frames=100, wall=4.0),
+                         PassSample(scale=0.5, frames=100, wall=2.0,
+                                    channels=("change",))]) is None
+
+
+def test_samples_agreeing_on_both_axes_still_fit():
+    m = CostModel.fit([
+        PassSample(scale=1.0, frames=100, wall=4.0, source_kind="clips:aaa",
+                   channels=("change",)),
+        PassSample(scale=0.5, frames=100, wall=1.75, source_kind="clips:aaa",
+                   channels=("change",))])
+    assert not m.provisional
+    assert m.n_samples == 2
+
+
+def test_the_default_source_kind_is_a_fact_not_a_guess():
+    """Every pass timed before routing existed decoded the source, so the
+    default lets archived samples keep fitting together."""
+    assert PassSample(scale=1.0, frames=1, wall=1.0).source_kind == "source"
 
 
 def test_from_spans_prices_untimed_remainder_as_per_pixel():

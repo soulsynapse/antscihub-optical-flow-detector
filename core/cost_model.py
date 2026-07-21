@@ -91,15 +91,79 @@ class PassSample:
 
     ``spans`` is a ``Timer.totals`` dict. ``wall`` is preferred over the span sum
     when present, because spans overlap and un-timed work exists between them.
+
+    ``source_kind`` and ``channels`` are the two axes besides scale that this
+    pass's wall time depends on, and neither is recoverable from the number
+    alone. They are here so :meth:`CostModel.fit` can REFUSE to mix rather than
+    silently reading a difference in either as a difference in scale -- which
+    biases ``fixed_s``, and therefore the knee ``s* = sqrt(F/M)``, in whichever
+    direction the contamination happens to point.
+
+    * ``source_kind`` -- ``core.source_route.SourceRoute.sample_kind``. Cutting
+      ROI clips moves the decode floor ~25x (``FINDINGS.md`` section 10), and
+      ``fixed_s`` *is* that floor, so a sweep taken before a cut and one taken
+      after are measurements of two different machines. The default is
+      ``"source"`` because every pass timed before routing existed was one.
+    * ``channels`` -- a change-only pass measured 1.59x faster than the full
+      four (section 11), so a fit mixing the two inflates ``F`` and moves the
+      knee toward "downsampling is free" -- the one direction section 6 says
+      this model must never err in. Empty means unrecorded, and an unrecorded
+      sample mixes with anything, since refusing on absence would reject every
+      sample written before the field existed.
     """
     scale: float
     frames: int
     wall: float
     spans: dict[str, float] = field(default_factory=dict)
+    source_kind: str = "source"
+    channels: tuple[str, ...] = ()
 
     @property
     def seconds_per_frame(self) -> float:
         return self.wall / self.frames if self.frames > 0 else 0.0
+
+    @property
+    def regime(self) -> tuple[str, tuple[str, ...]]:
+        """What this sample may be fitted alongside. Equal regimes may mix."""
+        return (self.source_kind, tuple(self.channels))
+
+
+def mixing_error(samples: list[PassSample]) -> str | None:
+    """Why these samples cannot share one fit, or ``None`` if they can.
+
+    Two passes belong in the same fit only if the ONLY thing that differs
+    between them is the scale. Everything else the model sees becomes scale:
+    the regression has one explanatory variable, so any other cost difference is
+    absorbed into ``fixed_s`` and ``per_pixel_s`` with nothing saying it was.
+
+    The two axes checked here are the two that are recorded and known to matter
+    at the scale of the effect being fitted -- ~25x on the decode floor for the
+    source kind, 1.59x overall for the channel set. Block regime is a third and
+    is deliberately NOT checked here: it is not on ``PassSample`` (it is the
+    caller's *intent*, not a property of the pass -- a pinned block and a tracked
+    one coincide at some scale for any pinned value), so the GUI partitions on it
+    before calling. This function is the half that can be decided from the data.
+
+    An EMPTY ``channels`` mixes with anything. It means unrecorded, not
+    "no channels", and refusing on absence would reject every sample built
+    before the field existed -- turning a provenance improvement into a
+    regression for hand-built and archived samples. ``source_kind`` has no such
+    escape because its default is a claim that was true for every pass ever
+    taken before routing existed, not an absence.
+    """
+    kinds = {s.source_kind for s in samples}
+    if len(kinds) > 1:
+        return ("cost samples come from different sources "
+                f"({', '.join(sorted(kinds))}) and cannot share one fit: "
+                "pre-transcoded clips move the decode floor ~25x, and the "
+                "decode floor is the coefficient being fitted")
+    chans = {tuple(s.channels) for s in samples if s.channels}
+    if len(chans) > 1:
+        shown = "; ".join("+".join(c) for c in sorted(chans))
+        return (f"cost samples computed different channel sets ({shown}) and "
+                "cannot share one fit: channel selection is a cost lever of its "
+                "own (~1.59x), and the fit would read it as scale")
+    return None
 
 
 @dataclass(frozen=True)
@@ -148,8 +212,19 @@ class CostModel:
         off how wall time actually moved with scale. Falls back to
         :meth:`from_spans` when the samples do not span two distinct scales,
         since the fit is then underdetermined.
+
+        **Raises** on samples that must not be fitted together -- see
+        :func:`mixing_error`. A raise rather than a silent drop-the-minority,
+        because there is no way to know which subset the caller meant, and
+        answering with the wrong one is precisely the authoritative-looking wrong
+        number this module is built to refuse. Callers holding samples from more
+        than one regime should partition first (``gui`` does, by block intent as
+        well) and fit each.
         """
         usable = [s for s in samples if s.frames > 0 and s.scale > 0]
+        bad = mixing_error(usable)
+        if bad:
+            raise ValueError(bad)
         scales = {round(s.scale, 6) for s in usable}
         if len(usable) < 2 or len(scales) < 2:
             if not usable:

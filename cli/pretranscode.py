@@ -9,7 +9,7 @@ path could be read but not written.
 
 Writes one clip per replicate **into that replicate's home** --
 ``<stem>_rep01/<stem>.mkv`` -- plus a ``<stem>.pretranscode.json`` manifest, all
-**beside each video by default**, which is where ``core/shard.find_manifest``
+**beside each video by default**, which is where ``core/source_route.find_manifest_path``
 looks. Move them with ``--out-dir`` and later passes need ``--clip-dir`` to match;
 leave it alone and ``cli.run`` picks them up with no flag at all.
 

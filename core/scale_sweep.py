@@ -72,6 +72,12 @@ class ScalePass:
     # mixing a four-channel sample with a one-channel one reads the difference as
     # scale, which is how a cost model acquires a bias nobody put there.
     channels: tuple[str, ...] = ()
+    # Which pixels the pass read -- ``SourceRoute.sample_kind``. Recorded for a
+    # sharper version of the same reason ``channels`` is: pre-transcoded clips
+    # move the decode floor ~25x, and the decode floor is literally the
+    # coefficient the fit reports. A sweep taken before a cut and one taken after
+    # are not comparable, and nothing else in a row would say so.
+    source_kind: str = "source"
 
     @property
     def seconds_per_frame(self) -> float:
@@ -96,16 +102,26 @@ class ScalePass:
 
     def pass_sample(self) -> PassSample:
         return PassSample(scale=self.scale, frames=self.frames, wall=self.wall,
-                          spans=dict(self.spans))
+                          spans=dict(self.spans),
+                          source_kind=self.source_kind,
+                          channels=tuple(self.channels))
 
 
 def measure_scale(video_path: str, cfg, replicates: list[dict], *, dims,
-                  start: int, n: int, channels=None, progress=None) -> ScalePass:
+                  start: int, n: int, channels=None, route=None,
+                  progress=None) -> ScalePass:
     """Extract ``[start, start+n)`` at ``cfg``'s scale and time it.
 
     The block is whatever ``cfg`` resolves it to, which for the ``auto`` default
     tracks the scale. No detector runs: this measures cost, and cost is all it
     claims to measure.
+
+    ``route`` is a :class:`core.source_route.SourceRoute` and must be the SAME
+    route the run being priced will take. Passing ``None`` prices a source
+    decode, which is what every sweep did before routing existed. Timing a
+    clip-backed pass and reporting it as a source pass would be the worse
+    failure than not offering the option at all: ``fixed_s`` would come back ~25x
+    low with nothing in the row saying which pixels produced it.
 
     ``channels`` must be the SAME channel selection the run being priced will
     use -- pass the detection channel when modelling a whole-video commit, which
@@ -116,9 +132,10 @@ def measure_scale(video_path: str, cfg, replicates: list[dict], *, dims,
     one direction ``FINDINGS.md`` section 6 says this model must never err in.
     """
     w, h, fps, fc = dims
+    extract = route.extract_kwargs if route is not None else {}
     cd = live_channel_source(video_path, cfg, replicates, start=start, n=n,
                              width=w, height=h, fps=fps, frame_count=fc,
-                             channels=channels, progress=progress)
+                             channels=channels, progress=progress, **extract)
     t = (cd.meta.get("timing") or {})
     ny, nx = cd.meta["grid"]
     scale = cfg.preprocess.resolve_downsample(w)
@@ -137,7 +154,8 @@ def measure_scale(video_path: str, cfg, replicates: list[dict], *, dims,
         spans=dict(t.get("spans") or {}),
         approximated=bool(cd.approximated),
         truncated=bool(cd.meta.get("truncated", False)),
-        channels=tuple(cd.meta.get("channels_computed") or ()))
+        channels=tuple(cd.meta.get("channels_computed") or ()),
+        source_kind=(route.sample_kind if route is not None else "source"))
 
 
 def storage_curve(replicates: list[dict], src_width: int, src_height: int,

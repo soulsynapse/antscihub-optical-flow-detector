@@ -269,10 +269,14 @@ class _PreviewWorker(_StreamWorker):
     """
 
     def __init__(self, video_path, cfg, replicates, dims, start, n, channels,
-                 focus, parent=None):
+                 focus, route=None, parent=None):
         super().__init__(parent)
         self._args = (video_path, cfg, replicates, dims, int(start), int(n),
                       list(channels))
+        # Resolved on the GUI thread before the worker starts, so a stale
+        # manifest is reported by the control that asked for it rather than
+        # surfacing as a background worker failure with no obvious cause.
+        self._route = route
         # The clicked absolute frame, carried back so the done handler lands the
         # cursor exactly where the user clicked rather than at a window edge.
         self.focus = int(focus)
@@ -282,7 +286,8 @@ class _PreviewWorker(_StreamWorker):
         w, h, fps, fc = dims
         cd = live_channel_source(
             video_path, cfg, reps, start=start, n=n, width=w, height=h,
-            fps=fps, frame_count=fc, channels=channels, progress=self._tick)
+            fps=fps, frame_count=fc, channels=channels, progress=self._tick,
+            **(self._route.extract_kwargs if self._route is not None else {}))
         self.done.emit(cd)
 
 
@@ -317,9 +322,14 @@ class _ProcessWorker(_StreamWorker):
     segment_done = pyqtSignal(object, int, int, int, int)
 
     def __init__(self, video_path, cfg, replicates, dims, region_index, params,
-                 segments, coi: int = 0, parent=None):
+                 segments, coi: int = 0, route=None, parent=None):
         super().__init__(parent)
         self._args = (video_path, cfg, replicates, dims, region_index, params)
+        # See _PreviewWorker: resolved before the thread starts, so the pixels a
+        # committed track was measured from are decided by the control the user
+        # ticked and not by whatever the filesystem holds when the worker gets
+        # around to looking.
+        self._route = route
         self._segments = list(segments)
         self._coi = max(0, int(coi))
         # ``(covered, requested)`` when a decode ended early, else None. Read by
@@ -397,8 +407,8 @@ class _ProcessWorker(_StreamWorker):
                        else [attr])
             cd = live_channel_source(
                 video_path, cfg, reps, start=start, n=n, width=w, height=h,
-                fps=fps, frame_count=fc, channels=extract,
-                progress=tick)
+                fps=fps, frame_count=fc, channels=extract, progress=tick,
+                **(self._route.extract_kwargs if self._route is not None else {}))
             if attr in _DERIVED_CHANNELS:
                 cd = with_derived_channels(cd, [attr])
             got = int(cd.n_frames)
@@ -460,9 +470,13 @@ class _SweepWorker(_StreamWorker):
     scale_started = pyqtSignal(float, int, int)     # (scale, index, total)
 
     def __init__(self, video_path, cfg, replicates, dims, start, n, scales,
-                 parent=None):
+                 route=None, parent=None):
         super().__init__(parent)
         self._args = (video_path, cfg, replicates, dims, start, n, list(scales))
+        # The route these rows are timed over, and the one they are LABELLED
+        # with: clips move the decode floor ~25x, and the decode floor is the
+        # coefficient the fit reports. See core/cost_model.mixing_error.
+        self._route = route
 
     def _run(self):
         video_path, cfg, reps, dims, start, n, scales = self._args
@@ -476,7 +490,8 @@ class _SweepWorker(_StreamWorker):
                                                     downsample=float(s)))
             try:
                 sp = measure_scale(video_path, cfg_s, reps, dims=dims,
-                                   start=start, n=n, progress=self._tick)
+                                   start=start, n=n, route=self._route,
+                                   progress=self._tick)
             except _Cancelled:
                 raise
             except Exception as e:
@@ -565,19 +580,25 @@ class LiveScalogramSurface(QWidget):
         self._preview_key: tuple[int, int, int] | None = None
 
         # Timed passes, feeding the downsample dialog's cost model. Keyed by
-        # (scale, block) because the two are not interchangeable costs: a pass at
-        # block=1 does no reduction at all, so mixing those samples with
-        # block-reduced ones into one fit would regress across two variables and
-        # attribute both to the scale.
-        self._cost_samples: dict[tuple[float, int], PassSample] = {}
+        # (scale, block, source kind, channels) because none of those are
+        # interchangeable costs: a pass at block=1 does no reduction at all,
+        # clips move the decode floor ~25x, and the channel set is worth 1.59x.
+        # Mixing any of them into one fit would regress across several variables
+        # and attribute all of them to the scale.
+        #
+        # The last two are in the KEY and not only in the grouping so that
+        # re-sweeping the same scales after cutting clips ADDS a regime rather
+        # than overwriting the old one entry by entry -- which would leave the
+        # source regime with too few scales to fit and nothing saying why.
+        self._cost_samples: dict[tuple, PassSample] = {}
         # The regime each sample was taken in, keyed the same way: None when the
         # block tracked the scale, the pinned working block otherwise. Recorded
         # from the config that ran rather than inferred by comparing the block to
         # what tracking would have produced -- those coincide at some scale for
         # any pinned block (64 at scale 1.0, 32 at 0.5), and inferring would then
         # file that one pass in the wrong regime and drop it from the fit.
-        self._sample_regime: dict[tuple[float, int], int | None] = {}
-        self._last_cost_key: tuple[float, int] | None = None
+        self._sample_regime: dict[tuple, int | None] = {}
+        self._last_cost_key: tuple | None = None
         # The downsample dialog's empirical sweep, while one is running. Held on
         # the surface rather than in the dialog because it owns the decoder and
         # must not overlap the live pass or the whole-video commit.
@@ -870,6 +891,36 @@ class LiveScalogramSurface(QWidget):
         self.all_chan_chk.toggled.connect(self._on_all_channels_toggled)
         row.addWidget(self.all_chan_chk)
 
+        # Read the pre-transcoded per-replicate clips instead of the source.
+        # OPT-IN, and deliberately not auto-discovered: below ``lossless`` a clip
+        # and a live crop are not the same pixels (FINDINGS.md section 10), so
+        # which one a session's numbers came from is a claim the user makes
+        # rather than one the filesystem makes for them. The label states the
+        # measured end-to-end win honestly -- section 16 priced the 25x decode
+        # saving at 1.06x for a whole pass at scale 1.0, because the pass is
+        # math-bound there; it is worth more the further down the scale you go,
+        # which is exactly where the decode floor starts to dominate.
+        self.clips_chk = QCheckBox("Use ROI clips")
+        self.clips_chk.setToolTip(
+            "Decode each replicate's pre-transcoded clip (its home's .mkv) "
+            "instead of cropping the full source frame.\n\n"
+            "Off (default): the source is decoded whole and cropped, which is "
+            "what every number in this project was measured against.\n"
+            "On: ~25x less decode, but below the lossless quality setting these "
+            "are NOT the same pixels — the change channel is squared frame "
+            "differencing, and lossy inter-frame coding perturbs exactly that.\n\n"
+            "End to end the win is small at scale 1.0 (measured 1.06x, because "
+            "the pass is math-bound there) and grows as you downsample.\n\n"
+            "Greyed out until the clips exist: run the pre-transcode first.")
+        self.clips_chk.toggled.connect(self._on_clips_toggled)
+        row.addWidget(self.clips_chk)
+        # Deliberately NOT persisted into the tuning sidecar alongside the other
+        # knobs on this row. A restored downsample is the same measurement at a
+        # remembered setting; a restored source is a DIFFERENT set of pixels
+        # re-armed silently on a later session. The other knobs answer "how";
+        # this one answers "of what", and that is a claim the user re-makes.
+        self._sync_clip_availability()
+
         row.addWidget(QLabel("Normalize"))
         self.norm_combo = QComboBox()
         self.norm_combo.addItems(["off", "zscore", "clahe"])
@@ -1135,6 +1186,98 @@ class LiveScalogramSurface(QWidget):
                 block_size=None if block == _AUTO_BLOCK else block),
         )
 
+    # -- which pixels a pass reads -------------------------------------------
+    def _sync_clip_availability(self) -> None:
+        """Enable the clips checkbox only when a manifest for this video exists.
+
+        Existence only -- ``resolve_source`` does the trusting, and it does it at
+        the moment a pass starts rather than here. This runs once at construction
+        and is a UI affordance, not a decision: a manifest that is present but
+        stale must still be REPORTED when the user asks for it, and greying the
+        box out on staleness would hide the one thing they need to be told.
+        """
+        from core.source_route import find_manifest_path
+
+        try:
+            found = find_manifest_path(self.video_path, None) is not None
+        except OSError:
+            found = False
+        self.clips_chk.setEnabled(found)
+        if not found:
+            self.clips_chk.setChecked(False)
+
+    def _route(self):
+        """The source route for the next pass, or ``None`` if it cannot be taken.
+
+        **Derived here, every time, and never cached.** A cached route is a
+        recorded pointer by another name, and the whole rule (FINDINGS.md
+        sections 13 and 15) is that a clip's usability is re-established by
+        identity rather than remembered. It costs a head+tail read and a stat per
+        clip, on a surface that already re-decodes the window for the knob edit
+        that got here.
+
+        A stale manifest is REFUSED rather than silently downgraded to the
+        source. The checkbox is a claim about which pixels this session's
+        numbers came from; quietly answering it with the other set is the
+        provenance failure the opt-in exists to make visible. The pass does not
+        start, and the status line says why.
+        """
+        from core.pretranscode import PretranscodeError
+        from core.source_route import resolve_source
+
+        try:
+            return resolve_source(self.video_path, self.replicates,
+                                  allow_clips=self.clips_chk.isChecked())
+        except (PretranscodeError, OSError, ValueError) as e:
+            self.status_lbl.setText(
+                f"ROI clips cannot be used: {e} — untick “Use ROI clips” to "
+                f"decode the source instead.")
+            return None
+
+    def _clip_paths(self, route, meta: dict):
+        """Per-replicate clip paths for the streaming path, or ``None``.
+
+        ``live_channel_source`` resolves these itself from ``manifest`` +
+        ``clip_dir``; the STREAMING path takes the resolved list instead, because
+        ``stream_channel_planes`` is handed a plan rather than a config. So this
+        is the same call ``live_channel_source`` makes internally
+        (``resolve_clip_paths``, which re-verifies), reached from the one seam
+        that cannot go through it.
+
+        ``None`` on a source route (the streaming path's own "no clips" value)
+        and also on a failure, which is reported and refuses the pass -- the
+        caller distinguishes the two by ``route.uses_clips``.
+        """
+        from core.channel_source import resolve_clip_paths
+        from core.pretranscode import PretranscodeError
+        from core.tensor_channels import _tiles_from_meta
+
+        if not route.uses_clips:
+            return None
+        try:
+            return resolve_clip_paths(route.manifest, route.clip_dir,
+                                      self.replicates, _tiles_from_meta(meta))
+        except (PretranscodeError, KeyError, OSError, ValueError) as e:
+            self.status_lbl.setText(
+                f"ROI clips cannot be used: {e} — untick “Use ROI clips” to "
+                f"decode the source instead.")
+            return None
+
+    def _on_clips_toggled(self, on: bool) -> None:
+        """Switching which pixels are read restarts a running pass.
+
+        Same class as the channel and block knobs, and for a stronger reason: the
+        frames already in the ring were measured from the OTHER source, and below
+        lossless that makes them different measurements rather than merely older
+        ones. Letting the two sit in one ring would put a provenance seam in the
+        middle of a continuous plot with nothing marking it.
+        """
+        where = "ROI clips" if on else "the source video"
+        if self._stream_worker is None:
+            self.status_lbl.setText(f"next pass will decode {where}")
+            return
+        self.restart_stream(f"decoding {where} · restarting the pass…")
+
     def _window(self) -> tuple[int, int]:
         start = int(self.start_slider.value())
         n = max(2, int(round(self.len_spin.value() * self.fps)))
@@ -1232,12 +1375,24 @@ class LiveScalogramSurface(QWidget):
         self._stream_timer.stop()
         self._request_stop(self._stream_worker, "live pass")
 
-    def _stream_plan(self, cfg: PipelineConfig, start: int):
+    def _stream_plan(self, cfg: PipelineConfig, start: int, route=None):
         """Geometry, window and ring capacity for a live pass. Decode-free, which
         is the whole reason ``plan_channel_stream`` exists: the ring is sized from
         the SAME object the pass runs on, so the clamp of the window against the
-        clip is computed once rather than once here and once in the worker."""
+        clip is computed once rather than once here and once in the worker.
+
+        On a clip route the RATE comes from the manifest and not from OpenCV.
+        This is the same substitution ``live_channel_source`` makes for the
+        windowed path, and it is load-bearing rather than cosmetic:
+        ``ClipAtlasSource`` seeks by dividing a frame index by this rate, so a
+        rounded 24.0 standing in for 24000/1001 lands progressively earlier --
+        3 frames early by frame 11000 -- yielding a window of the right length
+        from the wrong place, silently (``FINDINGS.md`` section 3 trap 2). The
+        streaming path builds its own meta and so did not inherit the fix.
+        """
         w, h, fps, fc = self._dims
+        if route is not None and route.uses_clips:
+            fps = route.manifest.fps
         meta = synth_live_meta(self.video_path, cfg, self.replicates,
                                width=w, height=h, fps=fps, frame_count=fc)
         # n=None: forward to the end of the clip. A live pass has no window --
@@ -1265,9 +1420,17 @@ class LiveScalogramSurface(QWidget):
         self._block_debounce.stop()
         start = int(self.start_slider.value())
         cfg = self._build_cfg()
-        meta, plan, capacity = self._stream_plan(cfg, start)
+        # The route is resolved BEFORE the plan, because on a clip route it
+        # supplies the frame rate the plan is built on -- see _stream_plan.
+        route = self._route()
+        if route is None:
+            return                          # refused; _route said why
+        meta, plan, capacity = self._stream_plan(cfg, start, route)
         if plan.n < 2:
             self.status_lbl.setText("nothing left to stream from here")
+            return
+        clip_paths = self._clip_paths(route, meta)
+        if route.uses_clips and clip_paths is None:
             return
         # Carry the tuning across the rebuild: a live pass rebuilds the explorer,
         # and without this the bands revert to defaults on every start (T17, and
@@ -1289,7 +1452,7 @@ class LiveScalogramSurface(QWidget):
             f"{capacity / max(self.fps, 1e-6):.0f} s at "
             f"{plan.ny}×{plan.nx} blocks…")
         self._stream_worker = LiveStreamWorker(
-            self.video_path, plan, capacity, parent=self)
+            self.video_path, plan, capacity, clip_paths=clip_paths, parent=self)
         self._stream_worker.advanced.connect(self._on_advanced)
         self._stream_worker.window_ready.connect(self._on_window_ready)
         self._stream_worker.detected.connect(self._on_detected)
@@ -2203,9 +2366,12 @@ class LiveScalogramSurface(QWidget):
         # here is what keeps the bands from reverting to defaults on that rebuild.
         if self._explorer is not None:
             self._pending_state = self._explorer.capture_view_state()
+        route = self._route()
+        if route is None:
+            return                          # refused; _route said why
         self._preview_worker = _PreviewWorker(
             self.video_path, self._build_cfg(), self.replicates, self._dims,
-            start, n, sorted(self._channels_wanted()), focus, self)
+            start, n, sorted(self._channels_wanted()), focus, route, self)
         self._preview_worker.done.connect(self._on_preview_done)
         self._preview_worker.failed.connect(self._on_preview_failed)
         self._preview_worker.finished.connect(self._preview_worker.deleteLater)
@@ -2272,6 +2438,14 @@ class LiveScalogramSurface(QWidget):
         regime with the most distinct scales finds the fit if one exists
         anywhere; ties go to the newest.
 
+        **The regime is three-part**, not just the block: the source kind and the
+        channel set are cost levers of the same order (~25x on the decode floor,
+        1.59x overall) and ``CostModel.fit`` now RAISES on a mix rather than
+        quietly reading either as scale. Grouping here is what keeps that raise
+        unreachable from this path -- samples accumulate across sweeps, and a
+        user who cuts clips or changes the detection channel between two sweeps
+        would otherwise have their dialog stop producing a model at all.
+
         Every sample now comes from the dialog's own sweep (see _on_sweep_row).
         The surface used to contribute one per windowed extract, so the dialog
         often opened with a model already fitted; with the extract retired it
@@ -2286,15 +2460,17 @@ class LiveScalogramSurface(QWidget):
         """
         if not self._cost_samples:
             return None, None
-        groups: dict[int | None, list[PassSample]] = {}
+        groups: dict[tuple, list[PassSample]] = {}
         for key, s in self._cost_samples.items():
-            groups.setdefault(self._sample_regime.get(key), []).append(s)
-        newest = (self._sample_regime.get(self._last_cost_key)
-                  if self._last_cost_key else object())
-        block, samples = max(groups.items(),
-                             key=lambda kv: (len({s.scale for s in kv[1]}),
-                                             kv[0] == newest))
-        return CostModel.fit(samples), block
+            groups.setdefault((self._sample_regime.get(key),) + s.regime,
+                              []).append(s)
+        newest = (((self._sample_regime.get(self._last_cost_key),)
+                   + self._cost_samples[self._last_cost_key].regime)
+                  if self._last_cost_key in self._cost_samples else object())
+        gkey, samples = max(groups.items(),
+                            key=lambda kv: (len({s.scale for s in kv[1]}),
+                                            kv[0] == newest))
+        return CostModel.fit(samples), gkey[0]
 
     def _open_downsample_dialog(self):
         from gui.downsample_dialog import DownsampleDialog
@@ -2494,10 +2670,13 @@ class LiveScalogramSurface(QWidget):
         # Every row of this sweep runs under one block intent, so record it once
         # here rather than re-deriving it per row from the resolved block.
         self._sweep_block_intent = cfg.flow.block_size
+        route = self._route()
+        if route is None:
+            return                          # refused; _route said why
         self._set_busy(_Busy.SWEEP)
         self._sweep_worker = _SweepWorker(
             self.video_path, cfg, self.replicates, self._dims, start, n,
-            scales, self)
+            scales, route, self)
         self._sweep_worker.row.connect(self._on_sweep_row)
         self._sweep_worker.row_failed.connect(self._on_sweep_row_failed)
         self._sweep_worker.scale_started.connect(self._on_sweep_scale)
@@ -2532,8 +2711,9 @@ class LiveScalogramSurface(QWidget):
         # zero-cost point, which would pull the fitted decode floor toward zero
         # and put the knee where downsampling looks free.
         if sp.usable:
-            key = (round(float(sp.scale), 6), int(sp.block))
-            self._cost_samples[key] = sp.pass_sample()
+            sample = sp.pass_sample()
+            key = (round(float(sp.scale), 6), int(sp.block)) + sample.regime
+            self._cost_samples[key] = sample
             self._sample_regime[key] = self._sweep_block_intent
             self._last_cost_key = key
         if self._dlg is not None:
@@ -2713,6 +2893,9 @@ class LiveScalogramSurface(QWidget):
         cfg = self._build_cfg()
         strategy = self._process_settings["strategy"]
         coi = coi_trim(self._track.stamp.freq_band_hz, self.fps)
+        route = self._route()
+        if route is None:
+            return                          # refused; _route said why
         self._set_busy(_Busy.PROCESS)
         self._proc_wrote = self._proc_refused = 0
         flo, fhi = params["freq_band_hz"]
@@ -2725,7 +2908,8 @@ class LiveScalogramSurface(QWidget):
             f" · {self._proc_ctx}…")
         self._proc_worker = _ProcessWorker(
             self.video_path, cfg, self.replicates, self._dims,
-            params["region_index"], params, segments, coi=coi, parent=self)
+            params["region_index"], params, segments, coi=coi, route=route,
+            parent=self)
         self._proc_worker.done.connect(self._on_processed)
         self._proc_worker.segment_done.connect(self._on_segment_done)
         self._proc_worker.failed.connect(self._on_process_failed)

@@ -1998,3 +1998,90 @@ whose data is denser than the failure requires cannot see it, and "covered" and
 "received a frame" are only the same question in that regime. And the reachable
 case is not exotic — any live window shorter than the plot is wide (~600 px),
 which is every window early in a pass.
+
+## 25. Batch S slice 5: routing, and a rate that would have drifted silently
+
+Slice 4 put each replicate's clip inside its home, so a clip stopped being
+something an operator points at and became something that is either there or
+not. `core/source_route.py` is the one place that asks, and `resolve_source`
+is derived **per call, never recorded** — a pointer file is an existence claim
+that outlives the thing it points at, which is §13/§15's rule. The cost is a
+head+tail read and a stat per clip, ~1.4 ms, which is what `verify_manifest`
+was built cheap for.
+
+**Three outcomes, and the interesting boundary is between the last two.**
+
+| situation | route | why |
+|---|---|---|
+| no manifest for this video | source, with `reason` | clips are optional; an uncut corpus must still run |
+| a manifest that is not this video's | source, with `reason` | for *this* video no manifest exists |
+| this video's manifest, not verifying | **raise** | ruled 2026-07-21 |
+
+The middle row is the one that is easy to get wrong. Manifests are named from
+the video's basename, so two sources called `GX010047.MP4` in different session
+directories map to one manifest path under a shared `--clip-dir`.
+`verify_manifest` **cannot** catch it: it validates the manifest against the
+source *the manifest names*, which is present and unchanged, so it passes and
+one session's pixels get attributed to the other's detections. `cli/pretranscode`
+and `core/framecount` had each already discovered this separately; the identity
+check is now one function (`framecount.manifest_describes`, made public) rather
+than three near-copies. A *discovered* manifest that fails it is somebody else's
+file; an **explicitly named** one that fails it is a usage error and raises,
+because naming it asserts it applies.
+
+**The rate substitution the streaming path never inherited — found in review,
+and it is §3 trap 2 arriving by a new road.** `ClipAtlasSource` seeks by
+dividing a frame index by the fps it was given. `live_channel_source` has always
+replaced OpenCV's float with the manifest's *rational* rate before extraction
+for exactly this reason: 24.0 standing in for 24000/1001 lands 3 frames early by
+frame 11000, yielding a window of the right length **from the wrong place**,
+silently. The Batch Q streaming path builds its own meta through
+`synth_live_meta` and so never received that fix — it did not matter while
+nothing streamed from clips, and would have started mattering the moment the new
+checkbox was ticked. The route is therefore resolved *before* the plan, because
+on a clip route it supplies the rate the plan is built on. **A fix applied at one
+of two entry points is not applied**, and the second entry point was written
+after the first and looked self-contained.
+
+**The GUI is opt-in, and the checkbox is not persisted.** Below `lossless` a
+clip and a live crop are not the same pixels (§10), so which set a session's
+numbers came from is a claim the user makes, not one the filesystem makes for
+them. The other knobs on that row *are* persisted, and the distinction is worth
+stating: a restored downsample is the same measurement at a remembered setting,
+while a restored source is a different set of pixels re-armed silently on a
+later session. The other knobs answer *how*; this one answers *of what*.
+
+For the same reason a stale manifest **refuses the pass** in the GUI rather than
+falling back. The tick is a claim; quietly answering it with the other pixel set
+is the exact failure the opt-in exists to make visible.
+
+**The cost model half: `fixed_s` IS the decode floor, and the cut moves it 25x.**
+`PassSample` now carries `source_kind` and `channels`, and `CostModel.fit`
+**raises** on a mix rather than reading either as scale — which biases the knee
+`s* = √(F/M)` toward "downsampling is free", the one direction §6 says this model
+must never err in. Three details:
+
+- The token is `clips:<provenance_key>`, not a bare `"clips"`. Two cuts at
+  different quality are different pixels and a different floor.
+- `channels` was **already recorded** on `ScalePass` for this exact reason (§11,
+  1.59x) and was being dropped on the way to `PassSample`, so the axis the code
+  had identified was silently mixed anyway. Fixing only the axis the plan named
+  would have shipped a guard that refuses one contamination and permits its
+  neighbour.
+- Empty `channels` mixes with anything: it means *unrecorded*, not "no
+  channels". `source_kind` gets no such escape, because its default is a claim
+  that was true of every pass ever timed before routing existed.
+
+**Its own trap, in the GUI.** `_cost_samples` was keyed `(scale, block)`. Once
+two source kinds exist, re-sweeping the same scales after cutting clips would
+*overwrite* the source samples entry by entry, leaving that regime with too few
+scales to fit and nothing saying why. The regime axes had to go into the KEY,
+not only into the grouping.
+
+**Locality, eighth firing.** The spec named two things — `resolve_source(video)`
+and `core/cost_model.py:89`. It took nine files: the new module, `framecount`
+(one identity check to share), `shard`, both CLIs, `cost_model`, `scale_sweep`,
+`stream_worker`'s caller and the surface. The tell generalizes from §24's: the
+spec named a function to ADD and a field to ADD, and adding a field to a value
+object is never local — every producer of that object and every consumer that
+groups by it moves with it.

@@ -154,6 +154,7 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 22. Batch P streaming generator | the measured nil cost, why absolute fps is not comparable across sessions, and the three traps in the new seam |
 | 23. Batch Q continuous surface | the cube-build livelock, the 1-frame window that renders, the backwards-drifting cursor, and why a slice with no observable behaviour means the boundary is wrong |
 | 24. Batch Q continuous plots | the tier table, why the pooled Morlet is NOT the expensive call, the percentile that re-opened a closed decision, and the hatch that inverted its own purpose |
+| 25. Batch S routing | the three route outcomes and why the middle one cannot raise, the rational-fps fix the streaming path never inherited, and why the clips checkbox is not persisted |
 
 ---
 
@@ -536,12 +537,13 @@ tensor channel is DONE** (shipped in `9d843c0`; see the current thread below) �
 built but not yet validated for want of a postural corpus. Signature fitting
 (T32) is its own branch.
 
-**Batch S is the live thread (2026-07-21): slices 1–4 landed, 5–6 open.** It is
-where per-replicate ownership is being made real on disk, and it is ahead of
+**Batch S is the live thread (2026-07-21): slices 1–5 landed, only 6 open.** It
+is where per-replicate ownership is being made real on disk, and it is ahead of
 everything else here because slices 1–3 each fixed a *silent cross-replicate
 overwrite* rather than adding a feature. **Slice 6 (retired geometries) is the
-one with unruled design questions and should be ruled before it is started**;
-slice 5 is specced and independent of it.
+one with unruled design questions and MUST be ruled before it is started** — it
+is now the only thing left in the batch, so there is nothing else here to do
+first.
 
 ---
 
@@ -692,6 +694,14 @@ session touching only `core/pretranscode.py`, `core/channel_source.py` and
 `cli/pretranscode.py`. 777 passed deselected, the file passed in isolation, and
 an immediate full re-run passed 793. Three sessions, three unrelated diffs — the
 "not ours" reading is now the only one the evidence supports.
+
+**Slice 5 (2026-07-21) adds a fourth, and sharpens what it is.** The full suite
+passed 817 twice; a third run reported **817 passed** and *then* died at
+interpreter shutdown (pytest exit 5 with a faulthandler dump, no failed test).
+So it is a teardown-time crash, not a test failure, which is why "817 passed"
+and a non-zero exit code appear together. Proof pair again: 16/16 in isolation,
+801 deselected. This session did not touch `gui/stream_worker.py` at all.
+**Read the LAST line of the run, not the exit code.**
 
 ---
 
@@ -1001,13 +1011,47 @@ changes the layout.
   this without ruling those** — it spans `rois.json`'s schema,
   `core/replicate_home.py`, `gui/tab2_replicates.py` and both stores, which is
   the file-locality hazard's sixth firing waiting to happen.
-- **Slice 5 · routing + cost model.** `resolve_source(video)` derived per call
-  via the existing `verify_manifest` (~1.4 ms), never a recorded pointer file —
-  "resume is by identity, not existence" (§13, §15). Plus the contamination
-  hazard: `core/cost_model.py:89` `PassSample` has **no source-kind field**, so a
-  sweep taken before a cut and one taken after fit the same `CostModel`, whose
-  `fixed_s` *is* the decode floor the cut changes ~25x. Needs the field and a fit
-  that refuses to mix.
+- ~~**Slice 5 · routing + cost model.**~~ **LANDED 2026-07-21.** Full write-up
+  in `FINDINGS.md` §25. Built as specced, plus three things the spec did not
+  reach:
+
+  **`core/source_route.py` is the one place that asks.** `resolve_source` is
+  derived per call, never recorded. Three outcomes: no manifest → source (with
+  a `reason`); a manifest that is **not this video's** → also source, because
+  for this video none exists; this video's manifest failing `verify_manifest` →
+  **raise** (ruled by the user). The middle case is the one `verify_manifest`
+  provably cannot catch — it validates against the source *the manifest names*
+  — and `cli/pretranscode` and `core/framecount` had each rediscovered it
+  separately, so `framecount.manifest_describes` was made public and is now the
+  single implementation.
+
+  **Found in review, and it is §3 trap 2 by a new road:** the Batch Q streaming
+  path builds its own meta via `synth_live_meta` and so **never inherited**
+  `live_channel_source`'s substitution of the manifest's *rational* fps.
+  `ClipAtlasSource` seeks by dividing a frame index by that rate, so a rounded
+  24.0 for 24000/1001 lands 3 frames early by frame 11000 — the right window
+  length from the wrong place, silently. Harmless until something streamed from
+  clips; it would have gone live with the checkbox. The route is now resolved
+  **before** the plan, because on a clip route it supplies the plan's rate.
+
+  **The GUI is OPT-IN and the checkbox is not persisted** (`Use ROI clips`,
+  greyed until a manifest exists). A restored downsample is the same
+  measurement at a remembered setting; a restored *source* is a different set
+  of pixels re-armed silently in a later session — §10. For the same reason a
+  stale manifest **refuses the pass** rather than falling back: the tick is a
+  claim about which pixels the numbers came from.
+
+  **Cost model:** `PassSample` gained `source_kind` (`clips:<provenance_key>`,
+  not a bare `"clips"` — two qualities are two floors) *and* `channels`, and
+  `CostModel.fit` raises on a mix. `channels` was already recorded on
+  `ScalePass` for this exact reason and was being **dropped** on the way to
+  `PassSample`, so guarding only the axis the spec named would have shipped a
+  guard that refuses one contamination and permits its neighbour. The GUI's
+  `_cost_samples` key had to grow both axes too, or a re-sweep after a cut
+  overwrites the source regime entry by entry.
+
+  Suite 817 green. New: `tests/test_source_route.py` (12), plus cost-model,
+  shard and surface tests.
 
 **Locality warning (the hazard has now fired six times).** Slice 2 was specced
 as `track_store.py` plus a call site; it needed a real restructure of
@@ -1025,7 +1069,14 @@ merely given it two filenames. **A spec that names a file FORMAT is making the
 same claim as one that names a file, and it has now been wrong the same way:
 ask what holds the state, not where the state is written.**
 
-Treat slices 5–6's file lists as guesses. Slice 6's is already flagged in its
-own section as spanning four files, which is a prediction, not a reprieve.
-Slice 4 fired the hazard a seventh time, in the smallest possible way — see its
-entry.
+Treat slice 6's file list as a guess. Its own section already flags it as
+spanning four files, which is a prediction, not a reprieve. Slice 4 fired the
+hazard a seventh time, in the smallest possible way — see its entry.
+
+**Slice 5 was the eighth, and it names the rule for a whole class of specs.**
+It named two things (`resolve_source(video)` and `core/cost_model.py:89`) and
+took nine files. The generalization: the spec named a function to ADD and a
+field to ADD, and **adding a field to a value object is never local** — every
+producer of that object and every consumer that groups or keys by it moves with
+it. `PassSample` gained two fields; that reached `scale_sweep` (the producer),
+`cost_model` (the guard), and the surface's sample key, grouping and tests.
