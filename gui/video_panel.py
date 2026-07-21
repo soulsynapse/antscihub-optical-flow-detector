@@ -12,7 +12,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor, QImage, QPainter, QPen, QColor, QPixmap
+from PyQt6.QtGui import (QCursor, QFont, QImage, QPainter, QPen, QColor,
+                         QPixmap)
 from PyQt6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSizePolicy,
                              QSlider, QStyle, QStyleOptionSlider, QVBoxLayout,
                              QWidget)
@@ -31,6 +32,14 @@ from gui.state import AppState
 DISPLAY_MAX_W = 1280
 
 
+# The DETECTED badge fill. Must match ``speed_explorer.DETECT``, the colour of
+# the detection spans on the plots -- the badge and the shading report the same
+# gate, and two greens would read as two different states. Duplicated rather
+# than imported because speed_explorer imports THIS module; importing back
+# would make the cycle.
+DETECT_BADGE = QColor(60, 220, 110)
+
+
 class FrameView(QLabel):
     """Displays a frame scaled to fit, and maps clicks back to frame coords.
 
@@ -43,6 +52,13 @@ class FrameView(QLabel):
     back_requested = pyqtSignal()
     box_drawn = pyqtSignal(float, float, float, float)   # x0,y0,x1,y1 fractions
     stamp_at = pyqtSignal(float, float)                  # click point, fractions
+    # T12, all three opt-in behind box_drag_enabled. A press inside an existing
+    # box grabs it; whether that turns out to be a click or a drag is only known
+    # on release, so selection (grabbed) and the gesture's result (clicked /
+    # moved) are separate signals rather than one.
+    box_grabbed = pyqtSignal(int)                        # index, on press
+    box_clicked = pyqtSignal(int)                        # index, released in place
+    box_moved = pyqtSignal(int, float, float, float, float)
 
     def __init__(self):
         super().__init__()
@@ -66,11 +82,20 @@ class FrameView(QLabel):
         self._focus_frac: tuple[float, float, float, float] | None = None
 
         self.draw_enabled = False
+        # T12: hit-test and drag the persistent boxes. Off by default -- the four
+        # explorers, mask_dialog and tab3 all render boxes they do not want the
+        # user to grab, and a press inside one there must still fall through to
+        # `clicked`.
+        self.box_drag_enabled = False
         # Persistent boxes to render: [(x0,y0,x1,y1 fractions, label, hex, selected)]
         self.boxes: list[tuple] = []
         self._overlays_hidden = False
+        self._detected = False
         self._rubber: tuple | None = None    # in-progress drag, display coords
         self._drag_start: QPoint | None = None
+        self._move_idx: int | None = None    # box being repositioned
+        self._move_origin: QPoint | None = None
+        self._move_delta = (0.0, 0.0)        # fractions, live during the drag
 
     def set_boxes(self, boxes: list[tuple]) -> None:
         self.boxes = boxes
@@ -80,6 +105,13 @@ class FrameView(QLabel):
         """Temporarily suppress persistent annotations without discarding them."""
         self._overlays_hidden = bool(hidden)
         self.update()
+
+    def set_detected(self, on: bool) -> None:
+        """T16: flag the current frame as a positive detection."""
+        on = bool(on)
+        if on != self._detected:
+            self._detected = on
+            self.update()
 
     def set_focus_frac(self, frac: tuple[float, float, float, float] | None
                        ) -> None:
@@ -99,14 +131,38 @@ class FrameView(QLabel):
     def _view_frac(self) -> tuple[float, float, float, float]:
         return self._focus_frac or (0.0, 0.0, 1.0, 1.0)
 
-    def _frac_of(self, pos: QPoint) -> tuple[float, float]:
+    def _frac_of(self, pos: QPoint, clip: bool = True) -> tuple[float, float]:
         r = self._draw_rect
         lx = (pos.x() - r.x()) / max(1, r.width())
         ly = (pos.y() - r.y()) / max(1, r.height())
         x0, y0, x1, y1 = self._view_frac()
         fx = x0 + lx * (x1 - x0)
         fy = y0 + ly * (y1 - y0)
+        if not clip:
+            # A drag DELTA must not be clipped. Clipping both endpoints turns a
+            # drag that leaves the frame into a shorter one, so a box dragged
+            # toward an edge silently stops short of the cursor instead of
+            # travelling with it and being clamped once, at the end.
+            return float(fx), float(fy)
         return float(np.clip(fx, 0, 1)), float(np.clip(fy, 0, 1))
+
+    def _box_at(self, fx: float, fy: float) -> int | None:
+        """Index of the box under a fractional point, or None.
+
+        The SELECTED box wins any overlap, then the last drawn. Selection-first
+        matters for the drag: replicate boxes are routinely placed edge to edge
+        or overlapping, and grabbing the one you just selected -- rather than
+        whichever neighbour happens to sort later -- is what makes repositioning
+        predictable.
+        """
+        hits = [i for i, b in enumerate(self.boxes)
+                if b[0] <= fx <= b[2] and b[1] <= fy <= b[3]]
+        if not hits:
+            return None
+        for i in hits:
+            if self.boxes[i][6]:
+                return i
+        return hits[-1]
 
     def _rect_for_frac(self, x0, y0, x1, y1) -> QRect:
         r = self._draw_rect
@@ -172,7 +228,16 @@ class FrameView(QLabel):
 
         # Persistent boxes.
         if not self._overlays_hidden:
-            for x0, y0, x1, y1, label, hexcol, selected in self.boxes:
+            for i, (x0, y0, x1, y1, label, hexcol, selected) in enumerate(self.boxes):
+                if i == self._move_idx:
+                    # Draw the grabbed box where the cursor has taken it, with
+                    # the same clamp the release will apply -- so what you drop
+                    # is what you were shown, including at the frame edge.
+                    dx, dy = self._move_delta
+                    w, h = x1 - x0, y1 - y0
+                    x0 = float(np.clip(x0 + dx, 0.0, max(0.0, 1.0 - w)))
+                    y0 = float(np.clip(y0 + dy, 0.0, max(0.0, 1.0 - h)))
+                    x1, y1 = x0 + w, y0 + h
                 if x1 <= vx0 or x0 >= vx1 or y1 <= vy0 or y0 >= vy1:
                     continue
                 rect = self._rect_for_frac(x0, y0, x1, y1)
@@ -187,6 +252,25 @@ class FrameView(QLabel):
                 if label:
                     p.setPen(QPen(col, 1))
                     p.drawText(rect.x() + 3, rect.y() + 14, label)
+
+        # T16: the DETECTED badge, bottom-right of the drawn frame.
+        #
+        # Deliberately OUTSIDE the _overlays_hidden guard above. Shift-to-peek
+        # hides the annotations so the raw pixels can be read -- which is
+        # exactly when you are judging whether a detection is real, so that is
+        # the worst possible moment to take the detector's verdict away. It
+        # also annotates nothing: it reports a per-frame result rather than
+        # marking a place in the image, so it never occludes what peek reveals.
+        if self._detected:
+            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+            txt = "DETECTED"
+            fm = p.fontMetrics()
+            bw, bh = fm.horizontalAdvance(txt) + 16, fm.height() + 8
+            r = self._draw_rect
+            badge = QRect(r.right() - bw - 8, r.bottom() - bh - 8, bw, bh)
+            p.fillRect(badge, DETECT_BADGE)
+            p.setPen(QColor(0, 0, 0))
+            p.drawText(badge, Qt.AlignmentFlag.AlignCenter, txt)
 
         # Rubber-band in progress.
         if self._rubber is not None:
@@ -203,10 +287,32 @@ class FrameView(QLabel):
             return
         self.setFocus(Qt.FocusReason.MouseFocusReason)
         if e.button() == Qt.MouseButton.RightButton:
+            if self._move_idx is not None:
+                # Right-click during a drag CANCELS it, and is not also a
+                # "back". Committing here would reposition the box using
+                # whatever partial delta the drag had reached, and the un-zoom
+                # would change the coordinate mapping the delta was measured in
+                # -- so the box lands somewhere the user never dragged it.
+                self._cancel_move()
+                return
             self.back_requested.emit()
             return
         if not self._draw_rect.contains(e.pos()):
             return
+        if self.box_drag_enabled and e.button() == Qt.MouseButton.LeftButton \
+                and not self._overlays_hidden:
+            # Grabbing a box you cannot see (shift-to-peek) would be a blind
+            # edit, so peek suppresses the hit test as well as the drawing.
+            idx = self._box_at(*self._frac_of(e.pos()))
+            if idx is not None:
+                self._move_idx = idx
+                self._move_origin = e.pos()
+                self._move_delta = (0.0, 0.0)
+                # Emit on PRESS so the highlight follows the finger. The zoom
+                # deliberately does not -- it would move the frame out from
+                # under a drag that has not happened yet.
+                self.box_grabbed.emit(idx)
+                return
         if self.draw_enabled and e.button() == Qt.MouseButton.LeftButton:
             self._drag_start = e.pos()
             self._rubber = QRect(e.pos(), e.pos())
@@ -216,12 +322,59 @@ class FrameView(QLabel):
             min(self._src_size[0] - 1, int(fx * self._src_size[0])),
             min(self._src_size[1] - 1, int(fy * self._src_size[1]))))
 
+    def _cancel_move(self) -> None:
+        self._move_idx = None
+        self._move_origin = None
+        self._move_delta = (0.0, 0.0)
+        self.update()
+
+    def _delta_to(self, pos: QPoint) -> tuple[float, float]:
+        """Drag displacement in fractions, from the press point to `pos`."""
+        ox, oy = self._frac_of(self._move_origin, clip=False)
+        cx, cy = self._frac_of(pos, clip=False)
+        return cx - ox, cy - oy
+
     def mouseMoveEvent(self, e):
+        if self._move_idx is not None:
+            self._move_delta = self._delta_to(e.pos())
+            self.update()
+            return
         if self._drag_start is not None:
             self._rubber = QRect(self._drag_start, e.pos()).normalized()
             self.update()
 
     def mouseReleaseEvent(self, e):
+        if self._move_idx is not None:
+            if e.button() != Qt.MouseButton.LeftButton:
+                return          # a chorded button; the left drag is still live
+            idx, origin = self._move_idx, self._move_origin
+            # Measure the displacement from THIS event, not from the last move
+            # event's cached delta. Those are two sources for one quantity and
+            # they disagree whenever no move event arrives between press and
+            # release (Qt compresses them under load): the release then reads
+            # as "moved 150 px" while the cached delta is still zero, so the
+            # box is rewritten to where it already was -- and _rebuild_rois and
+            # the sidecar write both fire for a reposition that did not happen.
+            dx, dy = self._delta_to(e.pos())
+            moved = max(abs(e.pos().x() - origin.x()),
+                        abs(e.pos().y() - origin.y())) >= 5
+            self._cancel_move()
+            # The box list can be rebuilt by whoever handled box_grabbed, so the
+            # index is re-checked rather than trusted across the gesture.
+            if idx >= len(self.boxes):
+                return
+            if not moved:
+                self.box_clicked.emit(idx)
+                return
+            x0, y0, x1, y1 = self.boxes[idx][:4]
+            w, h = x1 - x0, y1 - y0
+            # Clamp the ORIGIN and keep the size: a box dragged past an edge
+            # must stay the size it was, or repositioning would silently become
+            # a resize and break the fixed-size-stamp invariant (T11).
+            nx = float(np.clip(x0 + dx, 0.0, max(0.0, 1.0 - w)))
+            ny = float(np.clip(y0 + dy, 0.0, max(0.0, 1.0 - h)))
+            self.box_moved.emit(idx, nx, ny, nx + w, ny + h)
+            return
         if self._drag_start is None:
             return
         rect = QRect(self._drag_start, e.pos()).normalized()
@@ -344,17 +497,6 @@ class VideoPanel(QWidget):
 
     # -- overlays ------------------------------------------------------------
 
-    def set_overlay(self, mask: np.ndarray | None,
-                    color: tuple[int, int, int] = (60, 200, 255)) -> None:
-        self._overlay = mask
-        self._overlay_color = color
-        self.refresh()
-
-    def set_roi_boxes(self, boxes: list[tuple[int, tuple, str]]) -> None:
-        """[(roi_id, (y0,x0,y1,x1) in blocks, hex_color)]"""
-        self._roi_boxes = boxes
-        self.refresh()
-
     def set_draw_mode(self, on: bool) -> None:
         self.view.draw_enabled = on
         self.view.setCursor(QCursor(
@@ -374,12 +516,6 @@ class VideoPanel(QWidget):
 
     def clear_focus(self) -> None:
         self.set_focus_frac(None)
-
-    def set_focus_mode(self, mode: str) -> None:
-        if mode not in ("source", "flow"):
-            raise ValueError(f"Unknown focus mode: {mode}")
-        self._focus_mode = mode
-        self.refresh()
 
     # -- playback ------------------------------------------------------------
 

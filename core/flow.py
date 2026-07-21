@@ -135,24 +135,6 @@ def gpu_available() -> bool:
         return False
 
 
-def backend_status() -> dict[str, str]:
-    """Per-backend availability message for Preprocessing & Flow."""
-    status = {
-        "farneback": "Available (CPU). Fast; coarse motion.",
-        "dis": "Available (CPU). Better on subtle motion.",
-    }
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        status["raft"] = ("Unavailable: PyTorch is not installed. "
-                          "Install torch + torchvision with CUDA to enable.")
-        return status
-    if gpu_available():
-        status["raft"] = "Available (GPU). Best on fine motion."
-    else:
-        status["raft"] = ("Unavailable: PyTorch is installed but no CUDA GPU was "
-                          "detected. RAFT on CPU is too slow to be usable.")
-    return status
 
 
 def create_backend(cfg: FlowConfig) -> FlowBackend:
@@ -199,6 +181,71 @@ def forward_backward_error(forward: np.ndarray,
     return np.minimum(err, cap).astype(np.float32, copy=False)
 
 
+def _ragged_cells(values: np.ndarray, block: int, h: int, w: int,
+                  ny: int, nx: int):
+    """Yield ``(by, bx, cell)`` for the partial cells at the bottom/right edge.
+
+    When ``include_partial``, ny/nx use ceiling division, so the last row and
+    column can be short. Those cells are the only ones that fall outside the
+    regular (ny, block, nx, block) grid, and both the mean and p90 reductions
+    need exactly the same set -- keeping the geometry in one place stops a fix to
+    edge handling from being applied to one statistic and not the other.
+    """
+    full_y, full_x = h // block, w // block
+    for by in range(ny):
+        for bx in range(nx):
+            if by < full_y and bx < full_x:
+                continue
+            yield by, bx, values[by * block:min(h, (by + 1) * block),
+                                 bx * block:min(w, (bx + 1) * block)]
+
+
+def _block_mean(values: np.ndarray, block: int, h: int, w: int,
+                ny: int, nx: int) -> np.ndarray:
+    """Block-mean without padding or transposing the full plane.
+
+    This is the extraction hot path -- five calls per frame per tile, measured at
+    14% of a 5.3K pass and 32% of a small one. The generic route below pads the
+    whole field with NaN, transposes it (which forces a copy at the following
+    reshape), and runs ``nanmean``: three full-size temporaries for what is a
+    strided sum. Reshaping to (ny, block, nx, block) and reducing axes 1 and 3
+    needs none of them. Only the ragged last row/column fall outside the regular
+    grid, and there are at most ny + nx of those cells.
+
+    Those edge cells are reduced as three SLABS rather than one at a time. The
+    per-cell loop was correct but paid numpy's fixed per-call overhead on cells
+    of a few thousand pixels: a 349x321 replicate tile at block 64 has 25 regular
+    cells and **11** ragged ones, so the loop ran 11 tiny ``mean`` calls per tile
+    per frame -- 24 200 of them in a 200-frame pass, and most of this function's
+    cost. The geometry makes the slabs possible: ``include_partial`` uses ceiling
+    division, so there is at most ONE short row and ONE short column, and every
+    cell in the bottom strip shares a height (every cell in the right strip, a
+    width). Only the corner is genuinely alone. 1.7-3x, and reducing the same
+    elements per cell as before.
+    """
+    out = np.empty((ny, nx), np.float32)
+    full_y, full_x = h // block, w // block
+    rem_y, rem_x = h - full_y * block, w - full_x * block
+    # Gated on ny/nx exceeding the regular grid, NOT on rem_y/rem_x being
+    # nonzero: without include_partial, ny == full_y even when the plane has a
+    # remainder, and the short row is meant to be dropped. Writing out[full_y]
+    # then would be an IndexError.
+    if full_y and full_x:
+        core = values[:full_y * block, :full_x * block]
+        out[:full_y, :full_x] = core.reshape(
+            full_y, block, full_x, block).mean(axis=(1, 3), dtype=np.float32)
+    if ny > full_y and full_x:              # bottom strip: rem_y tall, block wide
+        out[full_y, :full_x] = values[full_y * block:, :full_x * block].reshape(
+            rem_y, full_x, block).mean(axis=(0, 2), dtype=np.float32)
+    if nx > full_x and full_y:              # right strip: block tall, rem_x wide
+        out[:full_y, full_x] = values[:full_y * block, full_x * block:].reshape(
+            full_y, block, rem_x).mean(axis=(1, 2), dtype=np.float32)
+    if ny > full_y and nx > full_x:         # the single corner cell
+        out[full_y, full_x] = values[full_y * block:, full_x * block:].mean(
+            dtype=np.float32)
+    return out
+
+
 def reduce_scalar_to_blocks(values: np.ndarray, block: int,
                             statistic: str = "mean",
                             include_partial: bool = False) -> np.ndarray:
@@ -225,14 +272,18 @@ def reduce_scalar_to_blocks(values: np.ndarray, block: int,
         if full_y and full_x:
             out[:full_y, :full_x] = reduce_scalar_to_blocks(
                 values[:full_y * block, :full_x * block], block, "p90")
-        for by in range(ny):
-            for bx in range(nx):
-                if by < full_y and bx < full_x:
-                    continue
-                cell = values[by * block:min(h, (by + 1) * block),
-                              bx * block:min(w, (bx + 1) * block)]
-                out[by, bx] = np.percentile(cell, 90)
+        for by, bx, cell in _ragged_cells(values, block, h, w, ny, nx):
+            out[by, bx] = np.percentile(cell, 90)
         return out
+
+    if statistic == "mean":
+        out = _block_mean(values, block, h, w, ny, nx)
+        if not np.isnan(out).any():
+            return out
+        # NaN reached the output. Either the field itself carries NaN, or (when
+        # include_partial) a padded cell was all-NaN -- which ceiling division
+        # makes impossible, so it is the field. Fall through to the nanmean
+        # route below, which skips NaN per cell the way this path cannot.
 
     if include_partial:
         x = np.pad(values.astype(np.float32, copy=False),

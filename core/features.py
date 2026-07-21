@@ -629,5 +629,3 @@ def cached_feature_names(cfg) -> list[str]:
     return names
 
 
-def derived_feature_names() -> list[str]:
-    return [n for n, s in REGISTRY.items() if s.kind == "derived"]

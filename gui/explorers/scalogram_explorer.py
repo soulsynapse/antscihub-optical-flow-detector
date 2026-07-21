@@ -34,13 +34,15 @@ See docs/expanded_cache_plan.md.
 from __future__ import annotations
 
 import os
+import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from functools import partial
 
 import cv2
 import numpy as np
 
-from PyQt6.QtCore import QEvent, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
                          QShortcut)
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
@@ -48,8 +50,12 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                              QPushButton, QScrollArea, QSlider, QVBoxLayout,
                              QWidget)
 
-from core.tensor_channels import load_or_extract_channels
-from core.wavelet import default_freqs, morlet_power
+from core.channel_source import cache_channel_source
+from core.detection import (detect_gate, inband_count, largest_clump_per_frame,
+                            rescale_count_band,
+                            window_bounds, windowed_mean)
+from core.wavelet import (band_indices, coi_edge_samples, default_freqs,
+                          morlet_power)
 from gui.video_panel import FrameView
 from gui.explorers.speed_explorer import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
                                           TXT, TXT_DIM, DensityPlot, MiniPlot,
@@ -57,17 +63,21 @@ from gui.explorers.speed_explorer import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
 
 EPS = 1e-6
 SWEEP_C = QColor(110, 230, 120)      # in-band count / clump
-DETECT_C = QColor(120, 255, 140)     # binary detection gate
 
-# Channel -> (attribute, overlay colormap). All are nonnegative energies except
-# cached speed; the scalogram cares only about their temporal fluctuation, so the
-# choice is about which signal's rhythm you want to see.
+# Channel -> (attribute, overlay colormap). All are nonnegative energies; the
+# scalogram cares only about their temporal fluctuation, so the choice is about
+# which signal's rhythm you want to see.
+#
+# The pipeline's cached flow ``speed`` was listed here and is not any more. Every
+# channel below comes from the structure tensor and is available on a bare video,
+# so on the live surface -- the primary path now -- the flow row was permanently
+# disabled furniture, offering a channel that only the cache-backed entry point
+# could ever select. The cache still carries ``speed`` for the flow explorers.
 CHANNELS = {
     "change energy Jtt": ("change", cv2.COLORMAP_TURBO),
     "appearance energy": ("appearance", cv2.COLORMAP_TURBO),
     "tensor speed": ("tensor_speed", cv2.COLORMAP_TURBO),
     "intensity": ("intensity", cv2.COLORMAP_TURBO),
-    "cached flow speed": ("speed", cv2.COLORMAP_TURBO),
 }
 
 # Warm scalogram ramp (0 -> plot bg, up to hot white), distinct from the cyan
@@ -87,9 +97,14 @@ class ScalogramPlot(MiniPlot):
 
     BASE_H = MiniPlot.EXPANDED_H
 
-    def __init__(self, title: str, freqs: np.ndarray):
+    def __init__(self, title: str, freqs: np.ndarray, fps: float):
         super().__init__(title, unit="Hz")
         self.freqs = np.asarray(freqs, np.float64)
+        # Required, not defaulted: the cone of influence is a width in SECONDS
+        # converted to columns, so a wrong fps draws a confidently wrong wedge.
+        # Same reasoning as the cache_key provenance argument -- make the
+        # omission impossible rather than documented.
+        self.fps = float(fps)
         self.matrix = np.zeros((0, 0), np.float32)     # (F, T) power
         self._img = None
         self._img_key = None
@@ -110,13 +125,19 @@ class ScalogramPlot(MiniPlot):
     def _data_range(self):
         return float(self.freqs[0]), float(self.freqs[-1])
 
+    def _release_render_cache(self) -> None:
+        self._img = None
+        self._img_key = None
+
     def set_scalogram(self, matrix: np.ndarray) -> None:
         self.matrix = np.asarray(matrix, np.float32)   # (F, T)
         self.y = self.matrix.sum(axis=0) if self.matrix.size \
             else np.zeros(0, np.float32)               # cursor readout: total power
         self._img = None
-        self._ver += 1
-        self.update()
+        # Writes self.y directly, so it invalidates the base class's memos the
+        # same way DensityPlot.set_matrix does.
+        self._bump_series_version()
+        self._repaint_unless_collapsed()
 
     def band_hz(self) -> tuple[float, float]:
         lo, hi = self.band()
@@ -127,7 +148,12 @@ class ScalogramPlot(MiniPlot):
     def _heatmap(self, w, h, lo, hi):
         if w <= 0 or h <= 0 or self.matrix.size == 0:
             return None
-        key = (w, h, self._ver)
+        # fps is in the key because _fade_coi's wedge width is derived from it.
+        # It cannot move today (set_channel_data refuses an fps change), so this
+        # guards a future setter rather than a live bug -- but a stale cached
+        # image would carry a wrong-width cone drawn as authoritatively as a
+        # right one, which is the one failure this plot must not have.
+        key = (w, h, self._ver, self.fps)
         if self._img is not None and self._img_key == key:
             return self._img
         F, T = self.matrix.shape
@@ -136,28 +162,95 @@ class ScalogramPlot(MiniPlot):
         tlo, thi = self._fwd(lo), self._fwd(hi)
         row_f = self._inv(thi - (np.arange(h) + 0.5) / h * (thi - tlo))
         fidx = np.clip(np.searchsorted(self.freqs, row_f), 0, F - 1)
-        col = np.clip((np.arange(w) * T) // max(1, T), 0, T - 1)
-        cells = np.log10(self.matrix[np.ix_(fidx, col)] + EPS)
+        vals, d = self._columns(w, T, fidx)
+        cells = np.log10(vals + EPS)
         cmin, cmax = float(cells.min()), float(cells.max())
         norm = (cells - cmin) / max(1e-9, cmax - cmin)
         x = np.clip(norm, 0, 1) * (len(_SG_RAMP) - 1)
         i = np.clip(x.astype(int), 0, len(_SG_RAMP) - 2)
         f = (x - i)[..., None]
-        rgb = np.ascontiguousarray(
-            (_SG_RAMP[i] * (1 - f) + _SG_RAMP[i + 1] * f).astype(np.uint8))
+        rgb = _SG_RAMP[i] * (1 - f) + _SG_RAMP[i + 1] * f
+        rgb = self._fade_coi(rgb, row_f, d)
+        rgb = np.ascontiguousarray(rgb.astype(np.uint8))
         img = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
         self._img, self._img_key = img, key
         return img
 
+    def _columns(self, w, T, fidx):
+        """Map the record's T frames onto w pixel columns.
+
+        Returns the per-column power ``(h, w)`` and ``d``, each column's
+        distance in FRAMES to the nearer end of the record, which is what the
+        cone of influence is measured against.
+
+        Reduced, not point-sampled. Gathering one frame per column drops the
+        rest: at T=11308 into 600 px that is ~94% of frames never drawn, so a
+        brief burst is rendered only if it happens to land on a sampled index --
+        signal absent from the plot with nothing to show it was ever there,
+        which is the failure mode this project designs against. It also left the
+        last ~T/w frames unreachable, so the rightmost column lagged a live
+        frontier. A per-column MAX matches how ``_Strip`` paints the whole-clip
+        detection strip, and preserves brief events by construction.
+
+        ``d`` takes each column's WORST frame (the one nearest an end), so a
+        column whose max may have come from inside the cone is faded as if it
+        did. Conservative in the direction that under-claims.
+        """
+        if T >= w:
+            bounds = np.linspace(0, T, w + 1).astype(int)
+            a, b = bounds[:w], bounds[1:]
+            # reduceat over [a[i], a[i+1]) -- segments are non-empty here
+            # because T >= w, which is what makes the plain form safe.
+            vals = np.maximum.reduceat(self.matrix, a, axis=1)[fidx]
+            d = np.minimum(a, T - b)
+        else:
+            # Fewer frames than pixels: nothing to reduce, each frame just
+            # spans several columns.
+            col = np.clip((np.arange(w) * T) // max(1, w), 0, T - 1)
+            vals = self.matrix[np.ix_(fidx, col)]
+            d = np.minimum(col, (T - 1) - col)
+        return vals, d
+
+    def _fade_coi(self, rgb, row_f, d):
+        """Blend the cone of influence toward the plot background.
+
+        ``morlet_power`` zero-pads the record, so within one e-folding time of
+        either end the coefficients measure the padding rather than the signal
+        -- and because that width is 1.369/f seconds, the contaminated wedge is
+        frequency-dependent: ~2.74 s at 0.5 Hz against ~0.068 s at 20 Hz. On a
+        live trailing window the newest seconds are therefore artifact at low
+        frequencies and fine at high ones, so progressive fill is naturally
+        frequency-shaped and drawing that edge as data would be a
+        plausible-looking wrong number of exactly the kind this codebase is
+        built against.
+
+        BOTH ends fade, not only the newest. A trailing window's oldest edge has
+        real frames before it, but the transform did not see them, so it is a
+        genuine zero-padding edge for this cube regardless.
+
+        The linear ramp -- background at the very edge, full colour one
+        e-folding time in -- is a rendering choice. The e-folding time is a
+        scale rather than a cutoff, so a hard boundary would overclaim where
+        contamination stops.
+        """
+        if not np.isfinite(self.fps) or self.fps <= 0:
+            return rgb
+        edge = np.maximum(coi_edge_samples(row_f, self.fps), 1e-9)[:, None]
+        alpha = np.clip(np.asarray(d)[None, :] / edge, 0.0, 1.0)[..., None]
+        return rgb * alpha + _SG_RAMP[0] * (1.0 - alpha)
+
     def paintEvent(self, _):
         p = QPainter(self)
+        if self._paint_collapsed(p):
+            return
         p.fillRect(self.rect(), BG)
         r = self._plot_rect()
         p.fillRect(r, PLOT_BG)
+        self._paint_header(p)
         p.setFont(QFont("Consolas", 7))
         if self.matrix.size == 0:
             p.setPen(TXT_DIM)
-            p.drawText(8, 12, self.title)
+            p.drawText(self._title_x(), 12, self.title)
             p.end()
             return
         lo, hi = self._data_range()
@@ -173,7 +266,8 @@ class ScalogramPlot(MiniPlot):
         p.drawLine(int(cx), int(r.top()), int(cx), int(r.bottom()))
         flo, fhi = self.band_hz()
         p.setPen(TXT)
-        p.drawText(8, 12, f"{self.title}   band {flo:.2f}-{fhi:.2f} Hz")
+        p.drawText(self._title_x(), 12,
+                   f"{self.title}   band {flo:.2f}-{fhi:.2f} Hz")
         p.setPen(TXT_DIM)
         p.drawText(int(r.left()), int(r.bottom()) + 8, f"{lo:.3g} Hz")
         p.drawText(int(r.left()), int(r.top()) + 4, f"{hi:.3g} Hz")
@@ -207,16 +301,82 @@ class ScalogramExplorer(QWidget):
     # cubes (610 MB each) but only the current one for a multi-minute clip.
     _SG_CACHE_BUDGET = 6 * 1024 ** 3
 
+    # Something ``capture_view_state`` would report differently now. The live
+    # surface persists that state per video off this, so it fires only on
+    # committed changes (band RELEASE, not every drag frame) -- a signal per
+    # mouse-move would drive a sidecar write per pixel of drag.
+    tuning_changed = pyqtSignal()
+    # Absolute video frame the cursor sits on. Emitted on every frame change --
+    # including playback -- so the whole-clip strip tracks the position rather
+    # than only updating when a pass lands.
+    frame_moved = pyqtSignal(int)
+
     def __init__(self, cache=None, video_path: str | None = None, *,
-                 state=None, sidecar_path: str | None = None, parent=None):
+                 state=None, sidecar_path: str | None = None,
+                 channel_data=None, own_shortcuts: bool = True,
+                 own_status: bool = True,
+                 on_demand_channels: Iterable[str] | None = None, parent=None):
         super().__init__(parent)
-        if state is not None:
+        # Channel ATTRIBUTES the host can produce on demand even when this data
+        # does not currently carry them -- the live surface's set is LIVE_CHANNELS,
+        # because a live pass computes only the selected channel (+ _ALWAYS_STREAM)
+        # and replans to add another. Such a channel is SELECTABLE though absent:
+        # checking it is what tells the host to compute it. Empty for a static
+        # cache explorer, which already carries every channel it lists.
+        self._on_demand = frozenset(on_demand_channels or ())
+        if state is not None and cache is None and channel_data is None:
             cache = state.cache
-        if cache is None:
-            raise ValueError("ScalogramExplorer requires an open cache")
         self.state = state
         self.cache = cache
-        self.meta = cache.meta
+        # When embedded in a host that owns Space (the live surface / main
+        # window), skip our own Space shortcut so the two do not fight over it.
+        self._own_shortcuts = own_shortcuts
+        # The main window's Space handler walks up from the focus widget looking
+        # for a toggle_playback(). Embedded in the live surface, Space belongs to
+        # the LIVE PASS, not to video playback -- and this widget sits between
+        # the focus and the surface, so without an explicit opt-out it wins the
+        # walk and Space silently means the wrong thing. Video playback needs no
+        # Space there because it never stops: see _build_ui.
+        self.space_toggles_playback = own_shortcuts
+        # When embedded, the host displays the status line (in its own strip): skip
+        # rendering our internal copy and mirror the text to the host-supplied
+        # relay label instead (see set_status_relay).
+        self._own_status = own_status
+        self._status_relay = None
+
+        # Source of geometry + channels. A ChannelData decouples us from the
+        # cache: it comes either from an open cache or a live windowed pass over
+        # a bare video. Both carry the four structure-tensor channels this panel
+        # plots; a cache additionally carries flow "speed", which this panel no
+        # longer offers (see CHANNELS).
+        if channel_data is None:
+            if cache is None:
+                raise ValueError(
+                    "ScalogramExplorer requires a cache, state, or channel_data")
+            dlg = QProgressDialog("Extracting structure-tensor channels...", None,
+                                  0, int(cache.meta["n_frames"]), self)
+            dlg.setWindowModality(Qt.WindowModality.WindowModal)
+            dlg.setMinimumDuration(0)
+
+            def prog(done, total):
+                dlg.setMaximum(total)
+                dlg.setValue(done)
+                QApplication.processEvents()
+
+            channel_data = cache_channel_source(
+                cache, sidecar_path=sidecar_path, progress=prog)
+            dlg.close()
+
+        self._cd = channel_data
+        self.meta = channel_data.meta
+        # Absolute video frame the T axis starts at (0 for full-clip sources);
+        # the video overlay adds it back to decode the right frame.
+        self.window_start = int(channel_data.window_start)
+        # How the cursor is carried onto a new span: None is the historical
+        # "hold the absolute frame, unless it was riding the newest one";
+        # "latest" and "center" are the two explicit live modes. See
+        # follow_center and set_channel_data.
+        self._follow: str | None = None
         self.fps = float(self.meta["fps"])
         self.dt = 1.0 / max(self.fps, EPS)
         self.ny, self.nx = map(int, self.meta["grid"])
@@ -234,25 +394,11 @@ class ScalogramExplorer(QWidget):
         self.src_h = max(1, int(self.meta.get("src_height", 0)) or
                          int(self.meta.get("work_height", 1)))
 
-        dlg = QProgressDialog("Extracting structure-tensor channels...", None,
-                              0, int(self.meta["n_frames"]), self)
-        dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        dlg.setMinimumDuration(0)
-
-        def prog(done, total):
-            dlg.setMaximum(total)
-            dlg.setValue(done)
-            QApplication.processEvents()
-
-        ch = load_or_extract_channels(cache, sidecar_path=sidecar_path, progress=prog)
-        dlg.close()
-        self._chan = {
-            "change": np.asarray(ch["change"], np.float32),
-            "appearance": np.asarray(ch["appearance"], np.float32),
-            "tensor_speed": np.asarray(ch["tensor_speed"], np.float32),
-            "intensity": np.asarray(ch["intensity"], np.float32),
-            "speed": np.asarray(cache.read("speed"), np.float32),
-        }
+        # Channels present in this source. tensor_speed/change/intensity/
+        # appearance are always here; a cache-backed source also carries "speed",
+        # which stays in the dict (unused here) rather than being filtered out.
+        self._chan = {k: np.asarray(v, np.float32)
+                      for k, v in channel_data.channels.items()}
         self._channels_bytes = sum(a.nbytes for a in self._chan.values())
         self.T = self._chan["change"].shape[0]
         self.freqs = default_freqs(self.fps)
@@ -262,9 +408,34 @@ class ScalogramExplorer(QWidget):
         self._phase = "starting…"
         self.frame = int(state.current_frame) if state is not None else 0
         self.playing = False
+        # Achieved-vs-realtime playback rate, measured by comparing two clocks
+        # over the same interval: wall seconds elapsed, and seconds of FOOTAGE
+        # advanced (frames / fps). The window closes once a full wall second has
+        # passed, so the readout updates once a second and covers the whole
+        # per-frame cycle -- decode, channel overlay, in-band highlight, every
+        # expanded plot -- rather than any one stage.
+        #
+        # Frames are counted with a cumulative tick counter, not by differencing
+        # self.frame: playback loops back to 0 at the end of the window, and a
+        # frame-index difference would read that wrap as a large negative jump
+        # and report a nonsense rate on whichever second the loop falls in.
+        self._advance_ticks = 0
+        self._rate_wall0 = 0.0
+        self._rate_ticks0 = 0
+        # Per-frame detection gate. Owned here rather than read back off a plot
+        # so that removing or collapsing a readout cannot change the detection.
+        self.detect: np.ndarray = np.zeros(0, np.float32)
         self._overlay_peek_hidden = False
         self._render_frac = (0.0, 0.0, 1.0, 1.0)
+        # Constant green layers for the in-band highlight, keyed by ROI shape.
+        # Bounded by the number of distinct replicate tile sizes on screen.
+        self._tint_cache: dict[tuple, np.ndarray] = {}
         self._ov_scale = EPS       # replaced by a real percentile in _rebuild
+        # Whether _ov_scale has ever been set from actual data. A live pass skips
+        # the percentile (see _rebuild_selected_views), and the FIRST rebuild of
+        # a pass must not be allowed to skip it too -- the overlay would then
+        # normalize by EPS and render every block saturated.
+        self._ov_scale_set = False
         # Detection-window D (frames): the binary gate reads the centered mean of
         # "# blocks in band" over D, so a 1-frame spike of N blocks dilutes to
         # N/D and cannot fake a sustained event. Centered by default (offline, so
@@ -280,7 +451,54 @@ class ScalogramExplorer(QWidget):
         # than by count: a full-length clip may hold only the current one, a
         # short clip many -- degrades correctly instead of running out of RAM.
         self._sg_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        # The (window_start, T) each cached cube was transformed over. A cube now
+        # OUTLIVES the span it was built on -- that is what lets the per-frame
+        # plots run at 10 Hz while the cube takes seconds -- so the span has to
+        # travel with it, or the density heatmap it feeds cannot be drawn at the
+        # right place on the shared time axis. See DensityPlot.set_matrix.
+        self._sg_span: dict[tuple, tuple[int, int]] = {}
         self._worker = None
+        # The span the in-flight cube is being transformed over, captured at
+        # launch: self.window_start/self.T may both have moved by the time it
+        # lands, which is the normal case on a live pass.
+        self._cube_span: tuple[int, int] = (0, 0)
+        # Bumped by every set_channel_data. The cube cache is keyed by
+        # (region, channel) and NOT by the data, so on a live surface -- where
+        # the channels are replaced under a fixed geometry once a second -- that
+        # key alone cannot tell a cube built over the previous window from one
+        # built over this one. Both the cache and the in-flight worker are
+        # therefore stamped with this, and a cube whose stamp is stale is
+        # dropped. Without it the failure is silent and looks like the
+        # transform: a scalogram from a span the user has already left.
+        self._data_gen = 0
+        self._cube_gen = 0
+        # Channels whose band-power sum was skipped because their plot was
+        # collapsed; re-summed when the user expands one.
+        self._density_dirty: set[str] = set()
+        # Density plots the user explicitly opened with [+]. Distinct from "open
+        # because it is the selected channel", which _apply_selected_plot_ui
+        # forces and must be able to UNDO on deselection: a plot left open by a
+        # selection that has moved on stays in _refresh_densities' `wanted` set
+        # forever, so visiting every channel once would make every later band
+        # drag re-sum every cube -- exactly the per-refresh cost T14 removed.
+        # Only a real [+] click belongs here (set_collapsed emits no signal).
+        self._density_user_open: set[str] = set()
+        # The mirror set, for the SELECTED plot only. A selected heatmap opens by
+        # default, so "user intent" for it is the collapse, not the expand -- the
+        # two sets are not complements and cannot be folded into one. Tracked
+        # separately so a channel collapsed while selected stays collapsed when
+        # you come back to it, instead of springing open on every reselect.
+        self._density_user_collapsed: set[str] = set()
+
+        # Per-scope band memory, keyed by region index. A replicate switch used
+        # to wipe every band to None; that made a threshold un-comparable across
+        # replicates by construction -- you cannot check whether one value
+        # separates behaviour in rep 25 and rep 26 if looking at rep 26 discards
+        # it. Revisiting a scope restores exactly what was left there; a scope
+        # seen for the first time inherits the band you were just using (see
+        # _restore_bands for why the two kinds of band inherit differently).
+        self._value_band_cache: dict[tuple[int, str], tuple] = {}
+        self._count_band_cache: dict[int, tuple] = {}
 
         self.source = None
         self._owns_source = False
@@ -305,6 +523,9 @@ class ScalogramExplorer(QWidget):
         self._sweep_debounce.setInterval(120)
         self._sweep_debounce.timeout.connect(self._recompute_counts)
         self._build_ui()
+        if not self._own_shortcuts:
+            self._toggle_play()
+        self._wire_tuning_changed()
 
         # Shift-to-peek (hide the overlay to read the raw frame) rides an
         # application-wide event filter, exactly as the structure-tensor
@@ -314,7 +535,7 @@ class ScalogramExplorer(QWidget):
         if self._event_filter_app is not None:
             self._event_filter_app.installEventFilter(self)
         self._space_shortcut = None
-        if state is None:
+        if state is None and self._own_shortcuts:
             self._space_shortcut = QShortcut(
                 QKeySequence(Qt.Key.Key_Space.value), self)
             self._space_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -337,7 +558,454 @@ class ScalogramExplorer(QWidget):
             raise ValueError("Open a feature cache before creating this explorer")
         return cls(state=state, parent=parent)
 
+    @classmethod
+    def from_channel_data(cls, channel_data, video_path: str | None = None,
+                          own_shortcuts: bool = True, own_status: bool = True,
+                          on_demand_channels: Iterable[str] | None = None,
+                          parent=None) -> "ScalogramExplorer":
+        """Standalone explorer over a ChannelData (e.g. a live windowed source),
+        decoding its own video for the overlay. ``on_demand_channels`` names the
+        channel attributes a live host can compute on demand, so their checkboxes
+        stay selectable even while this window carries only a subset."""
+        return cls(channel_data=channel_data,
+                   video_path=video_path or channel_data.meta.get("video_path"),
+                   own_shortcuts=own_shortcuts, own_status=own_status,
+                   on_demand_channels=on_demand_channels, parent=parent)
+
+    def _sync_info_label(self) -> None:
+        self._info_lbl.setText(
+            f"cache: {self.meta.get('backend','?')} | fps {self.fps:.2f} | "
+            f"{self.T} frames | scalogram "
+            f"{self.freqs[0]:.2f}-{self.freqs[-1]:.2f} Hz, "
+            f"{len(self.freqs)} scales")
+
+    # -- live data replacement (Batch Q) -------------------------------------
+    def is_building(self) -> bool:
+        """Whether a per-block cube is still being transformed off-thread.
+
+        DO NOT gate live updates on this. That is what it was for, and the
+        reason is gone: a cube arriving after its span had moved used to be
+        DISCARDED, so updating faster than the transform ran meant every cube
+        was dropped and relaunched and the scalogram never appeared at all.
+        Cubes are now retained and tagged with the span they cover
+        (``_sg_span``), drawn at that span with the remainder hatched, so a late
+        cube is late data correctly placed rather than wrong data.
+
+        Gating on it now costs what it used to buy: it throttles the per-FRAME
+        plots -- ~12 ms together even at whole-clip length -- to the rate of a
+        per-block transform up to 500x slower that feeds none of them
+        (FINDINGS §24).
+
+        Kept as a status predicate: it is what ``_set_busy`` and any
+        "still working" readout should ask. Nothing in the update path reads it.
+        """
+        return self._worker is not None
+
+    def follow_latest(self) -> None:
+        """Park the cursor on the newest frame of the current span.
+
+        Called once when a live pass opens this explorer. A freshly built
+        explorer sits at frame 0, and :meth:`set_channel_data` treats "cursor on
+        the newest frame" as the signal to keep following -- so without this the
+        live view pins to the OLDEST retained frame and stays there, drifting
+        further behind the frontier with every update while looking stationary.
+        """
+        self._follow = "latest"
+        self._update_frame(self.T - 1)
+
+    def follow_center(self) -> None:
+        """Pin the cursor to the MIDDLE of the span and keep it there.
+
+        This is the live surface's reading position. The served window is the
+        trailing ``n`` frames ending at the frontier, so a cursor at its centre
+        sits half a window behind the frontier: the left half of every plot is
+        what has been played, the right half is what the pass has already
+        computed and is about to reach. The playhead is therefore a fixed
+        landmark and the data scrolls under it, rather than the reverse.
+
+        The alternative -- cursor on the frontier -- puts the reading position
+        hard against the right edge of every plot, where a burst is half drawn
+        and there is no lead-in at all. Trailing the frontier costs latency
+        equal to half the window and buys the context to see an event coming.
+        """
+        self._follow = "center"
+        self._update_frame((self.T - 1) // 2)
+
+    def set_channel_data(self, channel_data, live: bool = False) -> None:
+        """Replace the channels in place, keeping the tuning and the geometry.
+
+        ``live=True`` selects the 10 Hz path used by a streaming pass: it skips
+        the overlay re-percentile (see _rebuild_selected_views). Everything else
+        is shared, because everything else is per-frame and measured cheap
+        enough to run at that rate even on a whole clip (§24). The per-BLOCK
+        cube is NOT on this path -- it takes seconds, keeps running at its own
+        pace, and its density heatmap is drawn at the span it actually covers
+        with the remainder hatched.
+
+        This is the streaming counterpart to rebuilding the explorer from a
+        fresh ChannelData. A rebuild is right when the GEOMETRY moves (a
+        downsample or block change): the constructor re-derives the grid,
+        regions, block snap and cube budget together, which is far safer than
+        mutating them. It is wrong once a second on a live pass, because it
+        would discard the cube cache, reset the selected replicate to the
+        selection view, and swap the widget under the user's cursor.
+
+        So this deliberately refuses a geometry change rather than trying to
+        absorb one: same grid, same regions, same fps. What it does accept is a
+        new span -- different length, different ``window_start`` -- which is
+        exactly what a sliding trailing window is.
+
+        The frame cursor is carried by ABSOLUTE video frame, not by its index on
+        the T axis. Those differ the moment the window slides, and keeping the
+        index would walk the cursor backwards through the clip at the ring's
+        eviction rate while appearing to sit still.
+        """
+        meta = channel_data.meta
+        ny, nx = map(int, meta["grid"])
+        if (ny, nx) != (self.ny, self.nx):
+            raise ValueError(
+                f"set_channel_data cannot change the grid: {(ny, nx)} vs "
+                f"{(self.ny, self.nx)}; rebuild the explorer instead")
+        fps = float(meta["fps"])
+        if abs(fps - self.fps) > 1e-6:
+            raise ValueError(
+                f"set_channel_data cannot change fps ({fps} vs {self.fps}); "
+                f"self.freqs and every cached cube are derived from it")
+        chan = {k: np.asarray(v, np.float32)
+                for k, v in channel_data.channels.items()}
+        if "change" not in chan:
+            # self.T is read off it, and every scope/threshold path assumes it.
+            raise ValueError("set_channel_data needs the 'change' channel")
+
+        old_start = self.window_start
+        old_abs = old_start + self.frame
+        followed = self.frame >= self.T - 1      # was the cursor at the newest frame?
+
+        self._data_gen += 1
+        self._cd = channel_data
+        self.meta = meta
+        self.window_start = int(channel_data.window_start)
+        self._chan = chan
+        self._channels_bytes = sum(a.nbytes for a in self._chan.values())
+        self.T = self._chan["change"].shape[0]
+        # Every cube was transformed over the previous span. Keyed by (region,
+        # channel) only, so they cannot be told apart from current ones -- drop
+        # them wholesale rather than trying to salvage the overlapping frames.
+        # Cubes are RETAINED across the span change, each tagged with the span it
+        # was transformed over (_sg_span). Clearing them here was right when this
+        # was the only update path and wrong once the per-frame plots refresh
+        # faster than a cube builds: at 10 Hz against a multi-second transform,
+        # every cube would be discarded before it could ever be drawn and the
+        # density heatmaps would stay empty for the entire pass. _refresh_densities
+        # now places each cube at its true position and hatches the remainder.
+        self._density_dirty = set(CHANNELS)
+
+        # Where the cursor lands on the new span. An explicit follow mode wins:
+        # "center" is the live surface's reading position (see follow_center),
+        # and it has to be re-asserted on every window because the span slides
+        # under it. Otherwise the historical rule applies -- a cursor riding the
+        # newest frame keeps riding it, and anything else holds the absolute
+        # frame the user parked on, clamped if the window has slid past it.
+        if self._follow == "center":
+            frame = (self.T - 1) // 2
+        elif self._follow == "latest" or followed:
+            frame = self.T - 1
+        else:
+            frame = old_abs - self.window_start
+        self.frame = max(0, min(int(frame), self.T - 1))
+        self.sweep_win = max(1, min(max(1, self.T - 1), int(self.sweep_win)))
+        self.scrub.blockSignals(True)
+        self.scrub.setRange(0, max(0, self.T - 1))
+        self.scrub.setValue(self.frame)
+        self.scrub.blockSignals(False)
+        self.sweep_win_slider.blockSignals(True)
+        self.sweep_win_slider.setRange(1, max(2, self.T - 1))
+        self.sweep_win_slider.setValue(self.sweep_win)
+        self.sweep_win_slider.blockSignals(False)
+        # The slider's own handler is what normally writes this, and it was
+        # blocked above (a live update is not a user edit and must not re-enter
+        # _recompute_windowed_count before the new channels are in place).
+        self._sync_labels()
+        self._sync_info_label()
+        # A replan may have added or dropped a channel; keep each checkbox's
+        # enabled state and tooltip honest about what this window now carries.
+        self._sync_channel_checks()
+        self._rebuild_scalograms(rescale_overlay=not live)
+        self._redraw_video()
+
+    # -- view-state carry-over (survives a live re-extract rebuild) ----------
+    def capture_view_state(self) -> dict:
+        """The tuning context worth preserving when the live surface rebuilds this
+        explorer with a fresh ChannelData: which channel, where the cursor and
+        detection window are, and the frequency band you dragged.
+
+        The two detection threshold bands travel too: ``detection_params`` reads
+        the value band and the count band off live widgets, so omitting them here
+        silently reverted both to defaults on every rebuild (T17). Endpoints are
+        carried raw -- ``None`` means "never placed", which ``set_band_active``
+        seeds lazily; collapsing it to +/-inf here would turn "unset" into an
+        explicit unbounded threshold and defeat that seeding.
+        """
+        return {
+            "channel": self.channel,
+            "frame": self.frame,
+            "sweep_win": self.sweep_win,
+            "centered": self.centered,
+            "freq_band": (self.scalo_plot.band_lo, self.scalo_plot.band_hi),
+            # Per channel, not just the selected one: switching channels after a
+            # rebuild should not find the others wiped either.
+            "value_bands": {name: (dp.band_lo, dp.band_hi)
+                            for name, dp in self.density_plots.items()},
+            "count_band": (self.count_w_plot.band_lo, self.count_w_plot.band_hi),
+            # What the count band is implicitly denominated in. The band is a
+            # raw block count, so it only means what it meant on a grid of the
+            # same size; apply_view_state converts it when this differs.
+            # block_size says WHETHER the grid moved (a replicate switch changes
+            # the count for an unrelated reason and must not re-scale the
+            # threshold); region_blocks says BY HOW MUCH.
+            #
+            # region_index travels with them and is load-bearing. Replicate
+            # tiles are NOT uniform -- build_layout sizes each from its own frac
+            # box -- and the rebuilt explorer resets its selection, so measuring
+            # the new denominator against whatever is selected THERE would
+            # compare a large replicate's old count against region 0's new one
+            # and scale the threshold by the ratio of two different boxes.
+            "count_denom": {"block_size": self._resolved_block(),
+                            "region_index": self.active_region_index,
+                            "region_blocks": self._region_block_count(
+                                self.active_region_index)},
+        }
+
+    def _wire_tuning_changed(self) -> None:
+        """Relay every committed change to something ``capture_view_state``
+        reports. Wired here in one block rather than folded into each handler:
+        the set of persisted knobs is defined by that method, so the thing that
+        has to stay in step with it is one list, in one place.
+
+        Band plots are taken on ``band_committed`` only -- ``band_changed``
+        fires per mouse-move, and the persistence downstream is a file write.
+        """
+        srcs = [self.scalo_plot.band_committed,
+                self.count_w_plot.band_committed,
+                self.sweep_win_slider.valueChanged,
+                self.centered_chk.stateChanged,
+                self.region_combo.currentIndexChanged,
+                self.chan_group.buttonToggled]
+        srcs += [dp.band_committed for dp in self.density_plots.values()]
+        for sig in srcs:
+            # *_ because these signals carry assorted payloads (an index, a
+            # button, a check state) and none of them belong in the relay.
+            sig.connect(lambda *_: self.tuning_changed.emit())
+
+    def select_region(self, index: int) -> None:
+        """Focus a replicate by index, as clicking it in the video would.
+
+        Deliberately NOT part of apply_view_state: a rebuild resets the
+        selection on purpose (the grid may have moved under it), and this is
+        for the one case that is not a rebuild -- restoring the replicate a
+        remembered session was tuned against when the clip is reopened.
+        """
+        i = self.region_combo.findData(int(index))
+        if i >= 0:
+            self.region_combo.setCurrentIndex(i)
+
+    def reset_tuning(self) -> None:
+        """Every tuned detection parameter back to a freshly-built explorer's:
+        the three bands wide open, D at one second, centered.
+
+        The per-scope band memory goes with them. That cache exists so a
+        replicate switch does not discard a threshold, which is exactly what
+        would make it the one place a reset thresholds could survive -- reset,
+        then look at another replicate, and the old band reappears.
+
+        The selected channel and replicate are left alone: they say what you
+        are looking at, not what counts as a detection.
+        """
+        self._value_band_cache.clear()
+        self._count_band_cache.clear()
+        # None is "never placed", which set_band_active re-seeds wide open --
+        # the same lazy seeding a new explorer gets, rather than a hand-written
+        # +/-inf that would read as a threshold the user deliberately opened.
+        for pl in [self.scalo_plot, self.count_w_plot,
+                   *self.density_plots.values()]:
+            pl.band_lo = pl.band_hi = None
+        self.scalo_plot.set_band_active(True)
+        self.count_w_plot.set_band_active(True)
+        for name, dp in self.density_plots.items():
+            dp.set_band_active(name == self.channel)   # as _apply_selected_plot_ui
+            dp.update()
+        self.sweep_win = max(1, min(self.T - 1, int(round(self.fps))))
+        self.centered = True
+        # Both blocked: the recompute below covers them in one pass, where each
+        # left live would trigger its own O(F*T*B) re-sum on the way through.
+        self.sweep_win_slider.blockSignals(True)
+        self.sweep_win_slider.setValue(self.sweep_win)
+        self.sweep_win_slider.blockSignals(False)
+        self.centered_chk.blockSignals(True)
+        self.centered_chk.setChecked(True)
+        self.centered_chk.blockSignals(False)
+        self._sync_labels()
+        if self.active_region_index >= 0:
+            self._on_freq_band_committed()
+        self.tuning_changed.emit()
+
+    def detection_params(self) -> dict:
+        """The tuned detector settings, for the whole-video commit pass. Returns
+        the channel attribute, selected region, and the three bands + window so
+        the whole-clip pass reproduces exactly what this preview shows."""
+        dp = self._selected_density()
+        return {
+            "channel_attr": CHANNELS[self.channel][0],
+            "region_index": self.active_region_index,
+            "freq_band_hz": self.scalo_plot.band_hz(),
+            "value_band": dp.band() if dp is not None
+            else (float("-inf"), float("inf")),
+            "count_band": self.count_w_plot.band(),
+            "detect_window": self.sweep_win,
+            "centered": self.centered,
+        }
+
+    def _converted_count_band(self, st: dict):
+        """The captured count band, re-denominated onto THIS explorer's grid.
+
+        Returns ``(band, note)``; ``note`` is None when nothing was converted and
+        a human sentence otherwise. The note is not decoration -- a threshold
+        that silently changes value is the same class of surprise as one that
+        silently stops meaning what it meant, so the conversion has to be
+        visible even though it is the correct thing to do."""
+        cb = st.get("count_band")
+        if cb is None:
+            return None, None
+
+        def fmt(v):
+            return "unset" if v is None else ("inf" if not np.isfinite(v)
+                                              else f"{float(v):.3g}")
+
+        def band_txt(b):
+            return f"[{fmt(b[0])}, {fmt(b[1])}]"
+
+        den = st.get("count_denom") or {}
+        old_block = int(den.get("block_size") or 0)
+        old_blocks = int(den.get("region_blocks") or 0)
+        new_block = self._resolved_block()
+        # An unchanged grid (or one we cannot identify at all) leaves the band
+        # alone and says nothing: there is no re-denomination to report.
+        if not old_block or not new_block or old_block == new_block:
+            return cb, None
+        # The grid MOVED. From here the band is wrong unless it is converted,
+        # so every exit below either converts or warns -- returning it quietly
+        # is the one outcome this method exists to prevent.
+        #
+        # Denominate against the region the band was tuned on, not against
+        # whatever this explorer has selected: a rebuild resets the selection to
+        # none, and replicate tiles differ in size, so the two are not the same
+        # replicate and their block counts are not comparable.
+        #
+        # A NEGATIVE index is pooled scope, not a missing region, and it must
+        # take the same regions[0] fallback the capture side took: capture calls
+        # _region_block_count(-1), which falls back and records a real count, so
+        # rejecting -1 here would compare a usable denominator against nothing
+        # and warn "could not be re-scaled" about a conversion that was
+        # available. Only an index past the end is genuinely unresolvable.
+        idx = den.get("region_index")
+        new_blocks = (self._region_block_count(int(idx))
+                      if idx is not None and int(idx) < len(self.regions)
+                      else 0)
+        # A band with no finite endpoint carries no tuning, so neither branch
+        # below has anything to say about it.
+        if all(v is None or not np.isfinite(v) for v in cb):
+            return cb, None
+        if old_blocks <= 0 or new_blocks <= 0:
+            # The denominator is unknown: state captured before it was
+            # recorded, no regions, or a tuned region that no longer exists.
+            # Guessing a factor would be worse than leaving the number alone --
+            # the user can see an unchanged threshold and re-tune, but cannot
+            # see a wrong conversion -- so the band stands and the WARNING
+            # carries the whole load. Silence here is the one outcome that
+            # reproduces the original hazard.
+            return cb, (
+                f"block {old_block}→{new_block} changed the grid but the "
+                f"detection threshold {band_txt(cb)} could NOT be re-scaled "
+                f"(no comparable block count for the tuned replicate). It is "
+                f"still in {old_block}-block units and will not mean the same "
+                f"thing — re-tune it.")
+        conv = rescale_count_band(cb, old_blocks, new_blocks)
+        if tuple(conv) == tuple(cb):
+            return cb, None                     # same block count; nothing moved
+        return conv, (
+            f"block {old_block}→{new_block} re-scaled the detection "
+            f"threshold {band_txt(cb)} → {band_txt(conv)} "
+            f"({old_blocks}→{new_blocks} blocks in the tuned replicate)")
+
+    def apply_view_state(self, st: dict) -> str | None:
+        """Restore a captured view state onto this (freshly built) explorer.
+
+        Returns a note describing any conversion the restore had to perform, for
+        the caller to surface; None when the state transferred as-is."""
+        ch = st.get("channel")
+        # Selectable, not merely carried: restoring a view that detected on an
+        # on-demand channel this window has not computed yet must still select it
+        # (which fires _on_channel_toggled and, on a live host, the replan that
+        # computes it) rather than silently revert to whatever the pass carries.
+        if ch in self.chan_checks and self._channel_selectable(ch):
+            self.channel = ch
+            self.chan_checks[ch].setChecked(True)   # fires _on_channel_toggled
+        sw = st.get("sweep_win")
+        if sw:
+            self.sweep_win = max(1, min(max(2, self.T - 1), int(sw)))
+            self.sweep_win_slider.setValue(self.sweep_win)
+        if "centered" in st:
+            self.centered = bool(st["centered"])
+            self.centered_chk.setChecked(self.centered)
+        fb = st.get("freq_band")
+        if fb is not None:
+            self.scalo_plot.band_lo, self.scalo_plot.band_hi = fb
+            self.scalo_plot.set_band_active(True)
+            self.scalo_plot.update()
+        # Detection thresholds must land BEFORE the _on_freq_band_committed()
+        # below, or the recompute at the end of this method runs against the
+        # defaults these are here to replace.
+        for name, band in (st.get("value_bands") or {}).items():
+            dp = self.density_plots.get(name)
+            if dp is not None:
+                dp.band_lo, dp.band_hi = band
+                dp.update()
+        cb, note = self._converted_count_band(st)
+        if cb is not None:
+            self.count_w_plot.band_lo, self.count_w_plot.band_hi = cb
+            self.count_w_plot.set_band_active(True)
+            self.count_w_plot.update()
+        frame = st.get("frame")
+        if frame is not None:
+            self._apply_frame(int(frame))
+        if self.active_region_index >= 0:
+            self._on_freq_band_committed()
+        return note
+
     # -- scope / geometry ----------------------------------------------------
+    def _resolved_block(self) -> int:
+        """Working pixels per block for this source, 0 when unrecorded."""
+        try:
+            return int(self.meta.get("block_size") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _region_block_count(self, idx: int) -> int:
+        """Blocks in ONE region -- the denominator a count band is implicitly
+        expressed in. Region 0 stands in when no region is selected (the count
+        band is tuned against a single replicate, and in a packed atlas the
+        tiles are the same size), so the denominator survives being captured
+        from the selection view.
+
+        Taken from the atlas bbox rather than from ny*nx/len(regions), so a
+        source whose regions do not tile the grid exactly still reports the
+        count the detector actually sums over."""
+        if not self.regions:
+            return 0
+        r = self.regions[idx] if 0 <= idx < len(self.regions) else self.regions[0]
+        y0, x0, y1, x1 = r["atlas_bbox"]
+        return max(0, int(y1) - int(y0)) * max(0, int(x1) - int(x0))
+
     def _regions_for_index(self, idx: int) -> list[dict]:
         """The regions a scope index covers: all of them when pooled (<0)."""
         return self.regions if idx < 0 else [self.regions[idx]]
@@ -345,8 +1013,44 @@ class ScalogramExplorer(QWidget):
     def _active_regions(self) -> list[dict]:
         return self._regions_for_index(self.active_region_index)
 
+    def _channel_available(self, name: str) -> bool:
+        """Whether this source carries the channel behind display name ``name``
+        RIGHT NOW. On a live surface the running pass carries only the selected
+        channel (+ _ALWAYS_STREAM), so the others are absent until a replan; use
+        :meth:`_channel_selectable` to decide whether a checkbox may be ticked."""
+        return CHANNELS[name][0] in self._chan
+
+    def _channel_selectable(self, name: str) -> bool:
+        """Whether the channel behind display name ``name`` may be SELECTED --
+        either carried now, or producible on demand by a live host that will
+        replan the pass to compute it when it is checked. Only a channel that is
+        neither (nothing can ever produce it here) is a dead control."""
+        return self._channel_available(name) or CHANNELS[name][0] in self._on_demand
+
+    def _sync_channel_check(self, name: str) -> None:
+        """Set one channel checkbox's enabled state and tooltip from what the
+        source carries NOW. Re-run on every live update so the tooltip flips from
+        "check to compute it" to the plain build hint the moment a replan lands
+        that channel -- a selectable-but-absent channel is a promise the pass has
+        yet to keep, and saying so is the honest readout."""
+        cb = self.chan_checks[name]
+        cb.setEnabled(self._channel_selectable(name))
+        if self._channel_available(name):
+            cb.setToolTip(f"Detect on {name} (builds its cube on first check)")
+        elif self._channel_selectable(name):
+            cb.setToolTip(f"Detect on {name} — restarts the live pass to compute it")
+        else:
+            cb.setToolTip(f"{name} is not carried by this source")
+
+    def _sync_channel_checks(self) -> None:
+        for name in self.chan_checks:
+            self._sync_channel_check(name)
+
     def _chan_arr(self):
-        return self._chan[CHANNELS[self.channel][0]]
+        attr = CHANNELS[self.channel][0]
+        if attr not in self._chan:                     # defensive: absent channel
+            return np.zeros((self.T, self.ny, self.nx), np.float32)
+        return self._chan[attr]
 
     def _scope_blocks(self, arr: np.ndarray, idx: int) -> np.ndarray:
         """(T, B) block columns of ``arr`` over the regions of scope ``idx``,
@@ -372,8 +1076,20 @@ class ScalogramExplorer(QWidget):
 
     def _all_plots(self):
         return [self.trace_plot, self.scalo_plot, *self.density_plots.values(),
-                self.count_plot, self.count_w_plot, self.detect_plot,
-                self.clump_plot]
+                self.count_plot, self.count_w_plot, self.clump_plot]
+
+    def _value_axis_plots(self):
+        """Every plot whose Y axis is a data VALUE, i.e. everything except the
+        scalogram, whose Y is frequency. These are the ones the sticky axis
+        applies to; see the call in _build_ui."""
+        return [pl for pl in self._all_plots() if pl is not self.scalo_plot]
+
+    def _reset_sticky_ranges(self) -> None:
+        """Drop the accumulated value bounds. Called when the plots change what
+        they MEASURE -- another replicate, another channel -- never when they
+        merely receive the next window of the same thing."""
+        for pl in self._value_axis_plots():
+            pl.reset_sticky_range()
 
     # -- UI ------------------------------------------------------------------
     def _build_ui(self):
@@ -391,6 +1107,14 @@ class ScalogramExplorer(QWidget):
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self._toggle_play)
         trow.addWidget(self.play_btn)
+        # Embedded in the live surface the video is not a thing you start and
+        # stop: it loops over whatever span is currently held, running while the
+        # pass runs and continuing to loop while it is paused. There is one
+        # play/pause on this tab and it belongs to the pass, so the button goes
+        # and playback starts itself.
+        # (playback itself is started after the row is built, in __init__ --
+        # _toggle_play writes the rate label, which does not exist yet here.)
+        self.play_btn.setVisible(self._own_shortcuts)
         self.scrub = QSlider(Qt.Orientation.Horizontal)
         self.scrub.setRange(0, self.T - 1)
         self.scrub.setValue(self.frame)
@@ -399,6 +1123,19 @@ class ScalogramExplorer(QWidget):
         self.time_lbl = QLabel("0.00 s")
         self.time_lbl.setMinimumWidth(120)
         trow.addWidget(self.time_lbl)
+        self.rate_lbl = QLabel("")
+        self.rate_lbl.setMinimumWidth(112)
+        self.rate_lbl.setToolTip(
+            "Achieved playback rate against realtime, measured over the last "
+            "~1 s of frames: 1.00x means the panel is keeping up with the "
+            "clip's own frame rate.\n\n"
+            "It CANNOT read above ~1.00x — playback is driven by a timer at "
+            "the clip's fps, so this measures whether the per-frame work "
+            "(decode, channel overlay, in-band highlight, every expanded plot) "
+            "fits in one frame's budget, not how fast it could go unthrottled.")
+        self.rate_lbl.setStyleSheet(
+            "font-family:Consolas; font-size:11px; color:#777;")
+        trow.addWidget(self.rate_lbl)
         left.addLayout(trow)
 
         rrow = QHBoxLayout()
@@ -447,12 +1184,13 @@ class ScalogramExplorer(QWidget):
         note.setStyleSheet("color:#8ab; padding-top:4px;")
         left.addWidget(note)
 
-        info = QLabel(f"cache: {self.meta.get('backend','?')} | fps "
-                      f"{self.fps:.2f} | {self.T} frames | scalogram "
-                      f"{self.freqs[0]:.2f}-{self.freqs[-1]:.2f} Hz, "
-                      f"{len(self.freqs)} scales")
-        info.setStyleSheet("color:#888;")
-        left.addWidget(info)
+        # Held rather than dropped after construction: the frame count in it is
+        # replaced by set_channel_data, and a live surface would otherwise keep
+        # reporting the length of the first window it ever showed.
+        self._info_lbl = QLabel("")
+        self._info_lbl.setStyleSheet("color:#888;")
+        self._sync_info_label()
+        left.addWidget(self._info_lbl)
         # Persistent activity/memory line. Everything heavy on this explorer is
         # either off-thread (the cube worker) or a blocking O(F*T*B) / O(T)
         # GUI-thread pass; this line names the current step and reports retained
@@ -463,7 +1201,8 @@ class ScalogramExplorer(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse)
         self._status_lbl.setStyleSheet(
             "color:#e0a94a; font-family:Consolas; font-size:11px;")
-        left.addWidget(self._status_lbl)
+        if self._own_status:
+            left.addWidget(self._status_lbl)
         root.addLayout(left, 3)
 
         scroll = QScrollArea()
@@ -485,7 +1224,7 @@ class ScalogramExplorer(QWidget):
         col.addWidget(self.trace_plot)
 
         self.scalo_plot = ScalogramPlot("scalogram (drag frequency band)",
-                                        self.freqs)
+                                        self.freqs, self.fps)
         self.scalo_plot.seek_requested.connect(self._seek)
         # band_changed fires on every mouse-move; the band-power re-sum is an
         # O(F*T*B) pass per cached channel, so debounce it and recompute eagerly
@@ -511,10 +1250,10 @@ class ScalogramExplorer(QWidget):
         for r, name in enumerate(CHANNELS):
             cb = QCheckBox()
             cb.setProperty("channel", name)
-            cb.setToolTip(f"Detect on {name} (builds its cube on first check)")
-            cb.setChecked(name == self.channel)
+            cb.setChecked(self._channel_available(name) and name == self.channel)
             self.chan_group.addButton(cb)
             self.chan_checks[name] = cb
+            self._sync_channel_check(name)
             grid.addWidget(cb, r, 0, Qt.AlignmentFlag.AlignCenter)
             dp = DensityPlot(name)
             dp.set_log_axis(True)
@@ -522,17 +1261,25 @@ class ScalogramExplorer(QWidget):
             dp.band_changed.connect(partial(self._on_density_band_changed, name))
             dp.band_committed.connect(
                 partial(self._on_density_band_committed, name))
+            dp.collapse_toggled.connect(partial(self._on_density_toggled, name))
             self.density_plots[name] = dp
             grid.addWidget(dp, r, 1)
         col.addWidget(grid_w)
         self.chan_group.buttonToggled.connect(self._on_channel_toggled)
 
         section("Detection sweep (selected channel)")
-        self.count_plot = PixelBarPlot("# blocks in band", unit="blocks",
-                                       color=SWEEP_C)
-        self.count_plot.seek_requested.connect(self._seek)
-        col.addWidget(self.count_plot)
-        self.count_w_plot = MiniPlot("windowed # blocks in band (mean over D)",
+        # T15: the detection gate is shaded onto this plot rather than drawn as
+        # a separate 0/1 trace. The gate is read against THIS plot's band, so
+        # the threshold and its consequence now share one set of axes; a
+        # separate plot forced the eye to correlate two x-axes to see whether a
+        # handle drag had done anything.
+        #
+        # It leads the sweep section, above the raw per-frame count, because it
+        # is the one carrying a live control: the permanent readouts are what
+        # the eye should land on first, and the raw count is the diagnostic you
+        # drop to when the windowed trace looks wrong.
+        self.count_w_plot = MiniPlot("windowed # blocks in band (mean over D)"
+                                     " -- green = positive detection",
                                      "blocks", SWEEP_C)
         self.count_w_plot.seek_requested.connect(self._seek)
         self.count_w_plot.set_band_active(True)
@@ -540,10 +1287,21 @@ class ScalogramExplorer(QWidget):
         self.count_w_plot.band_changed.connect(self._recompute_detect)
         self.count_w_plot.band_committed.connect(self._recompute_detect)
         col.addWidget(self.count_w_plot)
-        self.detect_plot = MiniPlot("positive detection (windowed count in band)",
-                                    "0/1", DETECT_C)
-        self.detect_plot.seek_requested.connect(self._seek)
-        col.addWidget(self.detect_plot)
+        # A band that carried over from another replicate can be correct and
+        # still land nowhere near this replicate's data, which reads as "the
+        # detector broke" rather than "your threshold is off-scale here". Same
+        # class of surprise _converted_count_band exists to prevent, so it gets
+        # the same treatment: say it out loud. Empty (and hidden) when nothing
+        # is wrong, so it never becomes furniture the eye learns to skip.
+        self.band_note = QLabel("")
+        self.band_note.setWordWrap(True)
+        self.band_note.setStyleSheet("color:#d0a050; font-size:11px;")
+        self.band_note.setVisible(False)
+        col.addWidget(self.band_note)
+        self.count_plot = PixelBarPlot("# blocks in band", unit="blocks",
+                                       color=SWEEP_C)
+        self.count_plot.seek_requested.connect(self._seek)
+        col.addWidget(self.count_plot)
         self.clump_plot = PixelBarPlot("largest connected clump in band",
                                        unit="blocks", color=SWEEP_C)
         self.clump_plot.seek_requested.connect(self._seek)
@@ -553,6 +1311,58 @@ class ScalogramExplorer(QWidget):
         scroll.setWidget(holder)
         scroll.setMinimumWidth(480)
         root.addWidget(scroll, 2)
+
+        # T14/T10: every plot gets a [+] header and starts collapsed. At block=1
+        # with weak downsampling the plots -- not the extraction -- are the main
+        # source of lag, so the panel opens costing nothing and the user pays
+        # only for the readouts they expand.
+        for pl in self._all_plots():
+            pl.set_collapsible(True)
+            pl.set_collapsed(True)
+            pl.collapse_toggled.connect(self._on_plot_expanded)
+        for dp in self.density_plots.values():
+            dp.set_auto_collapse_empty(True)
+        # T27: the sweep plots drew the same empty black slab T13 removed from
+        # the heatmaps -- visible on open and whenever no replicate is selected.
+        for pl in (self.count_plot, self.count_w_plot, self.clump_plot):
+            pl.set_auto_collapse_empty(True)
+        # Three readouts are PERMANENT: not collapsed by default, and with no
+        # [+] to collapse them at all. They are the panel's three axes of
+        # control -- the frequency band is dragged on the scalogram, the value
+        # band on the selected channel's heatmap, the detection threshold on
+        # the windowed count -- and each is also where you read what the drag
+        # did. A toggle that hides a live control is a way to make the panel
+        # look broken, so the toggle is removed rather than merely defaulted
+        # open. The selected-channel heatmap is handled in
+        # _apply_selected_plot_ui, since which plot it is changes at runtime.
+        #
+        # Auto-collapse-empty still applies to the windowed count (T27): with
+        # no series there is nothing to tune against, and it reopens itself
+        # when data arrives. That is data-driven, not a control the user can
+        # lose. The scalogram takes no auto-collapse -- see _rebuild_selected_views.
+        for pl in (self.scalo_plot, self.count_w_plot):
+            pl.set_collapsible(False)
+            pl.set_collapsed(False)
+        # Sticky value axes on everything whose Y is a VALUE. A live pass
+        # replaces the series ~10x a second, and a per-window autoscale then
+        # rescales every one of these continuously as the trailing window slides
+        # -- so a burst two windows ago silently redefines what "high" means,
+        # and a band handle placed against the axis drifts in pixels while the
+        # threshold behind it has not moved. Accumulating instead means the axis
+        # settles as the run covers the clip's range. The scalogram is excluded:
+        # its Y is log FREQUENCY, fixed by the transform, not a data range.
+        #
+        # The windowed count is the ONE exception, and deliberately: accumulating
+        # here pins its axis to the loudest burst the whole run ever saw, so a
+        # quiet current window reads as a flat line crushed against the floor and
+        # the thing this plot exists to show -- how the window's count sits versus
+        # its threshold -- is unreadable. So it autoscales to the current window
+        # instead, and _widen_for_band keeps the count band on the axis so the
+        # threshold handle stays put at its true value rather than sliding off the
+        # top when the window goes quiet (set_include_band_in_range).
+        for pl in self._value_axis_plots():
+            pl.set_sticky_range(pl is not self.count_w_plot)
+        self.count_w_plot.set_include_band_in_range(True)
 
         self._apply_selected_plot_ui()
         self._sync_labels()
@@ -573,11 +1383,68 @@ class ScalogramExplorer(QWidget):
 
     def _apply_selected_plot_ui(self):
         """Expand + activate the value band on the selected channel's density;
-        collapse and deactivate the rest (their matrices stay visible)."""
+        deactivate the rest (their matrices stay visible).
+
+        The selected plot OPENS uncollapsed, because it carries the value band
+        that defines the detection -- but it keeps its [+]. Batch N made it
+        permanent (no toggle at all) on the grounds that a toggle hiding a live
+        control makes the panel look broken; defaulting it open already carries
+        that, and removing the toggle outright also removed the only way to ask
+        "is this plot what is costing me 3x during playback?". The A/B is worth
+        more than the last increment of protection, and it is safe to offer
+        precisely because _refresh_densities exempts the selected channel by
+        NAME, not by collapse state: collapsing it stops the drawing and cannot
+        stop the detector. Hiding it hides the control, never the computation.
+
+        The selected plot is exempt from T13's auto-collapse-empty as well, and
+        that is not the same call as the [+]. Auto-collapse fires exactly when
+        the cube is not built -- i.e. for the whole build after every channel
+        switch, the moment the user just asked to look at this channel. An
+        empty pane costs one black slab; a vanished pane costs the value band
+        that defines the detection, and takes it away at the least defensible
+        moment.
+
+        Deselecting restores the toggle, the empty-collapse, and the user's OWN
+        collapse state -- not the open state the selection imposed. A plot the
+        user opened with [+] stays open; one that was only open because it was
+        selected closes again. Leaving it open instead is not a harmless
+        courtesy: _refresh_densities keys off is_collapsed(), so every channel
+        ever visited would stay in `wanted` and be re-summed on every band
+        drag."""
         for name, dp in self.density_plots.items():
             sel = (name == self.channel)
             dp.set_band_active(sel)
             dp.set_expanded(sel)
+            dp.set_collapsible(True)
+            dp.set_auto_collapse_empty(not sel)
+            dp.set_collapsed(name in self._density_user_collapsed if sel
+                             else name not in self._density_user_open)
+
+    def _on_density_toggled(self, name: str, expanded: bool) -> None:
+        """Record a real [+]/[-] click so deselection can restore it. Only the
+        user's own intent lands here; the forced open/close in
+        _apply_selected_plot_ui goes through set_collapsed, which emits
+        nothing.
+
+        Both sets are written on every click regardless of which plot is
+        selected, so the record stays correct across a selection that moves
+        afterwards -- a plot collapsed while selected must still read as
+        collapsed if it is reselected later, and as closed (its default) if it
+        is merely deselected."""
+        if expanded:
+            self._density_user_open.add(name)
+            self._density_user_collapsed.discard(name)
+        else:
+            self._density_user_open.discard(name)
+            self._density_user_collapsed.add(name)
+
+    def _on_plot_expanded(self, expanded: bool):
+        """A plot the user just opened may have been skipped while collapsed.
+        Fill in whatever was deferred; collapsing needs no work."""
+        if not expanded:
+            return
+        if self._density_dirty:
+            self._refresh_densities()
 
     def _sync_labels(self):
         self.sweep_win_lbl.setText(
@@ -588,21 +1455,35 @@ class ScalogramExplorer(QWidget):
     def _band_indices(self) -> tuple[int, int]:
         """[i, j) slice on the sorted frequency axis for the current band."""
         flo, fhi = self.scalo_plot.band_hz()
-        i = int(np.searchsorted(self.freqs, flo, "left"))
-        j = int(np.searchsorted(self.freqs, fhi, "right"))
-        if j <= i:                              # empty band: snap to nearest scale
-            i = int(np.argmin(np.abs(self.freqs - flo)))
-            j = i + 1
-        return i, j
+        return band_indices(self.freqs, flo, fhi)
 
     def _refresh_densities(self):
         """Re-sum every CACHED channel cube over the current frequency band into
         its density heatmap; blank the channels whose cube isn't built (or was
         evicted) so the display never shows stale band power."""
         if self.active_region_index < 0:
+            self.band_note.setVisible(False)
             return
         i, j = self._band_indices()
-        n_cached = sum(1 for name in self.density_plots
+        # The sum is O(F*T*B) per cube and is the expensive half of this
+        # refresh, so a collapsed plot skips it outright rather than computing
+        # a matrix nothing will draw. The name is remembered instead, and
+        # _on_plot_expanded re-enters here when the user opens it.
+        #
+        # THE SELECTED CHANNEL IS EXEMPT, and that exemption is load-bearing.
+        # Its matrix is not a picture -- _recompute_counts and _recompute_clump
+        # read it as the DETECTOR'S INPUT. Skipping it because it is collapsed
+        # empties the whole detection sweep while the cube sits built in the
+        # cache: a silent false negative, and a deadlock besides, since an
+        # empty matrix re-arms the auto-collapse that caused it. Visibility
+        # decides what is drawn; it must never decide what is computed.
+        wanted = [n for n, dp in self.density_plots.items()
+                  if n == self.channel or not dp.is_collapsed()]
+        self._density_dirty = {
+            n for n in self.density_plots
+            if n not in wanted
+            and self._sg_cache.get((self.active_region_index, n)) is not None}
+        n_cached = sum(1 for name in wanted
                        if self._sg_cache.get((self.active_region_index, name))
                        is not None)
         if n_cached:
@@ -610,27 +1491,86 @@ class ScalogramExplorer(QWidget):
                             f"{'s' if n_cached > 1 else ''})…", paint=True)
         empty = np.zeros((0, 0), np.float32)
         for name, dp in self.density_plots.items():
-            cube = self._sg_cache.get((self.active_region_index, name))
-            dp.set_matrix(cube[i:j].sum(axis=0) if cube is not None else empty)
+            if name not in wanted:
+                continue
+            key = (self.active_region_index, name)
+            cube = self._sg_cache.get(key)
+            if cube is None:
+                dp.set_matrix(empty)
+                continue
+            # Place the cube on the CURRENT span's axis. A cube may have been
+            # transformed over an older, shorter span -- that is the normal case
+            # on a live pass, where the per-frame plots refresh at 10 Hz and this
+            # takes seconds -- and drawing it edge to edge would misalign every
+            # column against the plots stacked above it.
+            c_start, c_T = self._sg_span.get(key,
+                                             (self.window_start, cube.shape[1]))
+            mat = cube[i:j].sum(axis=0)                  # (T_cube, B)
+            # Intersect the cube's absolute span with the current one. The
+            # offset can go NEGATIVE -- the ring drops oldest frames, so
+            # window_start advances past the start of a cube built earlier -- and
+            # clamping it to 0 would slide the whole matrix forward, drawing old
+            # data over newer frames. Trim to the overlap instead.
+            lo = max(0, self.window_start - c_start)
+            hi = min(c_T, self.window_start + self.T - c_start)
+            if hi <= lo:
+                dp.set_matrix(empty)         # cube is entirely off the axis now
+                continue
+            dp.set_matrix(mat[lo:hi],
+                          axis_off=(c_start + lo) - self.window_start,
+                          axis_total=self.T)
+        # The off-range check needs a MATRIX, and cubes arrive asynchronously --
+        # at region-change time every matrix is still (0,0), so checking there
+        # silently never fires. This is the one funnel every matrix lands in
+        # (region switch, channel toggle, cube ready, plot expand, frequency
+        # band), so the warning tracks the data instead of racing it.
+        self._sync_band_note()
 
     # -- scalogram computation ----------------------------------------------
-    def _rebuild_selected_views(self):
+    def _rebuild_selected_views(self, rescale_overlay: bool = True):
         """Cheap per-frame views of the selected channel (no cube needed): the
-        replicate-mean trace and the pooled-mean scalogram + overlay scale."""
+        replicate-mean trace and the pooled-mean scalogram + overlay scale.
+
+        Everything here is per-FRAME, and measured cheap enough to run at 10 Hz
+        on a live pass even at whole-clip length (FINDINGS §24): the pooled mean
+        is ~3 ms at T=30k, B=377 and the pooled Morlet ~8 ms. The Morlet looks
+        like the expensive call and is not -- it transforms one (T,) series,
+        carrying none of the B factor that makes the per-BLOCK cube take
+        seconds.
+
+        ``rescale_overlay=False`` is what makes that budget hold: see below.
+        """
         arr = self._chan_arr()
         blocks = self._scope_blocks(arr, self.active_region_index)   # (T, B)
         pooled = blocks.mean(axis=1)
         self.trace_plot.set_series(pooled)
         self.trace_plot.set_cursor(self.frame)
+        # The pooled Morlet transform is the one unconditional per-rebuild cost
+        # here. It used to be skipped while the scalogram was collapsed; the
+        # scalogram is now permanent (see _build_ui), so the transform runs on
+        # every rebuild and there is no deferred-build state to represent.
         self._set_phase("transforming pooled scalogram…", paint=True)
-        self.scalo_plot.set_scalogram(morlet_power(pooled, self.fps, self.freqs))
+        self.scalo_plot.set_scalogram(
+            morlet_power(pooled, self.fps, self.freqs))
         self.scalo_plot.set_cursor(self.frame)
         # Overlay color scale is a whole-clip percentile of this channel/scope;
         # freeze it here so scrubbing (which redraws every frame) never
         # re-percentiles the array in the hot path.
-        self._ov_scale = max(float(np.percentile(blocks, 99)), EPS)
+        #
+        # A live pass skips it, because a 10 Hz caller re-percentiles 10x/sec and
+        # reintroduces exactly what the line above avoids: it is a full sort of
+        # T*B floats and measured 53 ms at T=30k, B=377 -- on its own more than
+        # three times the rest of this method (§24). Holding it steady is also
+        # the better picture. A normalization that drifts every tick makes the
+        # same channel non-comparable by eye across time, which is the argument
+        # that refused Batch G's zoom margin (§19): same-looking pixels must mean
+        # the same value or the overlay is decoration. It is refreshed on the
+        # slow cadence instead, alongside the cube.
+        if rescale_overlay or not self._ov_scale_set:
+            self._ov_scale = max(float(np.percentile(blocks, 99)), EPS)
+            self._ov_scale_set = True
 
-    def _rebuild_scalograms(self):
+    def _rebuild_scalograms(self, rescale_overlay: bool = True):
         """React to a replicate or channel change: refresh the cheap views, then
         serve the selected channel's per-block cube from the memo cache or a
         background build. Other channels' densities fill in only if their cube is
@@ -651,26 +1591,49 @@ class ScalogramExplorer(QWidget):
             return
 
         self._block_snap = self._make_snap(self.active_region_index)
-        self._rebuild_selected_views()
+        self._rebuild_selected_views(rescale_overlay=rescale_overlay)
         self._apply_selected_plot_ui()
         self._refresh_densities()
         self._recompute_sweep()
-        # Build the selected channel's cube if it isn't cached yet.
-        if self._sg_cache.get((self.active_region_index, self.channel)) is None:
+        # Build the selected channel's cube unless the cached one already covers
+        # the span on screen (see _cube_is_current -- "cached" is not the same
+        # question once cubes outlive their span).
+        key = (self.active_region_index, self.channel)
+        if not self._cube_is_current(key):
             self._request_cube()
         else:
-            self._sg_cache.move_to_end((self.active_region_index, self.channel))
+            self._sg_cache.move_to_end(key)
             self._set_busy(False)
 
+    def _cube_is_current(self, key) -> bool:
+        """Whether the cached cube for ``key`` covers the span now on screen.
+
+        "Cached" stopped being the same question as "current" when cubes began
+        outliving their span. Treating the two as one means that on a live pass
+        the FIRST cube is the only one ever built -- it is present, so every
+        later request returns early -- and the density heatmap freezes at the
+        opening window behind a hatch that grows for the rest of the clip. That
+        failure looks like slow progress rather than a stuck cache, which is why
+        it is worth a named predicate.
+
+        A static explorer never moves its span, so this stays true and nothing
+        rebuilds; a live one falls through to a fresh build on every tick, with
+        the in-flight check in _request_cube serialising them.
+        """
+        if self._sg_cache.get(key) is None:
+            return False
+        return self._sg_span.get(key) == (self.window_start, self.T)
+
     def _request_cube(self):
-        """Build the SELECTED channel's cube unless it is already cached or a
-        build is in flight. Only the selected channel is ever built (lazy): the
-        running worker re-checks the current selection when it ends, so a rapid
-        channel/region switch coalesces onto the latest target."""
+        """Build the SELECTED channel's cube unless the cached one already
+        covers the current span, or a build is in flight. Only the selected
+        channel is ever built (lazy): the running worker re-checks the current
+        selection when it ends, so a rapid channel/region switch coalesces onto
+        the latest target."""
         if self.active_region_index < 0 or self._worker is not None:
             return
         key = (self.active_region_index, self.channel)
-        if self._sg_cache.get(key) is not None:
+        if self._cube_is_current(key):
             return
         self._launch_worker(key)
 
@@ -687,6 +1650,8 @@ class ScalogramExplorer(QWidget):
         self._set_phase(f"building scalogram · {channel} · "
                         f"{len(self.freqs)}×{self.T}×{b} (~{self._fmt_bytes(est)})…",
                         paint=True)
+        self._cube_gen = self._data_gen
+        self._cube_span = (self.window_start, self.T)
         self._worker = _ScalogramWorker(key, blocks, self.fps, self.freqs, self)
         self._worker.done.connect(self._on_cube_ready)
         # Free the finished thread (and its private (T, B) blocks copy) instead
@@ -696,11 +1661,45 @@ class ScalogramExplorer(QWidget):
         self._worker.start()
 
     def _on_cube_ready(self, key, cube):
+        stale = self._cube_gen != self._data_gen
+        # Kept either way, tagged with the span it was actually transformed over.
+        # It used to be DROPPED when stale, on the reasoning that a cube whose T
+        # axis belongs to a gone window would be served as current. That reasoning
+        # was right about the hazard and wrong about the remedy: on a live pass
+        # the channels are replaced far faster than a cube builds, so every cube
+        # was stale on arrival and the densities stayed empty for the whole run.
+        # Recording the span lets DensityPlot draw it in its true position with
+        # the uncovered remainder hatched, which answers the same hazard without
+        # throwing away seconds of completed work.
         self._sg_cache[key] = cube
+        self._sg_span[key] = self._cube_span
         self._sg_cache.move_to_end(key)
         self._worker = None
         region_idx, channel = key
         self._evict_cache(protect=(self.active_region_index, self.channel))
+        if stale:
+            # Show what just landed, then start the next one against the current
+            # span. Without the refresh the newly cached cube waits for some
+            # other event to draw it.
+            #
+            # The sweep and the overlay refresh here too, exactly as on the
+            # non-stale path below. The selected channel's density matrix is the
+            # DETECTOR'S input (see _refresh_densities), so updating the heatmap
+            # without them leaves the detection readout reading an older cube.
+            # A live pass takes this branch for every cube, and while
+            # set_channel_data would recompute the sweep within 100 ms anyway,
+            # that masking is incidental -- it disappears the moment the fast
+            # path is slowed or gated, and then the asymmetry is a silent stale
+            # detector rather than a visible lag.
+            self._refresh_densities()
+            if region_idx == self.active_region_index and \
+                    channel == self.channel:
+                self._recompute_sweep()
+                self._redraw_video()
+            self._request_cube()
+            if self._worker is None:
+                self._set_busy(False)
+            return
         if region_idx == self.active_region_index and region_idx >= 0:
             # Fold the new cube into its channel's density (and, if it is the
             # selected one, the sweep + overlay).
@@ -723,6 +1722,9 @@ class ScalogramExplorer(QWidget):
             if k == protect:
                 continue
             total -= self._sg_cache.pop(k).nbytes
+            # The span dict is keyed the same way and would otherwise retain an
+            # entry for every cube ever evicted.
+            self._sg_span.pop(k, None)
 
     # -- status line ---------------------------------------------------------
     @staticmethod
@@ -748,9 +1750,21 @@ class ScalogramExplorer(QWidget):
             f, t, b = cube.shape
             parts.append(f"cube {f}×{t}×{b} ({self._fmt_bytes(cube.nbytes)})")
         parts.append(f"channels {self._fmt_bytes(self._channels_bytes)}")
-        flo, fhi = self.scalo_plot.band_hz()
-        parts.append(f"band {flo:.2f}–{fhi:.2f} Hz")
-        self._status_lbl.setText("   ·   ".join(parts))
+        # The frequency band is deliberately absent: ScalogramPlot already draws
+        # it in its own title, right above the handles you drag to set it.
+        text = "   ·   ".join(parts)
+        self._status_lbl.setText(text)
+        if self._status_relay is not None:
+            self._status_relay.setText(text)
+
+    def set_status_relay(self, label) -> None:
+        """Mirror the status line into a host-supplied QLabel (the live surface's
+        top strip). The direct reference matters: ``_set_phase(paint=True)`` force-
+        repaints this label so a 'computing…' phase shows *during* the blocking
+        GUI-thread step, which a queued signal could not do. Pushes the current
+        text immediately so the host is not blank until the next state change."""
+        self._status_relay = label
+        self._update_status()
 
     def _set_phase(self, phase: str, *, paint: bool = False) -> None:
         """Set the current-activity string and refresh the line. ``paint=True``
@@ -758,8 +1772,15 @@ class ScalogramExplorer(QWidget):
         GUI-thread step so the label shows the step *while* it stalls."""
         self._phase = phase
         self._update_status()
-        if paint and hasattr(self, "_status_lbl"):
-            self._status_lbl.repaint()
+        if paint:
+            # Force a synchronous repaint of whichever label is actually visible so
+            # the phase shows *while* the blocking step that follows stalls the
+            # event loop. The relay (when hosted) is the one on screen.
+            target = self._status_relay
+            if target is None and hasattr(self, "_status_lbl"):
+                target = self._status_lbl
+            if target is not None:
+                target.repaint()
 
     def _settle_phase(self):
         """Return the line to a resting state -- but never stomp a build that is
@@ -777,6 +1798,13 @@ class ScalogramExplorer(QWidget):
             self._settle_phase()
 
     def closeEvent(self, e):
+        # Before the source is released below. The timer is a child and dies
+        # with the widget, but deleteLater needs an event-loop turn, and hosted
+        # playback runs continuously -- so without this a tick can land on a
+        # released VideoSource in the gap. A live pass closes an explorer on
+        # every restart, so that gap is entered routinely.
+        self.playing = False
+        self._timer.stop()
         if self._event_filter_app is not None:
             self._event_filter_app.removeEventFilter(self)
             self._event_filter_app = None
@@ -811,17 +1839,9 @@ class ScalogramExplorer(QWidget):
         return self.density_plots.get(self.channel)
 
     def _window_bounds(self, W):
-        """Prefix-sum bounds per frame for the detection window D; centered or
-        trailing per the checkbox. Windows truncate at the clip edges; neff keeps
-        the means honest there."""
-        t = np.arange(self.T)
-        if self.centered:
-            lo = np.maximum(0, t - W // 2)
-            hi = np.minimum(self.T, t + (W - W // 2))
-        else:
-            hi = t + 1
-            lo = np.maximum(0, hi - W)
-        return hi, lo, (hi - lo).astype(np.float32)
+        """Prefix-sum bounds per frame for the detection window D (shared with the
+        whole-video pass so the two agree)."""
+        return window_bounds(self.T, W, self.centered)
 
     def _recompute_sweep(self):
         self._recompute_counts()
@@ -834,12 +1854,12 @@ class ScalogramExplorer(QWidget):
         dp = self._selected_density()
         m = dp.matrix if dp is not None else None
         if m is None or m.size == 0:
-            for pl in (self.count_plot, self.count_w_plot, self.detect_plot):
+            for pl in (self.count_plot, self.count_w_plot):
                 pl.set_series(np.zeros(0, np.float32))
+            self._set_detect(np.zeros(0, np.float32))
             return
         lo, hi = dp.band()
-        inband = (m >= lo) & (m <= hi) & np.isfinite(m)
-        count = inband.sum(axis=1).astype(np.float32)
+        count = inband_count(m, lo, hi)
         self.count_plot.set_series(count)
         self.count_plot.set_cursor(self.frame)
         self._recompute_windowed_count(count)
@@ -852,12 +1872,7 @@ class ScalogramExplorer(QWidget):
             self.count_w_plot.set_series(np.zeros(0, np.float32))
             self._recompute_detect()
             return
-        if self.sweep_win <= 1:
-            windowed = count.astype(np.float32)
-        else:
-            c = np.concatenate([[0.0], np.cumsum(count, dtype=np.float64)])
-            hi, lo, neff = self._window_bounds(self.sweep_win)
-            windowed = ((c[hi] - c[lo]) / neff).astype(np.float32)
+        windowed = windowed_mean(count, self.sweep_win, self.centered)
         self.count_w_plot.set_series(windowed)
         self.count_w_plot.set_cursor(self.frame)
         self._recompute_detect()
@@ -865,10 +1880,25 @@ class ScalogramExplorer(QWidget):
     def _recompute_detect(self):
         blo, bhi = self.count_w_plot.band()
         y = self.count_w_plot.y
-        self.detect_plot.set_series(
-            ((y >= blo) & (y <= bhi)).astype(np.float32) if y.size
-            else np.zeros(0, np.float32))
-        self.detect_plot.set_cursor(self.frame)
+        self._set_detect(detect_gate(y, blo, bhi) if y.size
+                         else np.zeros(0, np.float32))
+
+    def _set_detect(self, gate: np.ndarray) -> None:
+        """Publish the detection gate to its two consumers.
+
+        The gate is computed unconditionally, whatever is collapsed or hidden --
+        it is a detection quantity, and per Batch D visibility decides what is
+        drawn, never what is computed. Both consumers here are pictures of it.
+        """
+        self.detect = np.asarray(gate, np.float32)
+        self.count_w_plot.set_detect_mask(self.detect > 0)
+        self._sync_detect_badge()
+
+    def _sync_detect_badge(self) -> None:
+        """T16: the DETECTED badge tracks the gate at the current frame."""
+        d = self.detect
+        on = bool(d.size and 0 <= self.frame < d.size and d[self.frame] > 0)
+        self.video_view.set_detected(on)
 
     def _recompute_clump(self):
         """Largest connected in-band clump per frame for the selected channel
@@ -889,18 +1919,7 @@ class ScalogramExplorer(QWidget):
         lo, hi = dp.band()
         self._set_phase(f"computing connected clumps ({m.shape[0]} frames)…",
                         paint=True)
-        largest = np.zeros(m.shape[0], np.float32)
-        for t in range(m.shape[0]):
-            cols = m[t]
-            passing = (cols >= lo) & (cols <= hi) & np.isfinite(cols)
-            if not passing.any():
-                continue
-            grid = np.zeros((dy, dx), np.uint8)
-            grid[gy, gx] = passing.astype(np.uint8)
-            n_lab, _, stats, _ = cv2.connectedComponentsWithStats(
-                grid, connectivity=8)
-            if n_lab > 1:
-                largest[t] = float(stats[1:, cv2.CC_STAT_AREA].max())
+        largest = largest_clump_per_frame(m, lo, hi, dy, dx, gy, gx)
         self.clump_plot.set_series(largest)
         self.clump_plot.set_cursor(self.frame)
 
@@ -913,7 +1932,7 @@ class ScalogramExplorer(QWidget):
         if self.state is not None:
             bgr = self.state.display_frame(self.frame, focus_frac=focus)
         elif self.source is not None:
-            bgr = self.source.frame_at(self.frame)
+            bgr = self.source.frame_at(self.window_start + self.frame)
             if bgr is not None and focus is not None:
                 h, w = bgr.shape[:2]
                 x0, y0, x1, y1 = focus
@@ -935,6 +1954,22 @@ class ScalogramExplorer(QWidget):
             bgr = cv2.resize(bgr, (DISPLAY_MAX_W, max(1, int(round(h * s)))),
                              interpolation=cv2.INTER_AREA)
         return np.ascontiguousarray(bgr)
+
+    def _tint(self, shape) -> np.ndarray:
+        """The flat green layer the in-band highlight blends toward.
+
+        It is a constant, but it was being re-allocated per region per frame by
+        ``np.zeros_like(roi)`` -- a full display-resolution uint8 image built
+        and thrown away on every redraw. Cached by shape (one entry per
+        replicate tile size) and never written to after construction, so the
+        callers below may treat it as read-only.
+        """
+        tint = self._tint_cache.get(shape)
+        if tint is None:
+            tint = np.zeros(shape, np.uint8)
+            tint[..., 1] = 255
+            self._tint_cache[shape] = tint
+        return tint
 
     def _display_bbox(self, region, width, height):
         """Where a replicate's full-frame frac lands in the rendered view."""
@@ -996,10 +2031,15 @@ class ScalogramExplorer(QWidget):
                     mm = cv2.resize(grid, (dx1 - dx0, dy1 - dy0),
                                     interpolation=cv2.INTER_NEAREST)
                     roi = out[dy0:dy1, dx0:dx1]
-                    tint = np.zeros_like(roi)
-                    tint[..., 1] = 255
-                    blended = cv2.addWeighted(roi, 0.5, tint, 0.5, 0)
-                    np.copyto(roi, blended, where=(mm > 0)[:, :, None])
+                    blended = cv2.addWeighted(roi, 0.5, self._tint(roi.shape),
+                                              0.5, 0)
+                    # cv2.copyTo, not np.copyto(where=...). The numpy form was
+                    # 3/4 of this whole branch: `where` takes a full-size
+                    # boolean it has to broadcast to 3 channels, and it walks
+                    # the ROI elementwise. The OpenCV masked copy takes the
+                    # single-channel mask directly. Pixel-identical -- verified
+                    # by test_highlight_overlay_is_unchanged_by_the_fast_path.
+                    cv2.copyTo(blended, mm, roi)
                     contours, _ = cv2.findContours(mm, cv2.RETR_EXTERNAL,
                                                    cv2.CHAIN_APPROX_SIMPLE)
                     cv2.drawContours(roi, contours, -1, (60, 255, 60), 1)
@@ -1016,7 +2056,32 @@ class ScalogramExplorer(QWidget):
             self._update_frame(int(v))
 
     def _advance(self):
+        self._advance_ticks += 1
         self._update_frame(0 if self.frame + 1 >= self.T else self.frame + 1)
+        # After the frame's work, not before: the tick that closes the window
+        # must have its own redraw counted, or the reported rate is always one
+        # frame optimistic.
+        self._sync_rate_label()
+
+    def _sync_rate_label(self):
+        """Close the measurement window once a full wall second has passed, and
+        report footage-seconds advanced per wall-second."""
+        elapsed = time.monotonic() - self._rate_wall0
+        if elapsed < 1.0:
+            return
+        footage = (self._advance_ticks - self._rate_ticks0) / max(self.fps, EPS)
+        ratio = footage / elapsed
+        self._start_rate_window()
+        # Green only when it is genuinely keeping up. The 0.95 floor is slack
+        # for timer jitter, not a "close enough" -- below it, frames really are
+        # being missed.
+        colour = ("#6ee678" if ratio >= 0.95
+                  else "#e0a94a" if ratio >= 0.6 else "#e06a5a")
+        self._set_rate_text(f"{ratio:.2f}x realtime", colour)
+
+    def _start_rate_window(self):
+        self._rate_wall0 = time.monotonic()
+        self._rate_ticks0 = self._advance_ticks
 
     def _update_frame(self, frame):
         """Single entry point for a frame change. When embedded, route through
@@ -1039,27 +2104,155 @@ class ScalogramExplorer(QWidget):
             self.scrub.blockSignals(False)
         for pl in self._all_plots():
             pl.set_cursor(self.frame)
+        self._sync_detect_badge()
         self.time_lbl.setText(f"{self.frame/self.fps:.2f} s  (#{self.frame})")
         if self.isVisible():
             self._redraw_video()
+        # Absolute, because the only consumer outside this widget is the
+        # whole-clip strip, whose axis is the video's. Emitting the T-axis index
+        # would walk its cursor backwards through the clip every time a live
+        # window slid forward, while appearing to sit still.
+        self.frame_moved.emit(self.absolute_frame())
+
+    def absolute_frame(self) -> int:
+        """Where the cursor sits on the VIDEO's axis, not this span's.
+
+        The counterpart to seek_absolute, for consumers whose axis is the clip.
+        Needed separately from ``frame_moved`` because that signal reports a
+        CHANGE of the T-axis index, and under follow_center the index is
+        constant while the window slides -- so the absolute position moves
+        continuously without the signal ever firing.
+        """
+        return int(self.window_start + self.frame)
+
+    def seek_absolute(self, frame: int) -> bool:
+        """Move the cursor to an absolute VIDEO frame if this span holds it.
+
+        Returns whether it landed. False is the ordinary answer while streaming
+        -- the span is a trailing window and the user is dragging the strip
+        somewhere else entirely -- and the caller treats it as "this seek needs
+        a pass", not as an error. Clamping into the span instead would park the
+        cursor at a window edge and report a position nobody asked for.
+        """
+        rel = int(frame) - self.window_start
+        if rel < 0 or rel >= self.T:
+            return False
+        self._update_frame(rel)
+        return True
+
+    def hold_at(self, frame: int) -> bool:
+        """Park the cursor on an absolute frame and STOP following.
+
+        The seek-while-paused preview's reading position. A static window has no
+        pass running ahead of it, so neither follow mode applies: the cursor
+        sits exactly on the clicked frame rather than half a window ahead of it
+        (follow_center) or on the newest row (follow_latest). Clearing the mode
+        matters when the explorer is reused across a paused seek -- a "center"
+        left by an earlier live pass would otherwise re-assert itself on the next
+        window and walk the cursor off the click. Returns whether the frame was
+        in the current span (it is, for a window decoded around it).
+        """
+        self._follow = None
+        return self.seek_absolute(frame)
+
+    def _stash_bands(self, index: int) -> None:
+        """Freeze the outgoing scope's bands so revisiting it restores them.
+
+        Only placed bands are stashed: an unset endpoint pair means "never
+        tuned here", and recording that would overwrite a real earlier tuning
+        with a blank on a scope the user merely passed through."""
+        for name, dp in self.density_plots.items():
+            if dp.band_lo is not None and dp.band_hi is not None:
+                self._value_band_cache[index, name] = (dp.band_lo, dp.band_hi)
+        cw = self.count_w_plot
+        if cw.band_lo is not None and cw.band_hi is not None:
+            self._count_band_cache[index] = (cw.band_lo, cw.band_hi)
+
+    def _restore_bands(self, old_index: int) -> None:
+        """Seed the incoming scope's bands. Cache first, carry-forward second.
+
+        The two kinds of band inherit differently because they are denominated
+        differently:
+
+        * A channel value band is an ABSOLUTE per-block quantity -- a
+          coherence of 0.3 is 0.3 in every replicate -- so it carries over
+          verbatim. (Log-energies drift with ROI size and illumination, but the
+          fix for that is normalising the channel, not silently discarding a
+          threshold the user placed.)
+        * The count band is a RAW BLOCK COUNT, and replicate tiles are not
+          uniform -- build_layout sizes each from its own frac box -- so it is
+          meaningless on the new scope until re-denominated by the block-count
+          ratio. That is the same conversion apply_view_state performs across a
+          rebuild; it belongs here for the same reason.
+
+        A cached band always wins over carry-forward: returning to a scope
+        should show what you left there, not what you were last touching
+        somewhere else."""
+        idx = self.active_region_index
+        for name, dp in self.density_plots.items():
+            cached = self._value_band_cache.get((idx, name))
+            if cached is not None:
+                dp.band_lo, dp.band_hi = cached
+            # else: leave the live band alone -- that IS the carry-forward.
+
+        cw = self.count_w_plot
+        cached = self._count_band_cache.get(idx)
+        if cached is not None:
+            cw.band_lo, cw.band_hi = cached
+        elif cw.band_lo is not None and cw.band_hi is not None:
+            old_blocks = self._region_block_count(old_index)
+            new_blocks = self._region_block_count(idx)
+            if old_blocks > 0 and new_blocks > 0:
+                cw.band_lo, cw.band_hi = rescale_count_band(
+                    (cw.band_lo, cw.band_hi), old_blocks, new_blocks)
+            else:
+                # No comparable denominator: an unconverted raw count would be
+                # wrong by an unknown factor and look authoritative. Drop back
+                # to unseeded so set_band_active re-opens it wide, which at
+                # least fails toward "detects everything" rather than toward a
+                # silent, arbitrary gate.
+                cw.band_lo = cw.band_hi = None
+        self.count_w_plot.set_band_active(True)
+
+    def _sync_band_note(self) -> None:
+        """Warn when the selected channel's band has no overlap with this
+        replicate's data -- a carried threshold that is off-scale here detects
+        nothing, and looks like a broken detector rather than a tuning miss."""
+        dp = self._selected_density()
+        self.band_note.setVisible(False)
+        if dp is None or dp.matrix.size == 0:
+            return
+        lo, hi = dp.band()
+        if not (np.isfinite(lo) or np.isfinite(hi)):
+            return
+        dlo = float(np.nanmin(dp.matrix))
+        dhi = float(np.nanmax(dp.matrix))
+        if not (np.isfinite(dlo) and np.isfinite(dhi)):
+            return
+        if lo > dhi or hi < dlo:
+            self.band_note.setText(
+                f"The {self.channel} band [{lo:.3g}, {hi:.3g}] carried over "
+                f"from the previous replicate lies outside this one's range "
+                f"[{dlo:.3g}, {dhi:.3g}] — it will select no blocks here. "
+                f"Re-drag it, or widen it, to tune against this replicate.")
+            self.band_note.setVisible(True)
 
     def _on_region_changed(self, _index):
+        old_index = self.active_region_index
+        self._stash_bands(old_index)
         data = self.region_combo.currentData()
         self.active_region_index = int(data) if data is not None else 0
-        # Each replicate lives on its own value scale, so a value band frozen
-        # from the previous replicate would sit off this one's plots. Re-seed
-        # every channel's value band (and the count gate, whose block count just
-        # changed) wide open; the selected plot re-seeds via _apply_selected_ui.
-        for dp in self.density_plots.values():
-            dp.band_lo = dp.band_hi = None
-        self.count_w_plot.band_lo = self.count_w_plot.band_hi = None
-        self.count_w_plot.set_band_active(True)
+        self._restore_bands(old_index)
+        # A different replicate is a different set of blocks, so the accumulated
+        # axis bounds do not describe it. Carrying them over would put one
+        # replicate's outliers on another's axis.
+        self._reset_sticky_ranges()
         focus = None if self.active_region_index < 0 else \
             self._active_regions()[0]["frac"]
         self.video_view.set_focus_frac(focus)
         self._sync_video_boxes()
         self._sync_window_title()
-        self._rebuild_scalograms()
+        self._rebuild_scalograms()   # _refresh_densities syncs the off-range note
         self._redraw_video()
 
     def _on_channel_toggled(self, button, checked: bool):
@@ -1068,11 +2261,26 @@ class ScalogramExplorer(QWidget):
         if not checked:
             return
         self.channel = str(button.property("channel"))
+        # Channels are in different units entirely (energies vs bounded ratios),
+        # so the accumulated bounds are meaningless across a switch.
+        self._reset_sticky_ranges()
         if self.active_region_index < 0:
+            return
+        # Selected an on-demand channel this window has not computed yet: _chan_arr
+        # would hand back zero-fill, so recomputing the sweep/overlay/cube would
+        # present a fake all-zero detection until the host's replan lands. Only the
+        # two field-independent calls are safe here -- an un-built channel's density
+        # blanks rather than reads zeros, and the plot UI keys off channel name.
+        # set_channel_data reruns the full recompute when the real data arrives, and
+        # the tuning_changed relay (already fired) is what triggers that replan.
+        if not self._channel_available(self.channel):
+            self._apply_selected_plot_ui()
+            self._refresh_densities()
+            self._set_phase(f"computing {self.channel}…")
             return
         self._rebuild_selected_views()
         self._apply_selected_plot_ui()
-        self._refresh_densities()
+        self._refresh_densities()   # re-syncs the off-range note for this channel
         self._recompute_sweep()
         self._redraw_video()
         self._request_cube()      # build the newly-selected channel if needed
@@ -1088,6 +2296,7 @@ class ScalogramExplorer(QWidget):
             return
         self._sweep_debounce.stop()
         self._recompute_sweep()
+        self._sync_band_note()   # a re-drag is how the off-range warning clears
         self._redraw_video()
 
     def _on_sweep_window(self, v):
@@ -1141,9 +2350,23 @@ class ScalogramExplorer(QWidget):
         self.playing = not self.playing
         self.play_btn.setText("Pause" if self.playing else "Play")
         if self.playing:
+            # Restart the window on resume: a window left open across a pause
+            # would charge the paused wall time against zero frames advanced
+            # and report a rate near 0 for the first second back.
+            self._start_rate_window()
+            self._set_rate_text("measuring…", "#777")
             self._timer.start(int(1000 / max(self.fps, 1)))
         else:
             self._timer.stop()
+            # The last reading stands, greyed: it describes playback that
+            # really happened, and blanking it would erase the number right as
+            # the user pauses to read it.
+            self._set_rate_text(self.rate_lbl.text(), "#777")
+
+    def _set_rate_text(self, text: str, colour: str) -> None:
+        self.rate_lbl.setStyleSheet(
+            f"font-family:Consolas; font-size:11px; color:{colour};")
+        self.rate_lbl.setText(text)
 
     def toggle_playback(self):
         self._toggle_play()

@@ -28,6 +28,31 @@ def morlet_scales(freqs_hz: np.ndarray) -> np.ndarray:
     return (W0 + np.sqrt(2.0 + W0 * W0)) / (4.0 * np.pi * f)
 
 
+def coi_efolding_s(freqs_hz: np.ndarray) -> np.ndarray:
+    """Cone-of-influence half-width in SECONDS for each Fourier frequency.
+
+    Torrence & Compo's e-folding time for Morlet, ``tau = sqrt(2) * s``. Within
+    ``tau`` of either end of the record the coefficients are contaminated by the
+    zero-padding ``morlet_power`` applies rather than by the signal, so that
+    wedge is artifact and must not be read as data.
+
+    Derived from :func:`morlet_scales` rather than from a baked-in constant, so
+    it follows ``W0`` if that ever moves. At w0=6 it works out to 1.369/f
+    seconds -- ~2.74 s at 0.5 Hz against ~0.068 s at 20 Hz. (A figure of 1.46/f
+    circulated in the plan; it is ~7% too large.)
+
+    Note this is a SCALE, not a threshold: contamination decays through the
+    wedge rather than stopping at its edge. A renderer should grade it.
+    """
+    return np.sqrt(2.0) * morlet_scales(freqs_hz)
+
+
+def coi_edge_samples(freqs_hz: np.ndarray, fs: float) -> np.ndarray:
+    """:func:`coi_efolding_s` in samples at rate ``fs`` -- the form a plot with
+    a time axis in frames needs."""
+    return coi_efolding_s(freqs_hz) * float(fs)
+
+
 def default_freqs(fps: float, fmin: float = 0.5, fmax: float = 25.0,
                   n: int = 24) -> np.ndarray:
     """Log-spaced frequency bank, capped below Nyquist."""
@@ -51,7 +76,7 @@ def morlet_power(x: np.ndarray, fs: float, freqs_hz: np.ndarray) -> np.ndarray:
     # fast composite length. This is the Torrence & Compo zero-padding: the
     # ends see zeros instead of circularly wrapping onto the other end of the
     # record (and a prime T would force the FFT into a Bluestein fallback).
-    support = int(np.ceil(np.sqrt(2.0) * scales.max() / dt))
+    support = int(np.ceil(coi_efolding_s(freqs_hz).max() / dt))
     n = _fft.next_fast_len(T + support)
     Xf = _fft.fft(x, n=n, axis=0, workers=-1)          # complex64
     omega = 2.0 * np.pi * np.fft.fftfreq(n, d=dt)
@@ -66,3 +91,60 @@ def morlet_power(x: np.ndarray, fs: float, freqs_hz: np.ndarray) -> np.ndarray:
         w = _fft.ifft(buf, axis=0, workers=-1, overwrite_x=True)[:T]
         out[i] = w.real ** 2 + w.imag ** 2
     return out[:, :, 0] if squeeze else out
+
+
+def band_indices(freqs_hz: np.ndarray, flo: float, fhi: float) -> tuple[int, int]:
+    """Frequency rows [i, j) covering [flo, fhi] Hz on a sorted bank; an empty
+    span snaps to the single nearest scale. Matches the scalogram explorer's
+    band picker so a whole-clip pass and the window preview index identically."""
+    freqs = np.asarray(freqs_hz, float)
+    i = int(np.searchsorted(freqs, flo, "left"))
+    j = int(np.searchsorted(freqs, fhi, "right"))
+    if j <= i:
+        i = int(np.argmin(np.abs(freqs - flo)))
+        j = i + 1
+    return i, j
+
+
+def morlet_band_power(x: np.ndarray, fs: float, freqs_hz: np.ndarray,
+                      i: int, j: int, block_chunk: int = 512) -> np.ndarray:
+    """Scalogram power summed over frequency rows [i, j). ``x`` (T,) or (T,B) ->
+    (T,) or (T,B) float32.
+
+    Numerically identical to ``morlet_power(x, fs, freqs_hz)[i:j].sum(axis=0)``
+    but never materializes the full (F, T, B) cube: it derives the zero-pad
+    length from the WHOLE bank's largest scale (so the band sum matches a
+    full-cube slice exactly), yet transforms only the band's scales, chunked over
+    block columns so a whole-clip (T~30k, B~thousands) pass stays memory-bounded.
+    """
+    x = np.asarray(x, np.float32)
+    squeeze = x.ndim == 1
+    if squeeze:
+        x = x[:, None]
+    T, B = x.shape
+    dt = 1.0 / fs
+    scales_all = morlet_scales(freqs_hz)
+    band = scales_all[i:j]
+    if band.size == 0:
+        k = int(np.clip(i, 0, len(scales_all) - 1))
+        band = scales_all[k:k + 1]
+    support = int(np.ceil(coi_efolding_s(freqs_hz).max() / dt))
+    n = _fft.next_fast_len(T + support)
+    omega = 2.0 * np.pi * np.fft.fftfreq(n, d=dt)
+    heavi = omega > 0
+    daughters = [
+        (np.sqrt(2.0 * np.pi * s / dt) * np.pi ** -0.25 * heavi *
+         np.exp(-0.5 * (s * omega - W0) ** 2)).astype(np.complex64)
+        for s in band]
+    out = np.zeros((T, B), np.float32)
+    for c0 in range(0, B, max(1, block_chunk)):
+        c1 = min(B, c0 + max(1, block_chunk))
+        Xf = _fft.fft(x[:, c0:c1], n=n, axis=0, workers=-1)
+        acc = np.zeros((T, c1 - c0), np.float32)
+        buf = np.empty_like(Xf)
+        for d in daughters:
+            np.multiply(Xf, d[:, None], out=buf)
+            w = _fft.ifft(buf, axis=0, workers=-1, overwrite_x=True)[:T]
+            acc += w.real ** 2 + w.imag ** 2
+        out[:, c0:c1] = acc
+    return out[:, 0] if squeeze else out

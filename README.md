@@ -38,13 +38,22 @@ requirements. Farnebäck and DIS work on CPU.
    boxes that own each animal or isolate. Drawing and fixed-size stamping start
    enabled: drag once to establish a size, then click to place matching boxes.
    Labels, calibration and quiescent-baseline intervals live here.
-2. **Preprocessing & Flow** — configure per-replicate preprocessing and the flow
-   backend. Test mode processes the first N seconds into a separate scratch
-   cache; full mode processes the clip. Completion opens the cache but leaves the
-   user on this tab.
-3. **Behavior Classification** — define behavior with a tree of AND/OR feature
+2. **Preprocessing (live)** — tune preprocessing directly against the detector,
+   with no optical-flow solve and no cache. Pick a short window of the raw video
+   and adjust downsample, block size and normalization while the Morlet scalogram
+   and the per-block detection respond; drag a frequency band to pick the rhythm
+   and value bands to isolate the behaving blocks. When the parameters isolate the
+   behavior, **Process whole video** runs that same detector over the entire clip
+   in one streaming pass and turns the result into a navigation strip. See
+   [Live tensor detection](#live-tensor-detection-no-flow-cache) below.
+3. **Flow cache (commit)** — the optional optical-flow pass. Configure
+   per-replicate preprocessing and the flow backend; Test mode processes the first
+   N seconds into a separate scratch cache, full mode processes the clip. This
+   path is only needed for flow-derived features or the cached-flow channels — the
+   live tensor loop above needs neither.
+4. **Behavior Classification** — define behavior with a tree of AND/OR feature
    ranges, temporal cleanup criteria and per-replicate thresholds; inspect the
-   ethogram and export CSV/HDF5 results.
+   ethogram and export CSV/HDF5 results. Requires a completed flow cache.
 
 Time is in **seconds** and frequency in **Hz** throughout. Frame indices appear
 only where an exact source-frame reference is useful.
@@ -52,6 +61,48 @@ only where an exact source-frame reference is useful.
 Replicate boxes and manual marks are stored beside the video as
 `<video>.rois.json` and `<video>.marks.json`. Feature caches are separate and
 live under `.cache/`; loading a new video never silently opens a prior cache.
+
+## Live tensor detection (no flow cache)
+
+The detector that isolates a behavior — a per-block "detection / no-detection" —
+is built entirely from structure-tensor channels streamed from the video
+(`tensor_speed`, change energy, intensity, and an appearance residual measured
+against the tensor's own flow). None of it uses the cached optical-flow arrays,
+so the whole loop runs on a bare video with no caching step:
+
+- **Tune on a window.** The Preprocessing (live) tab extracts a short window
+  (default 10 s, any position) and computes its Morlet scalogram per block. You
+  place a frequency band on the rhythm, a value band on the block power, and a
+  detection window on the sustained in-band count. `downsample`, `block_size` and
+  `normalize` are live knobs — each is upstream of the tensor solve, so changing
+  one re-extracts the window (seconds, not a cache build). Temporal denoise is
+  forced off in this windowed mode: it is stateful from frame zero and cannot be
+  reproduced starting mid-clip.
+- **Commit means running the detector, not building a cache.** *Process whole
+  video* streams the whole clip once and applies the tuned detector, keeping only
+  the per-block band power and the detection tracks — never the full
+  time-frequency cube, which would run to gigabytes. There is no flow solve and
+  nothing is written to `.cache/`.
+- **Navigate the result.** The whole-clip detection track (positive gate plus
+  largest-clump strength) becomes a timeline: click a detection, or step the
+  strongest first, to load that window back into the live view and verify it
+  against the footage. You never scrub blind through more than a window at a time.
+
+Because the whole-clip band power is retained, re-tuning the value band or the
+detection window is instant; changing the frequency band or channel requires a
+fresh pass (the band sum is baked in). The window preview and the whole-clip pass
+call the same detection code (`core/detection.py`), so a detection you navigate to
+cannot disagree with what the pass found.
+
+A flow cache is still worthwhile for two things the tensor path does not provide:
+flow-derived features (coherence, divergence, curl, direction oscillation), and
+instant re-query of an arbitrary frequency band across a whole clip (which needs
+the full retained scalogram cube). For an energetic or rhythmic behavior isolable
+by a band on a tensor channel, neither is needed.
+
+This path has not yet been validated for detection accuracy on marked footage —
+the offscreen tests establish the math and the plumbing, not biological recall.
+See [next steps](docs/next-steps.md).
 
 ## Current processing model
 

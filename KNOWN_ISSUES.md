@@ -121,6 +121,43 @@ reasons:
 
 ---
 
+## 5. Tensor detection path is not yet accuracy-validated (caution)
+
+**Severity:** medium — it is a usable tuning/triage tool, but not yet a validated
+detector.
+
+**Symptom.** The live tensor detection loop (Preprocessing (live) tab → *Process
+whole video* → navigation strip) produces detections with no established
+precision/recall on marked footage. Its tests cover the math (band power equals a
+full-cube slice, windowed mean, region scoping) and the plumbing (window → process
+→ navigate), not biological recall.
+
+**Context, not a bug.**
+- The whole-video pass is a full streaming structure-tensor solve (comparable to a
+  flow pass per frame), so it takes minutes on a long clip. It is the one
+  expensive step, paid once after tuning rather than up front. It writes nothing
+  to `.cache/`; nothing is persisted between runs yet (see next-steps §11).
+- Temporal denoise is forced off for windowed extraction and is unavailable on
+  this path — it is stateful from frame zero and cannot be reproduced mid-clip.
+  `registration`/`bg_subtract` also do not apply and are flagged approximated.
+- Changing the frequency band or channel requires a fresh whole-clip pass; only
+  the value band and detection window re-tune instantly (the band power is
+  retained, the band sum is not).
+
+**Workaround.** Verify detections by clicking into their windows (the loop is
+built for exactly this). For a behavior where a validated ethogram is required
+today, use the flow-cache Behavior tab.
+
+**Planned work.** Accuracy validation against marks (next-steps §10), optional
+channel sidecar persistence (§11), and the deferred question of the Behavior tab
+consuming a tensor sidecar (§12).
+
+**References:** `core/detection.py`, `core/channel_source.py`,
+`gui/explorers/live_scalogram_surface.py`; `docs/decisions.md` ("The
+tensor/scalogram path runs without a flow cache").
+
+---
+
 ## Resolved
 
 - **FFmpeg silently rounded odd-coordinate crops.** The ROI decode did not pass

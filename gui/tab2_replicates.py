@@ -1,7 +1,7 @@
 """Replicates tab: manual experimental-unit bounding boxes.
 
 The histogram-driven automatic ROI discovery is shelved in
-gui/_shelved_tab2_roi_auto.py -- it worked, but on footage where the behavior is
+gui/_shelved/tab2_roi_auto.py -- it worked, but on footage where the behavior is
 everywhere and the camera moves, drawing the replicate regions by hand is faster
 and less error-prone than tuning a filter to segment them. Each box becomes a
 replicate: a spatial region present for the whole clip, which Tab 3 then
@@ -17,7 +17,7 @@ import json
 import os
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QIcon, QPixmap
+from PyQt6.QtGui import QColor, QIcon, QKeyEvent, QPixmap
 from PyQt6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                              QGroupBox, QHBoxLayout, QInputDialog, QLabel,
                              QListWidget, QListWidgetItem, QMessageBox,
@@ -32,12 +32,24 @@ from gui.video_panel import VideoPanel
 _PALETTE = ["#ff5a5a", "#4ac6ff", "#ffd24a", "#6ee06e", "#c78bff", "#ff9d3a",
             "#00d0b0", "#ff6ec7"]
 
+# The exact words the user has to click to move a box that downstream work has
+# already consumed. Spelled out rather than "OK" because that is the whole point
+# of the gate: the cost is not the drag, it is that everything measured against
+# the old rectangle silently stops describing the new one. Same hazard class as
+# T17 and the count-band re-denomination -- state that quietly stops meaning what
+# it meant -- but unlike those it cannot be converted, only discarded.
+_MOVE_ANYWAY = "I recognize the existing replicate data will be lost"
+
 
 class Tab2Replicates(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
-        # Each replicate: {"id", "label", "frac": (x0,y0,x1,y1), "color"}.
+        # Each replicate: {"id", "label", "frac": (x0,y0,x1,y1), "color",
+        # "processed"}. `processed` means downstream work has consumed this box,
+        # so moving it is gated (_confirm_move). It is always present on a box
+        # this session created, but readers must still use .get -- sidecars
+        # written before the field existed do not carry it.
         self.replicates: list[dict] = []
         self._next_id = 1
 
@@ -52,14 +64,22 @@ class Tab2Replicates(QWidget):
         self.video = VideoPanel(state)
         self.video.view.box_drawn.connect(self._on_box_drawn)
         self.video.view.stamp_at.connect(self._on_stamp_at)
-        self.video.view.clicked.connect(self._on_view_clicked)
+        # T12: the boxes on this tab are grabbable. A press inside one selects
+        # it; releasing in place zooms to it; dragging repositions it.
+        self.video.view.box_drag_enabled = True
+        self.video.view.box_grabbed.connect(self._on_box_grabbed)
+        self.video.view.box_clicked.connect(self._on_box_clicked)
+        self.video.view.box_moved.connect(self._on_box_moved)
+        # Right-click is "back" everywhere in this app (four explorers and tab3
+        # wire it to un-zoom). T12 asked for right-click-to-delete here; that was
+        # refused deliberately, because T12 also introduces the zoom that makes
+        # this tab NEED an un-zoom gesture, and a tab where the same button means
+        # "go back" in one place and "destroy a replicate" in another is a
+        # misfire away from silent data loss. Deletion is the button and the
+        # Delete key (see keyPressEvent), neither of which can be hit by
+        # reaching for "go back".
+        self.video.view.back_requested.connect(self.video.clear_focus)
         ll.addWidget(self.video, 1)
-
-        # Stamp size in frame fractions, set from the last box you draw. When
-        # stamp mode is on, clicking drops an identically-sized box -- which is
-        # what keeps replicates the same size, so a fixed "min blocks" and the
-        # max-aggregation mean the same thing in every box.
-        self.stamp_size: tuple[float, float] | None = None
 
         bar = QHBoxLayout()
         self.draw_btn = QPushButton("✏ Draw boxes: OFF")
@@ -69,17 +89,21 @@ class Tab2Replicates(QWidget):
         bar.addWidget(self.draw_btn, 1)
         self.stamp_chk = QCheckBox("Fixed-size stamp")
         self.stamp_chk.setToolTip(
-            "Draw one box to set the size, then click to drop identically-sized "
-            "boxes. Same-size replicates make block counts comparable.")
+            "Click empty space to drop a box the size of the SELECTED replicate. "
+            "Same-size replicates make block counts comparable.")
         self.stamp_chk.setChecked(True)
         bar.addWidget(self.stamp_chk)
         self.draw_btn.setChecked(True)
         ll.addLayout(bar)
 
         self.hint = QLabel(
-            "Drag the first replicate box to set the stamp size (e.g. one per "
-            "tube), then CLICK to place more boxes of the same size. Drag again "
-            "at any time to change the stamp size.")
+            "Drag out the first replicate box (e.g. one per tube), then CLICK "
+            "empty space to place more of the same size. Click a box to select "
+            "and zoom to it, drag it to reposition, press Delete to remove it, "
+            "right-click to zoom out. "
+            "The stamp is always the SELECTED box's size. "
+            "A 🔒 box has been processed — moving it asks first, because its "
+            "existing measurements are discarded rather than re-aimed.")
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color:#333; font-size:11px;")
         ll.addWidget(self.hint)
@@ -95,6 +119,11 @@ class Tab2Replicates(QWidget):
         bl = QVBoxLayout(box)
         self.list = QListWidget()
         self.list.currentItemChanged.connect(self._on_select)
+        # itemClicked, not currentItemChanged: only a USER picking a row should
+        # move the frame. _add_box selects the box it just placed, and zooming
+        # on that would fight the place-several-in-a-row workflow T11 exists to
+        # support -- every click would fly the view somewhere new.
+        self.list.itemClicked.connect(lambda _: self._zoom_to_selected())
         bl.addWidget(self.list, 1)
 
         row = QHBoxLayout()
@@ -114,10 +143,10 @@ class Tab2Replicates(QWidget):
         row2.addWidget(load)
         bl.addLayout(row2)
 
-        to3 = QPushButton("Classify these in Tab 3 →")
-        to3.setStyleSheet("padding:6px; font-weight:bold;")
-        to3.clicked.connect(self._go_classify)
-        bl.addWidget(to3)
+        to_live = QPushButton("Tune these in Preprocessing →")
+        to_live.setStyleSheet("padding:6px; font-weight:bold;")
+        to_live.clicked.connect(self._go_preprocess)
+        bl.addWidget(to_live)
         rl.addWidget(box)
 
         std_box = QGroupBox("Selected replicate standardization")
@@ -152,6 +181,13 @@ class Tab2Replicates(QWidget):
         self.body_length_mm.setDecimals(4)
         self.body_length_mm.setSpecialValueText("unset")
         sf.addRow("body length (mm)", self.body_length_mm)
+        self.calibrate_btn = QPushButton("Calibrate by drawing…")
+        self.calibrate_btn.setToolTip(
+            "Measure both fields on the frame instead of typing them: drag "
+            "along the animal for its length, and across a ruler or scale bar "
+            "of known size to fix pixels/mm.")
+        self.calibrate_btn.clicked.connect(self._open_calibration)
+        sf.addRow(self.calibrate_btn)
         for w in (self.use_baseline, self.baseline_start, self.baseline_end,
                   self.pixels_per_mm, self.body_length_mm):
             # Rebuilding every ROI trace on each intermediate spinbox keystroke
@@ -179,6 +215,7 @@ class Tab2Replicates(QWidget):
         state.video_loaded.connect(self._on_video_loaded)
         state.cache_opened.connect(self._on_cache_opened)
         state.frame_changed.connect(self._on_frame_changed)
+        state.calibration_changed.connect(self._on_calibration_changed)
 
     # -- per-video persistence ----------------------------------------------
 
@@ -191,6 +228,9 @@ class Tab2Replicates(QWidget):
         path = self.state.video_sidecar("rois")
         self.replicates = []
         self._next_id = 1
+        # A zoom is a rectangle of the PREVIOUS video's frame; carrying it into
+        # a new clip frames an arbitrary region of it.
+        self.video.clear_focus()
         if path and os.path.exists(path):
             try:
                 with open(path) as f:
@@ -239,6 +279,7 @@ class Tab2Replicates(QWidget):
             "label": f"rep{self._next_id}",
             "frac": (x0, y0, x1, y1),
             "color": _PALETTE[(self._next_id - 1) % len(_PALETTE)],
+            "processed": False,
         }
         self._next_id += 1
         self.replicates.append(rep)
@@ -248,24 +289,173 @@ class Tab2Replicates(QWidget):
         self._autosave()
         self.list.setCurrentRow(self.list.count() - 1)
 
-    def _on_box_drawn(self, x0: float, y0: float, x1: float, y1: float):
-        # Every drawn box updates the stamp size, so you can redraw to resize.
-        self.stamp_size = (x1 - x0, y1 - y0)
+    # -- T11: the stamp is the SELECTED replicate's size ----------------------
+    #
+    # It used to be a stored `stamp_size`, written by the last box DRAWN. That
+    # made the stamp and the selection two independent pieces of state saying
+    # what "the current box" is, and they diverged the moment you selected an
+    # older box: the highlight said one thing, the next click placed another.
+    # Deriving it removes the second copy rather than syncing it, so the label,
+    # the highlight and what a click actually places cannot disagree.
+
+    @property
+    def stamp_size(self) -> tuple[float, float] | None:
+        rep = self._selected_rep()
+        if rep is None:
+            return None
+        x0, y0, x1, y1 = rep["frac"]
+        return (x1 - x0, y1 - y0)
+
+    def _sync_stamp_label(self):
+        size = self.stamp_size
         self.stamp_chk.setText(
-            f"Fixed-size stamp  ({self.stamp_size[0]*100:.0f}%×"
-            f"{self.stamp_size[1]*100:.0f}%)")
+            "Fixed-size stamp" if size is None else
+            f"Fixed-size stamp  ({size[0]*100:.0f}%×{size[1]*100:.0f}%)")
+
+    def _on_box_drawn(self, x0: float, y0: float, x1: float, y1: float):
+        # Drawing selects the new box (_add_box), which by the property above
+        # makes it the stamp -- so "drag again to change the stamp size" still
+        # holds, without a second variable to keep in step.
         self._add_box(x0, y0, x1, y1)
 
     def _on_stamp_at(self, cx: float, cy: float):
-        """A click in draw mode: drop a stamp-sized box centred on the click."""
-        if not self.stamp_chk.isChecked() or self.stamp_size is None:
+        """A click on empty space in draw mode: drop a box the size of the
+        selected replicate, centred on the click."""
+        size = self.stamp_size
+        if not self.stamp_chk.isChecked() or size is None:
             return
-        w, h = self.stamp_size
+        w, h = size
         x0 = min(max(cx - w / 2, 0.0), 1.0 - w)
         y0 = min(max(cy - h / 2, 0.0), 1.0 - h)
         self._add_box(x0, y0, x0 + w, y0 + h)
 
+    # -- T12: select, zoom, reposition ---------------------------------------
+
+    def _select_index(self, idx: int):
+        if 0 <= idx < self.list.count():
+            self.list.setCurrentRow(idx)
+
+    def _zoom_to_selected(self):
+        """Frame the selected replicate.
+
+        The box's own frac, verbatim -- the same zoom the four explorers apply
+        on a region change (`set_focus_frac(regions[i]["frac"])`). Deliberately
+        no margin: this view and an explorer's are the same replicate at the
+        same magnification, so a reader can compare them directly, and a tab
+        that framed it slightly wider would make the two disagree about how big
+        the animal is on screen.
+
+        Dragging still works at full zoom -- the press lands inside the box, and
+        _delta_to extrapolates past the widget edge (Qt grabs the mouse), so the
+        box follows a cursor that leaves the view.
+        """
+        rep = self._selected_rep()
+        if rep is None:
+            return
+        x0, y0, x1, y1 = rep["frac"]
+        if x1 <= x0 or y1 <= y0:
+            return
+        self.video.set_focus_frac(rep["frac"])
+
+    def _on_box_grabbed(self, idx: int):
+        # Press: select only. The zoom waits for release, or it would move the
+        # frame out from under a drag that is just starting.
+        self._select_index(idx)
+
+    def _on_box_clicked(self, idx: int):
+        self._select_index(idx)
+        self._zoom_to_selected()
+
+    def _on_box_moved(self, idx: int, x0: float, y0: float,
+                      x1: float, y1: float):
+        if not (0 <= idx < len(self.replicates)):
+            return
+        rep = self.replicates[idx]
+        if rep.get("processed") and not self._confirm_move(rep, (x0, y0)):
+            # Declined: snap the box back to where it still is. self.replicates
+            # was never written, so redrawing from it IS the revert -- there is
+            # no saved-position copy to restore and therefore none to get wrong.
+            self._redraw_boxes()
+            return
+        rep["frac"] = (x0, y0, x1, y1)
+        # Moving it makes it fresh again: whatever had been processed against
+        # the old rectangle is exactly what the user just agreed to lose, so
+        # leaving the flag set would warn a second time about data that is
+        # already gone.
+        rep["processed"] = False
+        # A moved box is new geometry, so the ROIs and every series computed
+        # against them are stale -- same path as drawing one.
+        self._rebuild_rois()
+        self._sync_lock_badges()
+        self._redraw_boxes()
+        self._autosave()
+        # No _sync_stamp_label: the release clamps the ORIGIN and keeps the
+        # size, so a reposition cannot change what the stamp reports.
+
+    def _confirm_move(self, rep: dict, to_origin: tuple[float, float]) -> bool:
+        """Gate a drag of an already-processed replicate behind an explicit
+        acknowledgement.
+
+        Deliberately NOT a hard freeze. Freezing would force a delete-and-redraw
+        for what is often a small correction, and redrawing loses the label, the
+        colour and the standardization settings along with the geometry -- so the
+        safe-looking option would cost the user more state than the dangerous one.
+
+        ``to_origin`` is stated in the text because the box on screen is still
+        drawn where it STARTED: FrameView clears the drag ghost before emitting
+        box_moved, so by the time this dialog opens there is nothing showing the
+        destination. Approving a destructive move with no indication of where it
+        lands is exactly the blind confirmation this gate exists to avoid.
+        """
+        x0, y0 = rep["frac"][:2]
+        nx, ny = to_origin
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Move a processed replicate?")
+        box.setText(f"<b>{rep['label']}</b> has already been processed.")
+        box.setInformativeText(
+            "Moving it changes the region every existing measurement was "
+            "computed over. Those results describe the old rectangle and "
+            "cannot be re-aimed at the new one — they are discarded, not "
+            "converted.<br><br>"
+            f"Top-left would move from <b>{x0:.1%}, {y0:.1%}</b> to "
+            f"<b>{nx:.1%}, {ny:.1%}</b> of the frame."
+            "<br><br>The box keeps its name, colour and settings.")
+        go = box.addButton(_MOVE_ANYWAY, QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("Leave it where it is",
+                             QMessageBox.ButtonRole.RejectRole)
+        # Default AND escape route both land on the harmless option, so a
+        # reflexive Enter or Esc on a dialog the user did not expect cannot
+        # destroy anything.
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        return box.clickedButton() is go
+
+    def mark_replicates_processed(self) -> None:
+        """Latch every current box as processed.
+
+        Called when the user leaves this tab, which is the only route to the
+        surfaces that consume the layout -- so it strictly precedes any pass and
+        a second trigger on the pass itself would be redundant. Boxes drawn after
+        this are fresh again until the next time the user leaves.
+        """
+        fresh = [r for r in self.replicates if not r.get("processed")]
+        if not fresh:
+            return
+        for r in fresh:
+            r["processed"] = True
+        self._sync_lock_badges()
+        self._autosave()
+
     def _redraw_boxes(self):
+        # This 1:1, in-order mapping IS the contract behind the index carried by
+        # box_grabbed / box_clicked / box_moved -- FrameView reports a position
+        # in the list published here, and _on_box_moved indexes self.replicates
+        # with it. Filtering or reordering this comprehension (to hide boxes
+        # outside a zoom, say) would silently reposition the WRONG replicate.
+        # Note this tab matches by POSITION where _source_box deliberately
+        # matches by id: there, build_layout re-sorts and position is a trap.
         sel = self.state.selected_roi
         self.video.set_frac_boxes([
             (*r["frac"], r["label"], r["color"], r["id"] == sel)
@@ -311,11 +501,41 @@ class Tab2Replicates(QWidget):
 
     # -- list ----------------------------------------------------------------
 
+    @staticmethod
+    def _row_text(r: dict) -> str:
+        # The lock marks a box whose drag is gated. Shown on the row rather than
+        # only in the dialog, so the state is legible BEFORE the user commits to
+        # a gesture -- a warning that only appears once the drag is finished
+        # teaches nothing about which boxes are safe to nudge.
+        return f"  {r['label']}{'  🔒' if r.get('processed') else ''}"
+
+    @staticmethod
+    def _row_tip(r: dict) -> str:
+        if not r.get("processed"):
+            return ""
+        return ("Processed. Moving this box discards the measurements "
+                "computed over it.")
+
+    def _sync_lock_badges(self):
+        """Update the 🔒 markers in place.
+
+        Deliberately NOT _refresh_list: that clears the list, and the selection
+        with it -- and ``stamp_size`` is derived from the selection (T11), so a
+        rebuild here would silently empty the stamp on every move. Editing the
+        rows relies on the same 1:1 ordering _redraw_boxes documents.
+        """
+        for i, r in enumerate(self.replicates):
+            it = self.list.item(i)
+            if it is not None:
+                it.setText(self._row_text(r))
+                it.setToolTip(self._row_tip(r))
+
     def _refresh_list(self):
         self.list.blockSignals(True)
         self.list.clear()
         for r in self.replicates:
-            it = QListWidgetItem(f"  {r['label']}")
+            it = QListWidgetItem(self._row_text(r))
+            it.setToolTip(self._row_tip(r))
             it.setData(Qt.ItemDataRole.UserRole, r["id"])
             # A colour SWATCH icon plus default (theme) text -- not coloured text,
             # which was invisible for light box colours on the light list. The
@@ -327,6 +547,10 @@ class Tab2Replicates(QWidget):
         self.list.blockSignals(False)
         if self.list.currentItem() is None:
             self._sync_standardization_controls(None)
+        # blockSignals above suppresses _on_select, so the label is refreshed
+        # here too -- otherwise deleting the selected box leaves the stamp
+        # advertising a size that no longer exists.
+        self._sync_stamp_label()
 
     def _selected_rep(self) -> dict | None:
         it = self.list.currentItem()
@@ -339,12 +563,16 @@ class Tab2Replicates(QWidget):
         rep = self._selected_rep()
         self.state.selected_roi = rep["id"] if rep else None
         self._sync_standardization_controls(rep)
+        # T11: selection IS the stamp, so the label follows it here rather than
+        # at the one place a box happens to be drawn.
+        self._sync_stamp_label()
         self._redraw_boxes()
         self._refresh_inspector()
 
     def _sync_standardization_controls(self, rep: dict | None):
         widgets = (self.use_baseline, self.baseline_start, self.baseline_end,
-                   self.pixels_per_mm, self.body_length_mm)
+                   self.pixels_per_mm, self.body_length_mm,
+                   self.calibrate_btn)
         for w in widgets:
             w.blockSignals(True)
         try:
@@ -363,6 +591,68 @@ class Tab2Replicates(QWidget):
             for w in widgets:
                 w.blockSignals(False)
 
+    # -- calibration ---------------------------------------------------------
+
+    def _source_box(self, rep: dict):
+        """The replicate's box in source pixels, as extraction resolves it.
+
+        Through ``build_layout`` rather than off ``frac`` directly, so the guide
+        rectangle in the calibration window is the box the pass actually crops --
+        rounding and clamping included. Matched by ``replicate_id``, never by
+        position: ``build_layout`` sorts by id and this list is in draw order.
+        """
+        if self.state.source is None:
+            return None
+        from core.replicates import build_layout
+        info = self.state.source.info
+        layout = build_layout(self.replicates, info.width, info.height,
+                              scale=1.0, block_size=1)
+        tile = next((t for t in layout.tiles
+                     if int(t.replicate_id) == int(rep["id"])), None)
+        return tile.source_box if tile is not None else None
+
+    def _open_calibration(self):
+        rep = self._selected_rep()
+        if rep is None or self.state.source is None:
+            return
+        frame = self.state.source.frame_at(self.state.current_frame)
+        if frame is None:
+            self.state.status.emit(
+                "Could not decode the current frame to calibrate against.")
+            return
+        from gui.calibration_dialog import CalibrationDialog
+        dlg = CalibrationDialog(
+            frame, box=self._source_box(rep), label=str(rep.get("label", "")),
+            pixels_per_mm=rep.get("pixels_per_mm"),
+            body_length_mm=rep.get("body_length_mm"),
+            body_length_px=rep.get("body_length_px"),
+            scale=1.0, parent=self)
+        try:
+            if dlg.exec() and dlg.calibration is not None:
+                self._merge_calibration(rep["id"],
+                                        dlg.calibration.as_replicate_fields())
+        finally:
+            dlg.deleteLater()
+
+    def _on_calibration_changed(self, replicate_id: int, fields: dict):
+        """A calibration measured on another tab. Persisting is this tab's job:
+        it owns the list and the per-video sidecar."""
+        self._merge_calibration(replicate_id, fields)
+
+    def _merge_calibration(self, replicate_id: int, fields: dict):
+        rep = next((r for r in self.replicates
+                    if int(r["id"]) == int(replicate_id)), None)
+        if rep is None or not fields:
+            return
+        rep.update(fields)
+        # Re-read the spin boxes off the dict rather than setting them from
+        # `fields`, so a partial calibration (animal only, no ruler) leaves the
+        # untouched field showing what it already held.
+        if rep is self._selected_rep():
+            self._sync_standardization_controls(rep)
+        self._rebuild_rois()
+        self._autosave()
+
     def _standardization_changed(self, *_):
         rep = self._selected_rep()
         if rep is None:
@@ -375,20 +665,11 @@ class Tab2Replicates(QWidget):
         self._rebuild_rois()
         self._autosave()
 
-    def _on_view_clicked(self, pt):
-        """Click a point on the video -> select the box under it."""
-        if self.state.source is None:
-            return
-        # pt is in source-frame pixels; convert to fractions.
-        if self.video._cache_frame is None:
-            return
-        w, h = self.video.view._src_size
-        fx, fy = pt.x() / w, pt.y() / h
-        for i, r in enumerate(self.replicates):
-            x0, y0, x1, y1 = r["frac"]
-            if x0 <= fx <= x1 and y0 <= fy <= y1:
-                self.list.setCurrentRow(i)
-                return
+    # _on_view_clicked is gone: FrameView._box_at now owns the hit test for both
+    # tabs, and `clicked` no longer fires for a press inside a box. Keeping the
+    # old scan would have left TWO hit tests with different overlap rules (this
+    # one took the first match, _box_at prefers the selected box), which is the
+    # kind of pair that agrees until boxes overlap and then disagrees silently.
 
     def _rename(self):
         rep = self._selected_rep()
@@ -408,10 +689,32 @@ class Tab2Replicates(QWidget):
         if not rep:
             return
         self.replicates = [r for r in self.replicates if r["id"] != rep["id"]]
+        # Deleting what you are zoomed into otherwise strands the view on empty
+        # frame, showing a region that no longer belongs to anything.
+        self.video.clear_focus()
         self._rebuild_rois()
         self._refresh_list()
         self._redraw_boxes()
         self._autosave()
+
+    def keyPressEvent(self, ev: QKeyEvent):
+        """Delete/Backspace removes the selected replicate.
+
+        Only reached when no text field holds focus: a QLineEdit or spin box
+        consumes Delete for its own editing, and Qt stops propagating there, so
+        deleting a digit in "source pixels / mm" can never destroy the box. The
+        list and the frame view both ignore the key, which is exactly where the
+        gesture is meant to work.
+
+        Backspace too, because "in a replicate" here usually means zoomed into
+        one with the frame view focused, and the Mac habit is Backspace.
+        """
+        if ev.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) \
+                and self._selected_rep() is not None:
+            self._delete()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
 
     def _clear(self):
         if not self.replicates:
@@ -419,6 +722,7 @@ class Tab2Replicates(QWidget):
         if QMessageBox.question(self, "Clear all", "Delete all replicate boxes?") \
                 == QMessageBox.StandardButton.Yes:
             self.replicates = []
+            self.video.clear_focus()
             self._rebuild_rois()
             self._refresh_list()
             self._redraw_boxes()
@@ -483,8 +787,15 @@ class Tab2Replicates(QWidget):
             return
         with open(path) as f:
             data = json.load(f)
+        # `processed` is scoped to the clip it was measured on, so an IMPORTED
+        # layout arrives fresh however locked it was in its source video --
+        # otherwise a plate layout reused on a new clip would warn about
+        # measurements that clip never had, which is the same ghosting-across-
+        # videos failure _load_sidecar exists to prevent. (_load_sidecar itself
+        # keeps the flag: that IS this video's own layout.)
         self.replicates = [
-            {**r, "frac": tuple(r["frac"])} for r in data.get("replicates", [])]
+            {**r, "frac": tuple(r["frac"]), "processed": False}
+            for r in data.get("replicates", [])]
         self._next_id = max([r["id"] for r in self.replicates], default=0) + 1
         self._rebuild_rois()
         self._refresh_list()
@@ -492,17 +803,12 @@ class Tab2Replicates(QWidget):
         self._autosave()
         self.state.status.emit(f"Loaded {len(self.replicates)} boxes.")
 
-    def _go_classify(self):
+    def _go_preprocess(self):
+        # Live preprocessing reads raw frames, so boxes are the only
+        # precondition -- there is no cache to build first.
         if not self.replicates:
             QMessageBox.information(self, "No replicates",
                                     "Draw at least one box first.")
             return
         self._rebuild_rois()
-        if not self.state.has_cache:
-            QMessageBox.information(
-                self, "Processing required",
-                "These boxes do not yet have a matching per-replicate cache. "
-                "Run Test or Full processing in Preprocessing & Flow first.")
-            self.state.request_tab.emit(1)
-            return
-        self.state.request_tab.emit(2)
+        self.state.request_tab.emit(1)

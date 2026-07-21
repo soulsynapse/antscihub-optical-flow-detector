@@ -102,7 +102,11 @@ class Preprocessor:
         if self.cfg.normalize != "off":
             gray = self._normalize(gray)
 
-        return gray.astype(np.float32)
+        # asarray, not astype: every step above already returns float32, so
+        # astype was copying a full plane per replicate per frame to change
+        # nothing (0.28 ms on a 760x680 tile, x11 tiles x 30 fps). asarray is a
+        # no-op on a float32 input and still converts anything that is not.
+        return np.asarray(gray, np.float32)
 
     @property
     def mask(self) -> np.ndarray | None:
@@ -112,6 +116,13 @@ class Preprocessor:
 
     def _downsample(self, bgr: np.ndarray) -> np.ndarray:
         if self.scale >= 1.0:
+            return bgr
+        if bgr.shape[:2] == (self.height, self.width):
+            # Already at the target size: the ROI decoder scales inside FFmpeg,
+            # so this would be a resize to the size it already is. INTER_AREA at
+            # scale 1 is bit-identical to its input (verified), so skipping is
+            # free of any numerical change -- and it is not free to run: 610 us
+            # per call on a 760x730 tile, once per replicate per frame.
             return bgr
         # INTER_AREA is the correct choice for shrinking: it area-averages, which
         # low-pass filters before decimating. INTER_LINEAR would alias high
@@ -184,17 +195,25 @@ class Preprocessor:
             # z-score until the halo/global-normalization rework lands.
             g = np.clip(gray, 0, 255).astype(np.uint8)
             return self._clahe.apply(g).astype(np.float32)
-        std = float(gray.std())
+        # One SIMD pass for both statistics instead of two full numpy traversals,
+        # and one fused scale+shift instead of four temporaries: the z-score is
+        # affine, so (g - mean)/std*32 + 128 is g*a + b with a = 32/std. 2.3-3x
+        # on the tile sizes this runs at, and preprocess is the largest remaining
+        # span of a change-only pass.
+        #
+        # Results differ from the old expression by <=1.5e-5 absolute on values
+        # around 128 (~1e-7 relative) -- float32 rounding from the reassociation.
+        # The direction is toward MORE accuracy, not less: cv2.meanStdDev
+        # accumulates in float64 where ndarray.std() accumulated in float32.
+        m, s = cv2.meanStdDev(gray)
+        mean, std = float(m[0, 0]), float(s[0, 0])
         if std < 1e-6:
-            return gray - float(gray.mean())
-        return (gray - float(gray.mean())) / std * 32.0 + 128.0
+            return gray - mean
+        a = 32.0 / std
+        out = cv2.multiply(gray, a, dtype=cv2.CV_32F)
+        return cv2.add(out, 128.0 - mean * a, dst=out)
 
 
-def sample_frames_for_background(source, n: int) -> list[np.ndarray]:
-    """Evenly sample n frames across the clip for the median background model."""
-    total = source.info.frame_count
-    idxs = np.linspace(0, max(0, total - 1), num=min(n, total), dtype=int)
-    return [f for f in (source.frame_at(int(i)) for i in idxs) if f is not None]
 
 
 def flow_input_preview(bgr: np.ndarray, work_size: tuple[int, int],

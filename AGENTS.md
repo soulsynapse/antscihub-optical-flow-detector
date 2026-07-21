@@ -13,17 +13,15 @@ see `README.md` and `docs/decisions.md`; historical handoffs are under
   while importing QtCore`), and Python311/Python37/WindowsApps have no PyQt6.
   A bare `python ...` will therefore fail — always call the venv python
   explicitly. (`.venv` is hidden/git-ignored, so a casual dir listing can miss it.)
-- The GUI is driven **headlessly** with offscreen Qt — no display needed. Pattern
-  (see `scripts/render_tabs.py`, `scripts/gui_smoke_test.py`):
+- The GUI is driven **headlessly** with offscreen Qt — no display needed. Pattern:
   set `QT_QPA_PLATFORM=offscreen` (and `QT_QPA_FONTDIR=C:/Windows/Fonts` on
-  Windows) *before* importing PyQt, build `MainWindow`, call `state.load_video(...)`
-  / `state.open_cache(key)`, invoke slot methods directly, `app.processEvents()`,
+  Windows) *before* importing PyQt, build `MainWindow`, call `state.load_video(...)`,
+  invoke slot methods directly, `app.processEvents()`,
   then `win.grab().save("screenshots/foo.png")` to eyeball a tab.
-- **The smoke/render scripts are stale**: they call the *shelved* flat-AND tab3
-  API (`tab3._sync_from_behavior`, `_rebuild_plots`, `tab3.plots`, `_add_constraint`).
-  The live tab3 (`gui/tab3_behavior.py`) is the tree editor — `_sync_editor`,
-  `_add_leaf`, a `QTreeWidget`, no `.plots` dict. Fix these calls before relying
-  on those scripts, or write a fresh offscreen driver.
+- **There is no working offscreen driver right now.** `scripts/_shelved/` holds
+  the two that existed; both drove the retired flow-cache and Behavior tabs and
+  were already stale before that. Write a fresh one against tabs 0-1 rather than
+  repairing them — see `scripts/_shelved/README.md`.
 
 ## Static checking without Qt
 
@@ -37,11 +35,30 @@ see `README.md` and `docs/decisions.md`; historical handoffs are under
 
 ## Architecture touchpoints (stable enough to rely on)
 
-- **`gui/state.py::AppState`** is the single shared hub. The three tabs never
+- **`gui/state.py::AppState`** is the single shared hub. Tabs never
   reference each other — they talk only through `AppState` signals
   (`video_loaded`, `cache_opened`, `rois_changed`, `frame_changed`,
   `behaviors_changed`, `status`, `request_tab`). To make one tab react to
   another's change, wire it through a state signal, not a direct call.
+- **Tabs are `MainWindow.tabs` indices 0-1:** 0 Replicates (`tab2`), 1
+  Preprocessing (live) (`tab_live`). The `tab2` field name predates the reorder —
+  go by the index/label, not the number in the attribute. Neither tab needs a
+  cache, so neither is ever disabled once a video loads.
+- **The flow-cache commit and Behavior Classification tabs are retired** to
+  `gui/_shelved/` (see its README). `AppState` still carries the cache API and
+  `cache_opened` — the explorers gate on `has_cache` — but no GUI surface writes
+  a cache now; that path is CLI-only until the whole-video detection pass lands.
+- **The tensor/scalogram detection path is cache-independent.** `ScalogramExplorer`
+  takes a `core.channel_source.ChannelData` (from `cache_channel_source` or
+  `live_channel_source`), not a raw cache. `core.tensor_channels.extract_channels_live`
+  streams a windowed structure-tensor pass over a bare video;
+  `core.wavelet.morlet_band_power` + `core.detection` (`detect_channel_region`,
+  and the shared count/window/gate/clump functions the explorer also calls) run
+  the detector; `gui/explorers/live_scalogram_surface.py` +
+  `gui/tab_live_preprocess.py` host the live-tuning surface and the whole-video
+  commit, and `gui/explorers/detection_timeline.py` is the navigation strip. When
+  touching detection math, change `core/detection.py` — never fork a formula into
+  the explorer, or the preview and the whole-clip pass will disagree.
 - **Per-video data lives in sidecar files next to the video**, via
   `AppState.video_sidecar(kind)` → `<video-path-without-ext>.<kind>.json`
   (returns `None` when no video loaded). Current kinds: `rois` (Tab 1 replicate
