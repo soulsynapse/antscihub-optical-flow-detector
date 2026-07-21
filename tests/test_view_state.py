@@ -268,11 +268,7 @@ class ReplicateSwitchBandsTest(unittest.TestCase):
         self.app.processEvents()
 
     def _select(self, ex, idx):
-        for i in range(ex.region_combo.count()):
-            if ex.region_combo.itemData(i) == idx:
-                ex.region_combo.setCurrentIndex(i)
-                return
-        self.fail(f"no combo entry for region {idx}")
+        ex.select_region(idx)
 
     def _await_matrix(self, ex, timeout=10.0):
         """Cubes build on a worker; spin the loop until the selected channel's

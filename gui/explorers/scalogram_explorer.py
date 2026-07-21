@@ -45,7 +45,7 @@ import numpy as np
 from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
                          QShortcut)
-from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
+from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
                              QGridLayout, QHBoxLayout, QLabel,
                              QPushButton, QScrollArea, QSlider, QVBoxLayout,
                              QWidget)
@@ -114,8 +114,7 @@ class ScalogramPlot(MiniPlot):
         self.freqs = np.asarray(freqs, np.float64)
         # Required, not defaulted: the cone of influence is a width in SECONDS
         # converted to columns, so a wrong fps draws a confidently wrong wedge.
-        # Same reasoning as the cache_key provenance argument -- make the
-        # omission impossible rather than documented.
+        # Make the omission impossible rather than documented.
         self.fps = float(fps)
         self.matrix = np.zeros((0, 0), np.float32)     # (F, T) power
         self._img = None
@@ -773,7 +772,6 @@ class ScalogramExplorer(QWidget):
                 self.count_w_plot.band_committed,
                 self.sweep_win_slider.valueChanged,
                 self.centered_chk.stateChanged,
-                self.region_combo.currentIndexChanged,
                 self.chan_group.buttonToggled]
         srcs += [dp.band_committed for dp in self.density_plots.values()]
         for sig in srcs:
@@ -789,9 +787,7 @@ class ScalogramExplorer(QWidget):
         for the one case that is not a rebuild -- restoring the replicate a
         remembered session was tuned against when the clip is reopened.
         """
-        i = self.region_combo.findData(int(index))
-        if i >= 0:
-            self.region_combo.setCurrentIndex(i)
+        self._set_active_region(int(index))
 
     def reset_tuning(self) -> None:
         """Every tuned detection parameter back to a freshly-built explorer's:
@@ -1122,21 +1118,17 @@ class ScalogramExplorer(QWidget):
         trow.addWidget(self.rate_lbl)
         left.addLayout(trow)
 
+        # Passive readout, not a dropdown (T20): selection is by clicking the
+        # video tile (right-click un-focuses to the pooled scope), so a combo was
+        # a redundant second route to state the gestures already own. This only
+        # reflects the current focus.
         rrow = QHBoxLayout()
         rrow.addWidget(QLabel("Replicate:"))
-        self.region_combo = QComboBox()
-        if len(self.regions) > 1:
-            self.region_combo.addItem(
-                "— all replicates (click one to select) —", -1)
-        for i, r in enumerate(self.regions):
-            rid = r["id"]
-            suffix = f" (#{rid})" if rid is not None else ""
-            self.region_combo.addItem(f"{r['label']}{suffix}", i)
-        idx = self.region_combo.findData(self.active_region_index)
-        self.region_combo.setCurrentIndex(max(0, idx))
-        self.region_combo.currentIndexChanged.connect(self._on_region_changed)
-        rrow.addWidget(self.region_combo, 1)
+        self.region_lbl = QLabel()
+        self.region_lbl.setStyleSheet("font-size:11px; color:#bbb;")
+        rrow.addWidget(self.region_lbl, 1)
         left.addLayout(rrow)
+        self._sync_region_label()
 
         hrow = QHBoxLayout()
         self.hi_chk = QCheckBox("Highlight blocks in band")
@@ -2228,11 +2220,25 @@ class ScalogramExplorer(QWidget):
                 f"Re-drag it, or widen it, to tune against this replicate.")
             self.band_note.setVisible(True)
 
-    def _on_region_changed(self, _index):
+    def _set_active_region(self, new_index: int):
+        """The single sink every selection gesture routes through -- click-to-
+        select, right-click-to-pool, and session restore (T20 removed the
+        dropdown that used to be a second route to the same state).
+
+        ``new_index`` is a region index, or a negative value for the pooled
+        scope (which only exists with more than one replicate; with one it
+        collapses to that replicate). An out-of-range or no-op index is ignored,
+        matching the old combo's silent suppression of a same-index set."""
+        new_index = int(new_index)
+        if new_index < 0:
+            new_index = -1 if len(self.regions) > 1 else 0
+        elif new_index >= len(self.regions):
+            return
+        if new_index == self.active_region_index:
+            return
         old_index = self.active_region_index
         self._stash_bands(old_index)
-        data = self.region_combo.currentData()
-        self.active_region_index = int(data) if data is not None else 0
+        self.active_region_index = new_index
         self._restore_bands(old_index)
         # A different replicate is a different set of blocks, so the accumulated
         # axis bounds do not describe it. Carrying them over would put one
@@ -2243,8 +2249,25 @@ class ScalogramExplorer(QWidget):
         self.video_view.set_focus_frac(focus)
         self._sync_video_boxes()
         self._sync_window_title()
+        self._sync_region_label()
         self._rebuild_scalograms()   # _refresh_densities syncs the off-range note
         self._redraw_video()
+        # Region is one of the knobs capture_view_state persists, so a switch is
+        # a tuning change; the old combo emitted this via the relay in
+        # _wire_tuning_changed, which no longer has a widget to hang off.
+        self.tuning_changed.emit()
+
+    def _sync_region_label(self):
+        """Reflect the focused replicate in the passive readout that replaced the
+        dropdown. The pooled scope reads as a hint to click, since clicking is now
+        the only way in."""
+        if self.active_region_index < 0:
+            self.region_lbl.setText("all — click a replicate to select")
+            return
+        r = self.regions[self.active_region_index]
+        rid = r.get("id")
+        suffix = f" (#{rid})" if rid is not None else ""
+        self.region_lbl.setText(f"{r['label']}{suffix}")
 
     def _on_channel_toggled(self, button, checked: bool):
         # buttonToggled fires for both the newly-unchecked and newly-checked
@@ -2307,15 +2330,12 @@ class ScalogramExplorer(QWidget):
         for i, region in enumerate(self.regions):
             x0, y0, x1, y1 = region["frac"]
             if x0 <= fx <= x1 and y0 <= fy <= y1:
-                idx = self.region_combo.findData(i)
-                if idx >= 0:
-                    self.region_combo.setCurrentIndex(idx)
+                self._set_active_region(i)
                 return
 
     def _clear_region_focus(self):
-        idx = self.region_combo.findData(-1)
-        if idx >= 0:                       # selection scope exists: back to it
-            self.region_combo.setCurrentIndex(idx)
+        if len(self.regions) > 1:          # pooled scope exists: back to it
+            self._set_active_region(-1)
         else:
             self.video_view.set_focus_frac(None)
 

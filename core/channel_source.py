@@ -176,10 +176,9 @@ def live_channel_source(video_path: str, cfg, replicates: list[dict], *,
     returned meta as ``clip_provenance`` and MUST be folded into the key of
     anything cached downstream -- below ``lossless`` these are different pixels
     from the source's, so a clip-derived result and a live-crop-derived one are
-    different measurements (``FINDINGS.md`` section 10). ``PipelineConfig.cache_key``
-    takes it as an optional third argument; note that nothing passes it yet, so
-    this is an obligation on the next caller to cache clip-derived output rather
-    than a guarantee already in force.
+    different measurements (``FINDINGS.md`` section 10). Nothing caches a
+    clip-derived result today, so this is an obligation on the first caller that
+    does rather than a guarantee already in force.
 
     ``channels`` restricts the pass to the channels named (default: all of
     ``LIVE_CHANNELS``). The returned ``ChannelData`` then **carries only those

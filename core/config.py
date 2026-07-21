@@ -11,8 +11,6 @@ at the video-decode boundary and in tooltips.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass, field, asdict, replace
 from typing import Literal
 
@@ -236,45 +234,6 @@ class PipelineConfig:
             features=FeatureConfig(**feat),
             version=d.get("version", CONFIG_VERSION),
         )
-
-    def cache_key(self, video_hash: str,
-                  replicate_geometry_hash: str | None = None,
-                  provenance_key: str | None = None) -> str:
-        """Stable hash over video, processing settings, and ROI geometry.
-
-        ``provenance_key`` is ``Manifest.provenance_key()`` when the pass read
-        pre-transcoded clips. It is a third provenance axis on top of the two
-        this key already misses -- the decoder and its bit depth (``FINDINGS.md``
-        section 3 trap 3) -- and without it a result computed from a live crop
-        and one computed from a clip cut at a different quality compare as equal,
-        which they are not: below ``lossless`` the clip's pixels differ from the
-        source's, and ``change`` measures exactly the frame-to-frame quantity
-        lossy inter-frame coding perturbs.
-
-        Omitted from the blob entirely when absent, rather than hashed as
-        ``None``: absence unambiguously means "read from the source", so every
-        cache built before clips existed keeps its key and stays valid.
-
-        **Opt-in, and currently opted into by nobody.** No caller passes this
-        today, because nothing caches a clip-derived result yet -- the flow cache
-        is not the detection path on this branch and ``run_pipeline`` takes no
-        manifest. So this is an available guard, not an active one, and the
-        obligation lands on whoever first caches something read from clips: the
-        provenance key travels in the channel meta as ``clip_provenance``
-        (``channel_source.live_channel_source``) and must be threaded to here.
-        Miss it and a source-derived result and a clip-derived one collide
-        silently in the same cache entry. Recorded in ``todo.md`` under Standing
-        decisions, which also carries the recommended fix: make this parameter
-        required and keyword-only, so a caller must claim ``provenance_key=None``
-        rather than forget it.
-        """
-        d = {"video": video_hash,
-             "replicate_geometry": replicate_geometry_hash,
-             **self.to_dict()}
-        if provenance_key is not None:
-            d["clip_provenance"] = provenance_key
-        blob = json.dumps(d, sort_keys=True).encode()
-        return hashlib.sha1(blob).hexdigest()[:16]
 
     def with_band(self, band: Band) -> "PipelineConfig":
         return replace(self, features=replace(self.features, bands=(band,)))

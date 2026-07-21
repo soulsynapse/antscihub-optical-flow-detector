@@ -327,20 +327,7 @@ class ClipExtractionTest(unittest.TestCase):
                                frame_count=self.man.frame_count)
 
 
-class CacheKeyProvenanceTest(unittest.TestCase):
-    def test_absent_provenance_leaves_the_key_unchanged(self):
-        """Caches built before clips existed must keep their keys."""
-        cfg = PipelineConfig()
-        self.assertEqual(cfg.cache_key("vid", "geo"),
-                         cfg.cache_key("vid", "geo", None))
-
-    def test_provenance_changes_the_key(self):
-        cfg = PipelineConfig()
-        base = cfg.cache_key("vid", "geo")
-        self.assertNotEqual(base, cfg.cache_key("vid", "geo", "abc123"))
-        self.assertNotEqual(cfg.cache_key("vid", "geo", "abc123"),
-                            cfg.cache_key("vid", "geo", "def456"))
-
+class ProvenanceKeyTest(unittest.TestCase):
     def test_quality_alone_changes_the_provenance_key(self):
         """Two cuts differing only in quality are different measurements: the
         change channel is squared frame differencing, which is precisely what
