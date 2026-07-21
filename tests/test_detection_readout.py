@@ -19,7 +19,7 @@ os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
 from PyQt6.QtGui import QImage, QPainter
 from PyQt6.QtWidgets import QApplication
 
-from gui.explorers.speed_explorer import MiniPlot
+from gui.explorers.plots import MiniPlot
 from gui.video_panel import FrameView
 
 _APP = QApplication.instance() or QApplication([])
@@ -96,7 +96,7 @@ class BadgeMatchesSpanColourTest(unittest.TestCase):
     drifting apart would read as two different states."""
 
     def test_the_two_greens_are_one_colour(self):
-        from gui.explorers.speed_explorer import DETECT
+        from gui.explorers.plots import DETECT
         from gui.video_panel import DETECT_BADGE
         self.assertEqual(DETECT.getRgb(), DETECT_BADGE.getRgb())
 

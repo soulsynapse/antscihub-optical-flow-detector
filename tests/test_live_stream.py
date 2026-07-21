@@ -217,7 +217,7 @@ class SetChannelDataTests(_QtTestCase):
         inverted, and it is the normal case for any live window shorter than the
         plot is wide (~600 px), so a dense-span test cannot see it.
         """
-        from gui.explorers.speed_explorer import DensityPlot
+        from gui.explorers.plots import DensityPlot
         w, h = 600, 120
         T, K, total = 64, 20, 128          # covers exactly the left half
         dp = DensityPlot("d")

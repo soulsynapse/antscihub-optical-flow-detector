@@ -57,7 +57,7 @@ from core.detection import (detect_gate, inband_count, largest_clump_per_frame,
 from core.wavelet import (band_indices, coi_edge_samples, default_freqs,
                           morlet_power)
 from gui.video_panel import FrameView
-from gui.explorers.speed_explorer import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
+from gui.explorers.plots import (BG, CURSOR, DISPLAY_MAX_W, PLOT_BG,
                                           TXT, TXT_DIM, DensityPlot, MiniPlot,
                                           PixelBarPlot, _regions_from_meta)
 
