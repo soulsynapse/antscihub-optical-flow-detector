@@ -657,5 +657,192 @@ class ProcessedBoxesAreGatedTest(unittest.TestCase):
         self.assertFalse(tab.replicates[0]["processed"])
 
 
+class ReplicateIdentityTest(unittest.TestCase):
+    """Ids are handed out once and never again.
+
+    An id is now a directory beside the video (``core.replicate_home``) holding
+    that replicate's track, marks and tuning. ``max(existing) + 1`` -- what this
+    used to be -- recycles the moment the highest box is deleted, so the next box
+    drawn would open on a dead animal's detections and there would be nothing on
+    screen to say so. Every test here is that one failure, approached from a
+    different gesture.
+    """
+
+    def _tab(self, video=None):
+        from unittest.mock import patch
+
+        from gui.state import AppState
+        from gui.tab2_replicates import Tab2Replicates
+        tab = Tab2Replicates(AppState())
+        if video is not None:
+            p = patch.object(type(tab), "_video_path", lambda self: video)
+            p.start()
+            self.addCleanup(p.stop)
+        return tab
+
+    def _dir(self):
+        import tempfile
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        return d.name
+
+    def test_a_deleted_id_is_not_reissued_within_a_session(self):
+        tab = self._tab()
+        tab._on_box_drawn(0.1, 0.1, 0.2, 0.2)
+        tab._on_box_drawn(0.5, 0.5, 0.6, 0.6)          # id 2
+        tab._delete()                                   # removes id 2
+        tab._on_box_drawn(0.7, 0.7, 0.8, 0.8)
+        self.assertEqual([r["id"] for r in tab.replicates], [1, 3])
+
+    def test_a_deleted_id_is_not_reissued_across_a_REOPEN(self):
+        """The case the in-memory counter alone never covered: _load_sidecar
+        recomputed it from the surviving boxes, so closing and reopening the clip
+        rewound it."""
+        import json
+        from unittest.mock import patch
+        d = self._dir()
+        path = os.path.join(d, "clip.rois.json")
+        tab = self._tab()
+        with patch.object(tab.state, "video_sidecar", return_value=path):
+            tab._on_box_drawn(0.1, 0.1, 0.2, 0.2)
+            tab._on_box_drawn(0.5, 0.5, 0.6, 0.6)      # id 2
+            tab._delete()                               # id 2 retired
+            with open(path) as f:
+                self.assertEqual(json.load(f)["next_id"], 3)
+            tab._load_sidecar()                         # the reopen
+            tab._on_box_drawn(0.7, 0.7, 0.8, 0.8)
+        self.assertEqual([r["id"] for r in tab.replicates], [1, 3])
+
+    def test_a_sidecar_written_before_the_counter_existed_still_loads(self):
+        import json
+        from unittest.mock import patch
+        d = self._dir()
+        path = os.path.join(d, "clip.rois.json")
+        with open(path, "w") as f:
+            json.dump({"replicates": [
+                {"id": 4, "label": "rep4", "frac": [0.1, 0.1, 0.2, 0.2],
+                 "color": "#ff5a5a"}]}, f)
+        tab = self._tab()
+        with patch.object(tab.state, "video_sidecar", return_value=path):
+            tab._load_sidecar()
+            tab._on_box_drawn(0.5, 0.5, 0.6, 0.6)
+        self.assertEqual([r["id"] for r in tab.replicates], [4, 5],
+                         "max()+1 is still the floor when there is no counter")
+
+    def test_a_corrupt_counter_cannot_hand_back_a_live_id(self):
+        import json
+        from unittest.mock import patch
+        d = self._dir()
+        path = os.path.join(d, "clip.rois.json")
+        with open(path, "w") as f:
+            json.dump({"next_id": "nonsense", "replicates": [
+                {"id": 7, "label": "a", "frac": [0.1, 0.1, 0.2, 0.2],
+                 "color": "#ff5a5a"}]}, f)
+        tab = self._tab()
+        with patch.object(tab.state, "video_sidecar", return_value=path):
+            tab._load_sidecar()
+            tab._on_box_drawn(0.5, 0.5, 0.6, 0.6)
+        self.assertEqual([r["id"] for r in tab.replicates], [7, 8])
+
+    def test_an_imported_layout_is_renumbered_onto_fresh_ids(self):
+        """`processed: False` claims the imported boxes carry no measurements.
+        Keeping the source clip's ids would contradict it -- an imported id 1
+        lands in THIS video's rep01 home and adopts whatever is already there."""
+        import json
+        from unittest.mock import patch
+        d = self._dir()
+        layout = os.path.join(d, "layout.json")
+        with open(layout, "w") as f:
+            json.dump({"replicates": [
+                {"id": 1, "label": "a", "frac": [0.1, 0.1, 0.2, 0.2],
+                 "color": "#ff5a5a"},
+                {"id": 2, "label": "b", "frac": [0.5, 0.5, 0.6, 0.6],
+                 "color": "#4ac6ff"}]}, f)
+        tab = self._tab()
+        tab._on_box_drawn(0.7, 0.7, 0.8, 0.8)          # this clip already has 1
+        with patch("gui.tab2_replicates.QFileDialog.getOpenFileName",
+                   return_value=(layout, "")), \
+                patch.object(tab.state, "video_sidecar", return_value=None):
+            tab._load()
+        self.assertEqual([r["id"] for r in tab.replicates], [2, 3])
+        self.assertEqual([r["label"] for r in tab.replicates], ["a", "b"],
+                         "renumbering must not disturb the labels")
+
+    def test_drawing_a_box_creates_its_home(self):
+        from core.replicate_home import replicate_dir
+        d = self._dir()
+        video = os.path.join(d, "clip.mp4")
+        tab = self._tab(video=video)
+        tab._on_box_drawn(0.1, 0.1, 0.2, 0.2)
+        self.assertTrue(os.path.isdir(replicate_dir(video, 1)),
+                        "the home exists from the moment the box does, cut or not")
+
+    def test_deleting_a_box_leaves_its_home_on_disk(self):
+        from core.replicate_home import home_path, replicate_dir
+        d = self._dir()
+        video = os.path.join(d, "clip.mp4")
+        tab = self._tab(video=video)
+        tab._on_box_drawn(0.1, 0.1, 0.2, 0.2)
+        with open(home_path(video, 1, ".track.npz"), "wb") as f:
+            f.write(b"\0" * 16)
+        # Contents present, so the gate fires; approving must still not unlink.
+        from unittest.mock import patch
+        with patch.object(type(tab), "_confirm_discard",
+                          lambda self, reps, title, what: True):
+            tab._delete()
+        self.assertEqual(tab.replicates, [])
+        self.assertTrue(os.path.exists(home_path(video, 1, ".track.npz")),
+                        "removing a box must never unlink a measurement")
+        self.assertTrue(os.path.isdir(replicate_dir(video, 1)))
+
+    def test_deleting_an_empty_box_does_not_prompt(self):
+        """Most deletes are a misdrawn box seconds old. A dialog on those trains
+        the user to dismiss the one that matters."""
+        from unittest.mock import patch
+        d = self._dir()
+        tab = self._tab(video=os.path.join(d, "clip.mp4"))
+        tab._on_box_drawn(0.1, 0.1, 0.2, 0.2)
+        # The gate is INSIDE _confirm_discard, so patching that would test
+        # nothing. Watch for a dialog being built instead -- QMessageBox.exec
+        # spins a nested event loop and would hang the suite headless anyway.
+        with patch("gui.tab2_replicates.QMessageBox",
+                   side_effect=AssertionError("prompted with nothing at stake")):
+            tab._delete()
+        self.assertEqual(tab.replicates, [])
+
+    def test_a_rename_moves_nothing_on_disk(self):
+        from core.replicate_home import replicate_dir
+        from unittest.mock import patch
+        d = self._dir()
+        video = os.path.join(d, "clip.mp4")
+        tab = self._tab(video=video)
+        tab._on_box_drawn(0.1, 0.1, 0.2, 0.2)
+        before = sorted(os.listdir(d))
+        with patch("gui.tab2_replicates.QInputDialog.getText",
+                   return_value=("wing-clipped #4", True)):
+            tab._rename()
+        self.assertEqual(tab.replicates[0]["label"], "wing-clipped #4")
+        self.assertEqual(sorted(os.listdir(d)), before,
+                         "the home is named by id; a label change is a string edit")
+        self.assertTrue(os.path.isdir(replicate_dir(video, 1)))
+
+    def test_a_duplicate_label_is_allowed_once_acknowledged(self):
+        """Two tubes both called "control" is a legibility problem, not a
+        collision -- every store keys on the id."""
+        from unittest.mock import patch
+        d = self._dir()
+        tab = self._tab(video=os.path.join(d, "clip.mp4"))
+        tab._on_box_drawn(0.1, 0.1, 0.2, 0.2)
+        tab._on_box_drawn(0.5, 0.5, 0.6, 0.6)
+        tab.list.setCurrentRow(1)
+        with patch("gui.tab2_replicates.QInputDialog.getText",
+                   return_value=("rep1", True)), \
+                patch.object(type(tab), "_confirm_duplicate_label",
+                             lambda self, rep, name: True):
+            tab._rename()
+        self.assertEqual([r["label"] for r in tab.replicates], ["rep1", "rep1"])
+        self.assertEqual([r["id"] for r in tab.replicates], [1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()

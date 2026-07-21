@@ -1093,5 +1093,98 @@ class ProcessPlanTests(_SurfaceTestCase):
         self.assertIsNone(surface._proc_worker)
 
 
+class PerReplicateTrackTest(_SurfaceTestCase):
+    """Switching replicates is a handover, not a settings change.
+
+    With one track per clip, selecting replicate 2 after replicate 1 wrote into
+    the SAME (T,) arrays: the first animal's counts were overwritten frame for
+    frame and only the stamp id changed, so the strip stayed plausible while the
+    work was gone.
+    """
+
+    def _surface2(self):
+        """Two replicates whose ids are deliberately not 0 and 1, so a test
+        cannot pass by conflating a region index with a replicate id."""
+        self._drop_tuning()
+        self.addCleanup(self._drop_tuning)
+        reps = [{"id": 9, "label": "b", "frac": (0.5, 0.0, 1.0, 1.0)},
+                {"id": 5, "label": "a", "frac": (0.0, 0.0, 0.5, 1.0)}]
+        surface = LiveScalogramSurface(self.video, reps)
+        self.addCleanup(self._destroy, surface)
+        surface.start_stream = MagicMock()
+        return surface
+
+    def test_region_index_maps_through_tile_order_not_position(self):
+        s = self._surface2()
+        # in_tile_order sorts by id, and the list above is in draw order.
+        self.assertEqual(s._replicate_id_for(0), 5)
+        self.assertEqual(s._replicate_id_for(1), 9)
+        self.assertIsNone(s._replicate_id_for(2))
+
+    def test_each_region_gets_its_own_track_object(self):
+        s = self._surface2()
+        s._activate_region(0)
+        first = s._track
+        s._activate_region(1)
+        self.assertIsNot(s._track, first)
+        s._activate_region(0)
+        self.assertIs(s._track, first, "returning to a region must not re-create it")
+
+    def test_a_region_switch_does_not_overwrite_the_other_regions_series(self):
+        import numpy as np
+        s = self._surface2()
+        s._activate_region(0)
+        s._track.count[100:150] = 7.0
+        s._activate_region(1)
+        s._track.count[100:150] = 3.0
+        s._activate_region(0)
+        np.testing.assert_allclose(s._track.count[100:150], 7.0)
+
+    def test_a_switch_flushes_the_outgoing_track_to_its_own_folder(self):
+        from core.live_track import TrackStamp
+        from core.replicate_home import home_path
+        import numpy as np
+        s = self._surface2()
+        s._activate_region(0)
+        stamp = TrackStamp(channel="change", freq_band_hz=(1.0, 5.0),
+                           grid=(4, 3), region_index=0, region_blocks=6,
+                           downsample=1.0, block_size=8)
+        s._track.set_stamp(stamp, region_grid=(2, 3,
+                                               np.arange(6, dtype=np.int32) // 3,
+                                               np.arange(6, dtype=np.int32) % 3))
+        s._track.write(0, np.ones((20, 6), np.float32), trim=0)
+        s._activate_region(1)          # the handover pays for the outgoing work
+        self.assertTrue(os.path.exists(home_path(self.video, 5, ".track.npz")),
+                        "replicate 5's track must land in replicate 5's folder")
+        self.assertFalse(os.path.exists(home_path(self.video, 9, ".track.npz")))
+
+    def test_nothing_is_written_before_a_region_is_chosen(self):
+        """The placeholder track is all-uncovered, which is save_track's cue to
+        DELETE a sidecar -- and with no replicate id the one it would delete is
+        the legacy per-video file no replicate has adopted yet."""
+        from gui.track_store import track_path
+        s = self._surface2()
+        with open(track_path(self.video), "wb") as f:
+            f.write(b"not a real sidecar")
+        self.addCleanup(lambda: os.path.exists(track_path(self.video))
+                        and os.remove(track_path(self.video)))
+        self.assertIsNone(s._active_region)
+        self.assertFalse(s._save_track())
+        self.assertTrue(os.path.exists(track_path(self.video)))
+
+    def test_a_region_with_no_replicate_behind_it_is_never_written(self):
+        """The error path must not reintroduce the bug. A stale remembered
+        selection has no replicate id, and falling through to replicate_id=None
+        would write one region's work straight back to the shared per-video
+        file."""
+        from gui.track_store import track_path
+        s = self._surface2()
+        s._activate_region(4)                     # only regions 0 and 1 exist
+        self.assertIsNone(s._active_region, "must not activate a phantom region")
+        s._active_region = 4                      # force the refusal path
+        self.assertFalse(s._save_track())
+        self.assertFalse(os.path.exists(track_path(self.video)))
+
+
 if __name__ == "__main__":
     unittest.main()

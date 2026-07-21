@@ -20,9 +20,9 @@ N = 400
 B = 6
 
 
-def _stamp(channel="change", blocks=B, band=(1.0, 5.0)):
+def _stamp(channel="change", blocks=B, band=(1.0, 5.0), region=0):
     return TrackStamp(channel=channel, freq_band_hz=band, grid=(4, 3),
-                      region_index=0, region_blocks=blocks, downsample=1.0,
+                      region_index=region, region_blocks=blocks, downsample=1.0,
                       block_size=8)
 
 
@@ -197,6 +197,93 @@ class TrackStoreRefusals(unittest.TestCase):
         np.savez(track_path(self.video), **payload)
         back, _ = load_track(self.video, N, FPS)
         self.assertIsNone(back)
+
+
+class PerReplicateTracksTest(unittest.TestCase):
+    """One track per replicate, not one per clip.
+
+    The bug these close is entirely silent: replicate 3's pass overwrote
+    replicate 2's arrays and its sidecar, and the strip showed a full, plausible
+    track the whole time -- just the wrong animal's, with several minutes of
+    decode gone and nothing to indicate it.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.video = os.path.join(self.dir, "clip.mp4")
+
+    def test_two_replicates_do_not_share_a_file(self):
+        self.assertNotEqual(track_path(self.video, 1),
+                            track_path(self.video, 2))
+        self.assertNotEqual(track_path(self.video, 1), track_path(self.video))
+
+    def test_saving_one_replicate_leaves_the_others_intact(self):
+        a = _filled(stamp=_stamp(region=0), first=50, rows=60, seed=1)
+        b = _filled(stamp=_stamp(region=1), first=200, rows=60, seed=2)
+        self.assertTrue(save_track(self.video, a, replicate_id=1)[0])
+        self.assertTrue(save_track(self.video, b, replicate_id=2)[0])
+        back_a, _ = load_track(self.video, N, FPS, replicate_id=1)
+        back_b, _ = load_track(self.video, N, FPS, replicate_id=2)
+        np.testing.assert_allclose(back_a.count, a.count)
+        np.testing.assert_allclose(back_b.count, b.count)
+        self.assertNotEqual(back_a.detected_intervals(),
+                            back_b.detected_intervals())
+
+    def test_a_save_creates_the_home_when_it_is_missing(self):
+        """A layout imported into a tree tidied by hand can have no folder yet,
+        and discovering that as a failed write costs the whole pass."""
+        wrote, note = save_track(self.video, _filled(), replicate_id=4)
+        self.assertTrue(wrote, note)
+        self.assertTrue(os.path.exists(track_path(self.video, 4)))
+
+    def test_a_replicate_with_no_track_reads_nothing(self):
+        save_track(self.video, _filled(), replicate_id=1)
+        self.assertIsNone(load_track(self.video, N, FPS, replicate_id=2)[0])
+
+    # -- adopting a pre-homes sidecar ---------------------------------------
+    def test_a_legacy_sidecar_is_adopted_by_the_region_it_names(self):
+        save_track(self.video, _filled(stamp=_stamp(region=1)))   # legacy path
+        back, note = load_track(self.video, N, FPS,
+                                replicate_id=7, legacy_region=1)
+        self.assertIsNotNone(back)
+        self.assertEqual(back.stamp.region_index, 1)
+        self.assertIn("pre-replicate-folder", note)
+
+    def test_a_legacy_sidecar_is_refused_by_every_other_region(self):
+        """The one that matters. A pre-homes file holds exactly ONE region's
+        work; handing it to whichever replicate asks first would present one
+        animal's detections as another's."""
+        save_track(self.video, _filled(stamp=_stamp(region=1)))
+        for region in (0, 2, 3):
+            self.assertIsNone(
+                load_track(self.video, N, FPS, replicate_id=7,
+                           legacy_region=region)[0],
+                f"region {region} must not adopt region 1's track")
+
+    def test_no_legacy_region_means_no_adoption(self):
+        """A caller that cannot say which region it is asking about gets
+        nothing, rather than the file that happens to be there."""
+        save_track(self.video, _filled(stamp=_stamp(region=1)))
+        self.assertIsNone(load_track(self.video, N, FPS, replicate_id=7)[0])
+
+    def test_the_home_copy_wins_once_it_exists(self):
+        legacy = _filled(stamp=_stamp(region=1), first=50, rows=40, seed=3)
+        home = _filled(stamp=_stamp(region=1), first=300, rows=40, seed=4)
+        save_track(self.video, legacy)
+        save_track(self.video, home, replicate_id=7)
+        back, _ = load_track(self.video, N, FPS,
+                             replicate_id=7, legacy_region=1)
+        np.testing.assert_allclose(back.count, home.count)
+
+    def test_adoption_still_checks_the_clip_identity(self):
+        """An old file gets more scrutiny, not less -- it is likelier to be
+        stale. A frame count that no longer matches means the stored indices
+        point at different footage."""
+        save_track(self.video, _filled(stamp=_stamp(region=1)))
+        back, note = load_track(self.video, N + 1, FPS,
+                                replicate_id=7, legacy_region=1)
+        self.assertIsNone(back)
+        self.assertIn("frames", note)
 
 
 if __name__ == "__main__":

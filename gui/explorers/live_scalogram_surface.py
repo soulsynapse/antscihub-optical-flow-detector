@@ -634,12 +634,24 @@ class LiveScalogramSurface(QWidget):
         # only in memory meant a tab switch or a replicate edit threw it away.
         # Anything restored under settings no longer in force comes back marked
         # stale rather than current -- see gui/track_store.
-        self._track, self._track_note = load_track(
-            video_path, self.frame_count, self.fps)
-        if self._track is None:
-            self._track = WholeVideoTrack(n_frames=self.frame_count,
-                                          fps=self.fps)
-        self._track_grid = self._track.region_grid
+        #
+        # ONE TRACK PER REPLICATE, not one per clip. A track is one region's
+        # answer -- TrackStamp carries region_index and region_blocks precisely
+        # because of that -- but a single WholeVideoTrack holds one set of (T,)
+        # arrays, so processing replicate 2 and then replicate 3 wrote the second
+        # over the first: same frames, same array, only the stamp id changed.
+        # Both the memory and the sidecar were shared, so the first replicate's
+        # minutes of decode were gone and nothing on the strip said so.
+        #
+        # Keyed by REGION INDEX because that is what the stamp and the explorer
+        # speak; the replicate id it maps to (_replicate_id_for) is what picks
+        # the folder on disk. Populated lazily by _activate_region, so a clip
+        # with eight replicates does not load eight sidecars to show one.
+        self._tracks: dict[int, WholeVideoTrack] = {}
+        self._active_region: int | None = None
+        self._track = WholeVideoTrack(n_frames=self.frame_count, fps=self.fps)
+        self._track_note = ""
+        self._track_grid = None
         # One write per burst of detection windows, not one per window: a live
         # pass lands a window every ~2 s and the payload can be tens of MB.
         # Long, because nothing waits on it and the terminal saves (hide, close,
@@ -720,6 +732,14 @@ class LiveScalogramSurface(QWidget):
         self.navigator.pressed.connect(self._on_strip_pressed)
         self.navigator.seek_committed.connect(self._on_seek_committed)
         root.addWidget(self.navigator)
+        # Reopening a clip lands on the replicate it was left on, so that one's
+        # track is loaded here rather than waiting for a pass to name a region.
+        # Without this the strip would open empty for a session that had already
+        # paid for it -- and with per-replicate tracks there is no longer a
+        # "the" track to show before a region is known, so the remembered
+        # selection is the only honest thing to restore.
+        if self._pending_region is not None and int(self._pending_region) >= 0:
+            self._activate_region(int(self._pending_region))
         # A restored track is put on the strip immediately, before anything runs.
         # That IS the feature: the clip opens showing the coverage and detections
         # an earlier session paid for, rather than an empty bar that has to be
@@ -1519,6 +1539,12 @@ class LiveScalogramSurface(QWidget):
         stamp, grid = self._current_stamp()
         if stamp is None:
             return False
+        # Before the stamp, because the stamp is what carries the region and a
+        # region change means a DIFFERENT track, not a stale one. Left to
+        # set_stamp alone the switch would look like a settings change: the old
+        # replicate's frames would go gray in place and the new replicate's
+        # writes would land on top of them.
+        self._activate_region(int(stamp.region_index))
         moved = self._track.set_stamp(stamp, region_grid=grid)
         if moved:
             # Retention is priced per stamp because B moves with the grid and
@@ -1587,6 +1613,63 @@ class LiveScalogramSurface(QWidget):
                 f"settings changed — {stale / max(self.fps, 1e-6):.0f} s of "
                 f"earlier detection is now shown gray (computed under the "
                 f"previous channel/band/geometry) and needs another pass")
+
+    def _replicate_id_for(self, region_index: int) -> int | None:
+        """The replicate id a region index refers to, or None.
+
+        Through ``in_tile_order``, never by treating the index AS the id. A
+        region index is a position in the tile list, which ``build_layout``
+        sorts by id; the two coincide only while ids run 1..N with nothing
+        deleted, which is exactly the state a single delete ends. Getting this
+        wrong writes one animal's track into another's folder -- the failure
+        ``in_tile_order``'s own docstring records having already happened once,
+        for a calibration.
+        """
+        reps = in_tile_order(self.replicates)
+        if 0 <= region_index < len(reps):
+            try:
+                return int(reps[region_index]["id"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
+
+    def _activate_region(self, region_index: int) -> None:
+        """Make ``region_index``'s track the one this surface reads and writes.
+
+        The outgoing track is flushed to ITS OWN folder first. That ordering is
+        the whole fix: a switch used to be free because there was one array to
+        overwrite, and it is now a handover with a cost that has to be paid at
+        the moment the user still has the work.
+
+        Loading is lazy and cached, so switching back and forth between two
+        replicates re-reads neither.
+        """
+        if region_index == self._active_region or region_index < 0:
+            return
+        if self._replicate_id_for(region_index) is None:
+            # No replicate behind this index: a remembered selection from a
+            # layout that has since lost boxes. Staying on the current track is
+            # right -- activating would create one that _save_track must then
+            # refuse to write, which reads as work silently not persisting.
+            return
+        if self._active_region is not None:
+            self._save_track()
+        self._active_region = region_index
+        track = self._tracks.get(region_index)
+        if track is None:
+            rid = self._replicate_id_for(region_index)
+            track, note = load_track(
+                self.video_path, self.frame_count, self.fps,
+                replicate_id=rid, legacy_region=region_index)
+            if track is None:
+                track = WholeVideoTrack(n_frames=self.frame_count, fps=self.fps)
+            elif note:
+                self._track_note = note
+                self.status_lbl.setText(note)
+            self._tracks[region_index] = track
+        self._track = track
+        self._track_grid = track.region_grid
+        self._repaint_track()
 
     def _repaint_track(self) -> None:
         self.navigator.set_track(self._track)
@@ -1659,7 +1742,24 @@ class LiveScalogramSurface(QWidget):
         must not overwrite a live progress readout.
         """
         self._track_save_debounce.stop()
-        wrote, note = save_track(self.video_path, self._track)
+        if self._active_region is None:
+            # No region has been selected, so _track is the empty placeholder.
+            # Writing it would be harmless; letting save_track see an all-
+            # uncovered track would NOT be -- that is its cue to delete the
+            # sidecar, and with replicate_id=None the sidecar it would delete is
+            # the legacy per-video file no replicate has adopted yet.
+            return False
+        rid = self._replicate_id_for(self._active_region)
+        if rid is None:
+            # A region index with no replicate behind it -- a stale remembered
+            # selection, or boxes edited under a live surface. Falling through
+            # would pass replicate_id=None, and save_track would then write this
+            # one region's work to the shared per-video path: the exact
+            # clobbering that per-replicate homes exist to end, reintroduced by
+            # the error path. Refusing costs a re-pass; writing costs a
+            # neighbour's.
+            return False
+        wrote, note = save_track(self.video_path, self._track, replicate_id=rid)
         if note and self._stream_worker is None and self._proc_worker is None:
             self.status_lbl.setText(note)
         return wrote

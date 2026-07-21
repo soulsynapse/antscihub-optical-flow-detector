@@ -8,9 +8,23 @@ editing a replicate (which rebuilds the surface), or reopening the clip tomorrow
 discarded it, and the only way back to the same answer was to spend the same
 minutes again.
 
-Same convention as every other sidecar here: ``.../Foo.mp4`` ->
-``.../Foo.track.npz``, keyed on the video PATH so a human can see which file
-belongs to which clip and moving the clip carries its work along.
+**A track belongs to one REPLICATE, not to the video.** ``TrackStamp`` carries
+``region_index`` and ``region_blocks`` precisely because a track is one region's
+answer, but this file used to derive a single path from the video -- so running
+replicate 2 and then replicate 3 wrote both into ``Foo.track.npz`` and the second
+destroyed the first, silently, at a cost of minutes of decode each time. Tracks
+now live in the replicate's home (``core.replicate_home``): ``.../Foo.mp4``
+replicate 2 -> ``.../Foo_rep02/Foo.track.npz``.
+
+Passing no ``replicate_id`` still resolves the old per-video path. That is not a
+compatibility shim for its own sake -- it is how a sidecar written before homes
+existed is found and adopted, ONCE, by the replicate it actually belongs to. See
+:func:`load_track`: the legacy file names its own region in its stamp, so it is
+offered to that region and to no other. A file that cannot say which replicate it
+describes is ignored rather than guessed at.
+
+Keyed on the video PATH either way, so a human can see which file belongs to
+which clip and moving the clip carries its work along.
 
 **A restore never launders stale work as current.** The stamp registry travels
 with the arrays, so a frame restored under settings that no longer apply comes
@@ -41,6 +55,7 @@ import os
 import numpy as np
 
 from core.live_track import WholeVideoTrack
+from core.replicate_home import ensure_home, home_path
 
 SUFFIX = ".track.npz"
 
@@ -64,13 +79,18 @@ BP_DISK_CAP = 256 * 1024 ** 2
 _ARRAYS = ("count", "clump", "gate", "stamp_id")
 
 
-def track_path(video_path: str) -> str:
-    base, _ = os.path.splitext(video_path)
-    return base + SUFFIX
+def track_path(video_path: str, replicate_id: int | None = None) -> str:
+    """Where one replicate's track lives; the legacy per-video path when
+    ``replicate_id`` is None. See the module note on why both exist."""
+    if replicate_id is None:
+        base, _ = os.path.splitext(video_path)
+        return base + SUFFIX
+    return home_path(video_path, replicate_id, SUFFIX)
 
 
-def save_track(video_path: str, track: WholeVideoTrack) -> tuple[bool, str]:
-    """Write ``track`` as ``video_path``'s sidecar.
+def save_track(video_path: str, track: WholeVideoTrack,
+               replicate_id: int | None = None) -> tuple[bool, str]:
+    """Write ``track`` as this replicate's sidecar.
 
     Returns ``(wrote, note)``. The note is non-empty when something the user
     would want to know happened -- band power declined for size, or the write
@@ -90,7 +110,7 @@ def save_track(video_path: str, track: WholeVideoTrack) -> tuple[bool, str]:
     # Nothing computed -> nothing to remember, and an empty sidecar would be
     # indistinguishable from a stale one on the next read.
     if not (arrays["stamp_id"] != 0).any():
-        _remove(video_path)
+        _remove(video_path, replicate_id)
         return False, ""
 
     if bp is not None:
@@ -120,7 +140,13 @@ def save_track(video_path: str, track: WholeVideoTrack) -> tuple[bool, str]:
         # Written to a temp path and renamed, so an interrupted write cannot
         # replace a good sidecar with a truncated one -- the failure mode that
         # would silently cost the user the pass this file exists to preserve.
-        path = track_path(video_path)
+        path = track_path(video_path, replicate_id)
+        # The home normally exists from the moment the box was drawn, but a
+        # layout imported into a read-only tree, or one a user tidied by hand,
+        # can leave it missing -- and discovering that as a failed write costs
+        # the pass this file exists to preserve.
+        if replicate_id is not None:
+            ensure_home(video_path, replicate_id)
         tmp = path + ".tmp"
         with open(tmp, "wb") as f:
             np.savez(f, meta=np.frombuffer(blob.encode("utf-8"), np.uint8),
@@ -131,9 +157,29 @@ def save_track(video_path: str, track: WholeVideoTrack) -> tuple[bool, str]:
     return True, note
 
 
-def load_track(video_path: str, n_frames: int, fps: float
+def load_track(video_path: str, n_frames: int, fps: float,
+               replicate_id: int | None = None,
+               legacy_region: int | None = None
                ) -> tuple[WholeVideoTrack | None, str]:
-    """Read ``video_path``'s remembered track, or ``(None, note)``.
+    """Read this replicate's remembered track, or ``(None, note)``.
+
+    When the replicate has no track of its own, a legacy per-video sidecar is
+    offered to it -- but only if that file SAYS it is this one's, by carrying
+    ``legacy_region`` as the ``region_index`` of the stamp it was written under.
+    A pre-homes sidecar holds exactly one region's work (that was the bug), so at
+    most one replicate can claim it and the rest correctly see nothing. A file
+    with no stamp names no region and is left alone: adopting it would be a
+    guess, and the thing being guessed at is which animal the numbers describe.
+
+    ``legacy_region`` is passed separately because a replicate ID and a region
+    INDEX are not the same number -- the index is a position in
+    ``core.replicates.in_tile_order``, which sorts by id, so they coincide only
+    when ids happen to run 1..N with nothing deleted. Deriving one from the other
+    here is exactly the shortcut that would adopt a neighbour's track.
+
+    The legacy file is not deleted or moved on adoption. The next save writes the
+    home copy, and the original goes inert the moment the home exists -- which is
+    preferable to a migration that can half-succeed.
 
     ``n_frames`` and ``fps`` are checked against the sidecar rather than trusted
     from it. They are the clip's identity as far as a per-frame series is
@@ -144,9 +190,30 @@ def load_track(video_path: str, n_frames: int, fps: float
     ffmpeg recrop is required, so this must *detect* the change, not assume it
     cannot happen.)
     """
-    path = track_path(video_path)
-    if not video_path or not os.path.exists(path):
+    if not video_path:
         return None, ""
+    path = track_path(video_path, replicate_id)
+    if not os.path.exists(path):
+        if replicate_id is None or legacy_region is None:
+            return None, ""
+        legacy = track_path(video_path)
+        if not os.path.exists(legacy):
+            return None, ""
+        track, note = _read(legacy, n_frames, fps)
+        if track is None or track.stamp is None:
+            return None, note
+        if int(track.stamp.region_index) != int(legacy_region):
+            # Someone else's work, or nobody's. Not this replicate's to show.
+            return None, ""
+        return track, (note and note + " (from a pre-replicate-folder sidecar)")
+    return _read(path, n_frames, fps)
+
+
+def _read(path: str, n_frames: int, fps: float
+          ) -> tuple[WholeVideoTrack | None, str]:
+    """Parse one sidecar. The identity checks live here so the legacy path gets
+    exactly the same scrutiny as the home one -- an old file is more likely to
+    be stale, not less."""
     try:
         with np.load(path, allow_pickle=False) as data:
             state = json.loads(bytes(data["meta"]).decode("utf-8"))
@@ -182,9 +249,9 @@ def load_track(video_path: str, n_frames: int, fps: float
                    f"the clip already examined")
 
 
-def _remove(video_path: str) -> None:
+def _remove(video_path: str, replicate_id: int | None = None) -> None:
     try:
-        os.remove(track_path(video_path))
+        os.remove(track_path(video_path, replicate_id))
     except OSError:
         pass
 

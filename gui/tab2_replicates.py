@@ -23,6 +23,8 @@ from PyQt6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout
                              QListWidget, QListWidgetItem, QMessageBox,
                              QPushButton, QVBoxLayout, QWidget)
 
+from core.replicate_home import (describe_home, ensure_home, replicate_dir,
+                                 sync_homes)
 from gui.state import AppState
 from gui.video_panel import VideoPanel
 
@@ -35,8 +37,13 @@ _PALETTE = ["#ff5a5a", "#4ac6ff", "#ffd24a", "#6ee06e", "#c78bff", "#ff9d3a",
 # of the gate: the cost is not the drag, it is that everything measured against
 # the old rectangle silently stops describing the new one. Same hazard class as
 # T17 and the count-band re-denomination -- state that quietly stops meaning what
-# it meant -- but unlike those it cannot be converted, only discarded.
-_MOVE_ANYWAY = "I recognize the existing replicate data will be lost"
+# it meant -- and like those it cannot be converted.
+#
+# "no longer apply", not "will be lost": since the replicate's home survives a
+# move untouched (_confirm_move), promising loss would be a lie in the one
+# direction that matters -- a user who declines because they believe their marks
+# are about to be deleted has been talked out of a safe action by the warning.
+_MOVE_ANYWAY = "I recognize this replicate's existing results no longer apply"
 
 
 class Tab2Replicates(QWidget):
@@ -101,7 +108,8 @@ class Tab2Replicates(QWidget):
             "right-click to zoom out. "
             "The stamp is always the SELECTED box's size. "
             "A 🔒 box has been processed — moving it asks first, because its "
-            "existing measurements are discarded rather than re-aimed.")
+            "existing measurements go stale rather than being re-aimed. Each "
+            "box owns a folder beside the video that keeps its results.")
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color:#333; font-size:11px;")
         ll.addWidget(self.hint)
@@ -222,13 +230,37 @@ class Tab2Replicates(QWidget):
                     data = json.load(f)
                 self.replicates = [{**r, "frac": tuple(r["frac"])}
                                    for r in data.get("replicates", [])]
-                self._next_id = max(
-                    [r["id"] for r in self.replicates], default=0) + 1
+                self._next_id = self._resume_next_id(data)
             except (OSError, ValueError) as e:
                 self.state.status.emit(f"Could not read boxes: {e}")
         self._rebuild_rois()
         self._refresh_list()
         self._redraw_boxes()
+        # Boxes restored from a sidecar written before homes existed have none.
+        # Created on load rather than lazily on first write, so the directory a
+        # user is told about in a warning is one they can already see.
+        sync_homes(self._video_path(), self.replicates)
+
+    def _resume_next_id(self, data: dict) -> int:
+        """The next id to hand out, never reusing one that has been retired.
+
+        ``max(existing ids) + 1`` alone -- what this used to be -- silently
+        recycles: delete the highest box, reopen the clip, and the next box drawn
+        reclaims that id. With per-replicate homes (``core.replicate_home``) that
+        is no longer merely confusing, it is wrong: the new box inherits the
+        deleted animal's directory, and with it a detection track and a set of
+        marks measured on different pixels.
+
+        So the counter is PERSISTED and only ever moves forward. The max() is
+        still taken, as a floor, because a sidecar written before this field
+        existed has no counter and an imported layout can carry ids above it.
+        """
+        floor = max([int(r["id"]) for r in self.replicates], default=0) + 1
+        try:
+            stored = int(data.get("next_id", 0))
+        except (TypeError, ValueError):
+            stored = 0
+        return max(floor, stored)
 
     def _autosave(self):
         """Persist the current boxes to this video's sidecar. Called on every
@@ -239,9 +271,17 @@ class Tab2Replicates(QWidget):
             return
         try:
             with open(path, "w") as f:
-                json.dump({"replicates": self.replicates}, f, indent=2)
+                # next_id rides along with the boxes because it is the one piece
+                # of state that must outlive them -- see _resume_next_id. Readers
+                # that predate it (core.batch.load_replicates takes
+                # data["replicates"] and ignores the rest) are unaffected.
+                json.dump({"replicates": self.replicates,
+                           "next_id": int(self._next_id)}, f, indent=2)
         except OSError as e:
             self.state.status.emit(f"Could not save boxes: {e}")
+
+    def _video_path(self) -> str:
+        return self.state.source.info.path if self.state.source else ""
 
     # -- drawing -------------------------------------------------------------
 
@@ -259,6 +299,10 @@ class Tab2Replicates(QWidget):
         }
         self._next_id += 1
         self.replicates.append(rep)
+        # The home is this replicate's identity on disk and exists from the
+        # moment the box does, cut or not -- so the transcode stays an optional
+        # speed-up rather than the thing that decides the layout.
+        ensure_home(self._video_path(), rep["id"])
         self._rebuild_rois()
         self._refresh_list()
         self._redraw_boxes()
@@ -355,9 +399,9 @@ class Tab2Replicates(QWidget):
             return
         rep["frac"] = (x0, y0, x1, y1)
         # Moving it makes it fresh again: whatever had been processed against
-        # the old rectangle is exactly what the user just agreed to lose, so
-        # leaving the flag set would warn a second time about data that is
-        # already gone.
+        # the old rectangle is exactly what the user just agreed to invalidate,
+        # so leaving the flag set would warn a second time about results they
+        # have already been told no longer apply.
         rep["processed"] = False
         # A moved box is new geometry, so the ROIs and every series computed
         # against them are stale -- same path as drawing one.
@@ -370,12 +414,25 @@ class Tab2Replicates(QWidget):
 
     def _confirm_move(self, rep: dict, to_origin: tuple[float, float]) -> bool:
         """Gate a drag of an already-processed replicate behind an explicit
-        acknowledgement.
+        acknowledgement, naming what is at stake.
 
         Deliberately NOT a hard freeze. Freezing would force a delete-and-redraw
         for what is often a small correction, and redrawing loses the label, the
         colour and the standardization settings along with the geometry -- so the
         safe-looking option would cost the user more state than the dangerous one.
+        With per-replicate homes the asymmetry is sharper still: a move keeps the
+        id and therefore the whole directory, while a redraw takes a fresh id and
+        starts from nothing. The cheap gesture is also the recoverable one.
+
+        **It enumerates rather than threatens, and it deletes nothing.** The home
+        stays exactly as it is. Everything in it that depends on geometry already
+        knows how to notice: ``WholeVideoTrack`` stamps geometry per frame and
+        ``track_store.load_track`` refuses a mismatch, so a track measured on the
+        old rectangle comes back gray rather than passing as current. Deleting
+        would do destructively, and irreversibly, what that machinery already
+        does safely -- and would take a hand-curated marks corpus with it on a 2%
+        nudge. So the marks survive the move; they simply describe the rectangle
+        they were labelled against, which is what the text has to say plainly.
 
         ``to_origin`` is stated in the text because the box on screen is still
         drawn where it STARTED: FrameView clears the drag ghost before emitting
@@ -385,6 +442,11 @@ class Tab2Replicates(QWidget):
         """
         x0, y0 = rep["frac"][:2]
         nx, ny = to_origin
+        held = describe_home(self._video_path(), rep["id"])
+        inventory = ("<br><br>Its folder <b>%s</b> holds:<ul>%s</ul>"
+                     % (os.path.basename(replicate_dir(self._video_path(),
+                                                       rep["id"])),
+                        "".join(f"<li>{h}</li>" for h in held))) if held else ""
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("Move a processed replicate?")
@@ -392,11 +454,16 @@ class Tab2Replicates(QWidget):
         box.setInformativeText(
             "Moving it changes the region every existing measurement was "
             "computed over. Those results describe the old rectangle and "
-            "cannot be re-aimed at the new one — they are discarded, not "
-            "converted.<br><br>"
+            "cannot be re-aimed at the new one."
+            f"{inventory}"
+            "<br>Nothing is deleted — the folder and its contents stay where "
+            "they are. But work measured against the old rectangle no longer "
+            "answers the question the new one asks: a detection track will come "
+            "back stale and needs a fresh pass, and any saved marks still "
+            "describe where the box used to be.<br><br>"
             f"Top-left would move from <b>{x0:.1%}, {y0:.1%}</b> to "
             f"<b>{nx:.1%}, {ny:.1%}</b> of the frame."
-            "<br><br>The box keeps its name, colour and settings.")
+            "<br><br>The box keeps its name, colour, settings and folder.")
         go = box.addButton(_MOVE_ANYWAY, QMessageBox.ButtonRole.DestructiveRole)
         keep = box.addButton("Leave it where it is",
                              QMessageBox.ButtonRole.RejectRole)
@@ -457,8 +524,8 @@ class Tab2Replicates(QWidget):
     def _row_tip(r: dict) -> str:
         if not r.get("processed"):
             return ""
-        return ("Processed. Moving this box discards the measurements "
-                "computed over it.")
+        return ("Processed. Moving this box makes the measurements computed "
+                "over it stale; its folder is kept either way.")
 
     def _sync_lock_badges(self):
         """Update the 🔒 markers in place.
@@ -620,16 +687,104 @@ class Tab2Replicates(QWidget):
             return
         name, ok = QInputDialog.getText(self, "Rename replicate", "Label:",
                                         text=rep["label"])
-        if ok and name:
-            rep["label"] = name
-            self._rebuild_rois()
-            self._refresh_list()
-            self._redraw_boxes()
-            self._autosave()
+        name = (name or "").strip()
+        if not ok or not name or name == rep["label"]:
+            return
+        if not self._confirm_duplicate_label(rep, name):
+            return
+        # A rename is exactly this: one string. No directory moves with it,
+        # because homes are named by id (core.replicate_home) -- which is the
+        # same call core.replicates._canonical_geometry already made when it
+        # excluded labels from the geometry hash. Had the folder taken the
+        # label, this line would have to relocate a track, a marks file, a
+        # tuning file and possibly a multi-gigabyte clip, and be atomic about it.
+        rep["label"] = name
+        self._rebuild_rois()
+        self._refresh_list()
+        self._redraw_boxes()
+        self._autosave()
+
+    def _confirm_duplicate_label(self, rep: dict, name: str) -> bool:
+        """Warn about a label already in use, but do not forbid it.
+
+        Blocking was tempting while the design still named folders after labels,
+        where a duplicate really was a collision. It is not one now: two boxes
+        called "control" own ``..._rep02`` and ``..._rep05``, and every store,
+        export and provenance record keys on the id. What is left is a
+        legibility problem -- a plot with two series called "control" -- and
+        legibility problems get a warning, not a veto. Refusing here would also
+        make a perfectly reasonable layout ("control" in four tubes, told apart
+        by position) impossible to express.
+        """
+        clash = [r for r in self.replicates
+                 if r is not rep and str(r.get("label", "")) == name]
+        if not clash:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Label already used")
+        box.setText(f"Another replicate is already called <b>{name}</b>.")
+        box.setInformativeText(
+            "That is allowed — every box keeps its own folder and its own "
+            "results regardless of what it is called — but the two will be "
+            "indistinguishable by name in exports and plots.")
+        go = box.addButton("Use it anyway", QMessageBox.ButtonRole.AcceptRole)
+        back = box.addButton("Pick another", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(back)
+        box.setEscapeButton(back)
+        box.exec()
+        return box.clickedButton() is go
+
+    def _confirm_discard(self, reps: list[dict], title: str, what: str) -> bool:
+        """Ask before dropping boxes whose homes hold real work.
+
+        Silent when there is nothing to lose -- most deletes are a misdrawn box
+        seconds old, and a dialog on those would train the user to dismiss the
+        one that matters. The gate is the CONTENTS of the homes, not the
+        ``processed`` flag, because that flag is about this session's state while
+        the directory is about every session's.
+
+        Nothing on disk is removed either way. The box list stops referring to
+        the directory; the directory keeps its track, marks and clip. That is
+        what makes ``next_id`` monotonic a safety property rather than a detail:
+        no future box can be handed the retired id, so the orphan can never be
+        silently adopted, and the user can delete it by hand once they are sure.
+        """
+        held = [(r, describe_home(self._video_path(), r["id"])) for r in reps]
+        held = [(r, h) for (r, h) in held if h]
+        if not held:
+            return True
+        lines = "".join(
+            "<li><b>%s</b> (%s): %s</li>"
+            % (r["label"],
+               os.path.basename(replicate_dir(self._video_path(), r["id"])),
+               ", ".join(h))
+            for r, h in held)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        box.setText(what)
+        box.setInformativeText(
+            f"These have results on disk:<ul>{lines}</ul>"
+            "Their folders are <b>not</b> deleted — removing the box only stops "
+            "this video referring to them, and the ids are never reissued, so "
+            "nothing else can pick them up. Delete the folders by hand when you "
+            "are sure.<br><br>Redrawing a box gives it a NEW folder; it does not "
+            "recover this one.")
+        go = box.addButton("Remove the box", QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("Keep it", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        return box.clickedButton() is go
 
     def _delete(self):
         rep = self._selected_rep()
         if not rep:
+            return
+        if not self._confirm_discard(
+                [rep], "Remove a replicate with saved results?",
+                f"<b>{rep['label']}</b> has work stored beside the video."):
             return
         self.replicates = [r for r in self.replicates if r["id"] != rep["id"]]
         # Deleting what you are zoomed into otherwise strands the view on empty
@@ -662,8 +817,20 @@ class Tab2Replicates(QWidget):
     def _clear(self):
         if not self.replicates:
             return
-        if QMessageBox.question(self, "Clear all", "Delete all replicate boxes?") \
-                == QMessageBox.StandardButton.Yes:
+        # The contents gate comes FIRST and is the only prompt when it fires:
+        # asking twice for one gesture is how a user learns to click through
+        # both. With empty homes this falls back to the plain question, which is
+        # all a layout of freshly drawn boxes warrants.
+        if any(describe_home(self._video_path(), r["id"])
+               for r in self.replicates):
+            ok = self._confirm_discard(
+                self.replicates, "Clear all replicates?",
+                "Some of these boxes have work stored beside the video.")
+        else:
+            ok = QMessageBox.question(
+                self, "Clear all", "Delete all replicate boxes?") \
+                == QMessageBox.StandardButton.Yes
+        if ok:
             self.replicates = []
             self.video.clear_focus()
             self._rebuild_rois()
@@ -705,10 +872,21 @@ class Tab2Replicates(QWidget):
         # measurements that clip never had, which is the same ghosting-across-
         # videos failure _load_sidecar exists to prevent. (_load_sidecar itself
         # keeps the flag: that IS this video's own layout.)
-        self.replicates = [
-            {**r, "frac": tuple(r["frac"]), "processed": False}
-            for r in data.get("replicates", [])]
-        self._next_id = max([r["id"] for r in self.replicates], default=0) + 1
+        #
+        # RENUMBERED onto fresh ids for the same reason, one level deeper. The
+        # `processed: False` above says "these carry no measurements"; keeping
+        # the source clip's ids would contradict it, because an imported id 1
+        # would land in THIS video's rep01 home and adopt whatever that
+        # replicate had already measured. Renumbering from the monotonic counter
+        # makes the freshness structural instead of a flag that a later reader
+        # has to remember to honour.
+        self.replicates = []
+        for r in data.get("replicates", []):
+            self.replicates.append({**r, "id": self._next_id,
+                                    "frac": tuple(r["frac"]),
+                                    "processed": False})
+            self._next_id += 1
+        sync_homes(self._video_path(), self.replicates)
         self._rebuild_rois()
         self._refresh_list()
         self._redraw_boxes()
