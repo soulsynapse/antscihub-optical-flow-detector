@@ -713,8 +713,9 @@ one is a finished-then-deleted thread and none is still running**. Both fixes
 also have regression tests that were confirmed to fail with their own fix
 reverted, and only their own. If the dump ever recurs, this note is wrong again
 — re-run **`scripts/qthread_leak_probe.py`** (its docstring has the invocation
-and how to read the report) and look for an entry WITHOUT the `(deleted)`
-marker, which is the crash-capable case. Baseline is 28 events, all `(deleted)`.
+and how to read the report). **The invariant is its crash-capable count, which
+must be 0**; the total is meaningless on its own and drifts with any new Qt
+test.
 
 ---
 

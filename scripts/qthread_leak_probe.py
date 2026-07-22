@@ -20,8 +20,10 @@ crash precondition and it is what to fix. An entry marked ``(deleted)`` is a
 thread that had already finished and been freed, and is only visible because
 this probe holds a stale Python wrapper; those are benign.
 
-The baseline after the §27 fixes is 28 events, all of them ``(deleted)``. Any
-entry WITHOUT the marker is a regression.
+**The invariant is the crash-capable count, which must be 0** -- not the total.
+The total tracks how many tests happen to build cubes and drifts with any new
+Qt test; it was 45 before the §27 fixes and is around 29 after, and neither
+number means anything on its own.
 """
 from __future__ import annotations
 
