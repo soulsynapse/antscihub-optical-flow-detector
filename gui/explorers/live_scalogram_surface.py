@@ -1783,6 +1783,22 @@ class LiveScalogramSurface(QWidget):
                 f"detecting on {self._selected_channel_attr()} — restarting the "
                 f"pass to compute it…")
             return
+        # The pass can finish in the short debounce interval between checking a
+        # new on-demand channel and arriving here.  In that case there is no
+        # running pass left to replan, and the old behaviour stopped here with
+        # the checkbox selected but the channel still absent from the displayed
+        # window.  The same dead end occurred for any channel switch made while
+        # paused.  Reload the span already on screen with the new channel set;
+        # this is a preview only, so it does not unexpectedly resume playback.
+        if (self._stream_worker is None and self._proc_worker is None
+                and self._sweep_worker is None and self._explorer is not None
+                and not self._explorer._channel_available(
+                    self._explorer.channel)):
+            self._sync_track(repaint=True)
+            self._load_preview_at(
+                int(self._explorer.window_start), max(2, int(self._explorer.T)),
+                focus=int(self._explorer.absolute_frame()))
+            return
         moved = self._sync_track()
         if not moved:
             return

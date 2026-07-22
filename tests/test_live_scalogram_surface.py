@@ -1157,6 +1157,37 @@ class ChannelGatingTests(_SurfaceTestCase):
         self.assertEqual(set(plan.want), {"change"})
         self.assertFalse(plan.need_flow)
 
+    def test_missing_channel_reloads_the_displayed_window_after_pass_ends(self):
+        """A pass finishing during the channel debounce must not strand the new
+        selection on the old channel-only window."""
+        surface = self._surface()
+        explorer = MagicMock()
+        explorer.channel = "tensor speed"
+        explorer._channel_available.return_value = False
+        explorer.window_start = 17
+        explorer.T = 23
+        explorer.absolute_frame.return_value = 29
+        surface._explorer = explorer
+        surface._sync_track = MagicMock(return_value=False)
+        surface._load_preview_at = MagicMock()
+
+        surface._on_retune_settled()
+
+        surface._load_preview_at.assert_called_once_with(17, 23, focus=29)
+
+    def test_present_channel_does_not_reload_while_paused(self):
+        surface = self._surface()
+        explorer = MagicMock()
+        explorer.channel = "change energy Jtt"
+        explorer._channel_available.return_value = True
+        surface._explorer = explorer
+        surface._sync_track = MagicMock(return_value=False)
+        surface._load_preview_at = MagicMock()
+
+        surface._on_retune_settled()
+
+        surface._load_preview_at.assert_not_called()
+
 
 class ProcessPlanTests(_SurfaceTestCase):
     """The gear beside Process: which spans a commit covers."""
