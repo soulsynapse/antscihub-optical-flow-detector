@@ -95,6 +95,16 @@ class TestQualityPresets(unittest.TestCase):
         with self.assertRaises(pt.PretranscodeError):
             pt.clip_command("x.mp4", _tiles(), ["a.mkv", "b.mkv"], "ludicrous")
 
+    def test_full_hash_honours_gui_cancellation(self):
+        """Cancel must still work during the final 2% provenance hash."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "source.bin")
+            with open(path, "wb") as f:
+                f.write(b"a" * 1024)
+            with self.assertRaises(pt.PretranscodeCancelled):
+                pt.full_sha256(path, should_cancel=lambda: True, chunk=16)
+
 
 def _tiles():
     return build_layout(REPS, 160, 120, 1.0, 16).tiles
@@ -606,8 +616,23 @@ class TestEndToEnd(unittest.TestCase):
         with self.assertRaises(pt.PretranscodeCancelled):
             pt.build_pretranscode(self.src, REPS, self.out,
                                   should_cancel=lambda: True)
-        leftovers = [f for f in os.listdir(self.out)] if os.path.isdir(self.out) else []
-        self.assertEqual([f for f in leftovers if f.endswith(".mkv")], [])
+        leftovers = [os.path.join(root, f)
+                     for root, _dirs, files in os.walk(self.out)
+                     for f in files if f.endswith(".mkv")]
+        self.assertEqual(leftovers, [])
+
+    def test_cancel_during_the_final_hash_also_removes_clips(self):
+        """At 98% the files exist, but without a manifest they are not a job."""
+        def cancel_hash(*_args, **_kwargs):
+            raise pt.PretranscodeCancelled
+
+        with unittest.mock.patch.object(pt, "full_sha256", cancel_hash):
+            with self.assertRaises(pt.PretranscodeCancelled):
+                pt.build_pretranscode(self.src, REPS, self.out)
+        leftovers = [os.path.join(root, f)
+                     for root, _dirs, files in os.walk(self.out)
+                     for f in files if f.endswith(".mkv")]
+        self.assertEqual(leftovers, [])
 
     def test_cancel_is_not_a_keyboard_interrupt(self):
         """A real Ctrl-C must stay distinguishable from a requested cancel."""

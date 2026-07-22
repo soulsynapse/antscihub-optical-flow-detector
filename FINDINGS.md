@@ -2043,6 +2043,16 @@ on a clip route it supplies the rate the plan is built on. **A fix applied at on
 of two entry points is not applied**, and the second entry point was written
 after the first and looked self-contained.
 
+**GUI follow-up, reproduced at 59.94 fps:** getting the rational rate into the
+stream plan was necessary but not sufficient. The hosted explorer could already
+exist from a source-backed pass at OpenCV's rounded `59.94`; its first clip
+window then arrived at `60000/1001 = 59.94005994…`. `set_channel_data` correctly
+refused the change because its frequency bins and cached Morlet cubes are
+fps-derived. The host had a rebuild boundary for grid changes but not for fps or
+pixel provenance. `_put_on_screen` now rebuilds on all three. Provenance is an
+independent guard: integer-rate footage would hide the fps mismatch while still
+retaining a cube transformed from the other pixel source.
+
 **The GUI is opt-in, and the checkbox is not persisted.** Below `lossless` a
 clip and a live crop are not the same pixels (§10), so which set a session's
 numbers came from is a claim the user makes, not one the filesystem makes for

@@ -41,7 +41,9 @@ The application has two tabs.
    Click selects and zooms, dragging repositions, and moving a box that has
    already been processed requires an explicit acknowledgement that its
    measurements are discarded. Labels, calibration and quiescent-baseline
-   intervals live here.
+   intervals live here. The optional **Replicate clips** panel can split the
+   source once into one full-resolution crop per box in the background; progress
+   and cancellation are handled in the tab, and partial clips are removed.
 2. **Preprocessing (live)** — tune preprocessing directly against the detector.
    Press `Play ▶` and the clip streams forward while the Morlet scalogram,
    per-block densities and detection track fill in behind the frontier. Drag a
@@ -51,6 +53,10 @@ The application has two tabs.
    verify a detection against the footage. `Process whole video ▶` runs the same
    detector over the entire clip and fills the *same* accumulator, so a committed
    pass and a live one are not two different pictures.
+
+Creating replicate clips does not silently change the pixels used by detection.
+After a verified split exists, **Use ROI clips** becomes available in
+Preprocessing and remains opt-in for each session.
 
 Time is in **seconds** and frequency in **Hz** throughout. Frame indices appear
 only where an exact source-frame reference is useful.

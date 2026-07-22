@@ -884,9 +884,9 @@ price a sensitivity curve across behaviours.
 The replicate box, not the video, is the unit of ownership on disk. A home is
 `<stem>_rep01/` beside the source, holding that replicate's track, marks, tuning
 and — optionally — a transcoded clip of just that region. The cut
-(`core/pretranscode.py`, already built and CLI-only) becomes a pure speed-up that
-drops a file into a directory that already exists, rather than a mode that
-changes the layout.
+(`core/pretranscode.py`, available from both the CLI and the Replicates tab)
+becomes a pure speed-up that drops a file into a directory that already exists,
+rather than a mode that changes the layout.
 
 **Three rulings this batch rests on. Do not relitigate without new evidence.**
 
@@ -905,6 +905,11 @@ changes the layout.
    adopted by a later box.
 
 ### Landed
+- **GUI follow-up (2026-07-21)** · `gui/replicate_split.py`,
+  `gui/tab2_replicates.py`. The Replicates tab now creates/rebuilds the home clip
+  split at a chosen recorded quality on a cancellable worker, reports progress
+  and verified/stale state, freezes geometry and source switching until the
+  manifest lands, and refreshes the Preprocessing opt-in on tab re-entry.
 - **Slice 1** · `core/replicate_home.py` (new), `gui/tab2_replicates.py`.
   Homes on box draw; `next_id` persisted; imports renumbered onto fresh ids;
   `_confirm_move` enumerates and deletes nothing; delete prompts only when the
@@ -1192,6 +1197,11 @@ changes the layout.
   length from the wrong place, silently. Harmless until something streamed from
   clips; it would have gone live with the checkbox. The route is now resolved
   **before** the plan, because on a clip route it supplies the plan's rate.
+  **GUI follow-up (2026-07-21):** an explorer already built from OpenCV's rounded
+  `59.94` still refused the first manifest-rate `60000/1001` window. The host now
+  rebuilds the explorer when fps or clip provenance changes, not only when the
+  grid changes; the provenance half prevents stale source-backed cubes even on
+  integer-rate footage where no fps mismatch exposes the seam.
 
   **The GUI is OPT-IN and the checkbox is not persisted** (`Use ROI clips`,
   greyed until a manifest exists). A restored downsample is the same

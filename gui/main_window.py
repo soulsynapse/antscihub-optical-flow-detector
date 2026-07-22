@@ -46,6 +46,7 @@ class MainWindow(QMainWindow):
         self.state.video_loaded.connect(self._on_video_loaded)
         self.state.request_tab.connect(self.tabs.setCurrentIndex)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tab2.split_running_changed.connect(self._on_split_running)
 
         self._menu()
         self._shortcuts()
@@ -62,9 +63,9 @@ class MainWindow(QMainWindow):
 
     def _menu(self):
         f = self.menuBar().addMenu("File")
-        a = f.addAction("Open Video…")
-        a.setShortcut(QKeySequence.StandardKey.Open)
-        a.triggered.connect(self._open_video)
+        self.open_action = f.addAction("Open Video…")
+        self.open_action.setShortcut(QKeySequence.StandardKey.Open)
+        self.open_action.triggered.connect(self._open_video)
         f.addSeparator()
         q = f.addAction("Quit")
         q.triggered.connect(self.close)
@@ -140,6 +141,11 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(1, True)
         self.tabs.setCurrentIndex(0)
 
+    def _on_split_running(self, running: bool):
+        """Keep the worker's source and geometry fixed until its manifest lands."""
+        self.tabs.setTabEnabled(1, not running)
+        self.open_action.setEnabled(not running)
+
     def _about(self):
         QMessageBox.about(
             self, "Optical Flow Behavior Detector",
@@ -154,6 +160,7 @@ class MainWindow(QMainWindow):
             "camera.</p>")
 
     def closeEvent(self, e):
+        self.tab2.shutdown()
         if self.state.source is not None:
             self.state.source.release()
         super().closeEvent(e)

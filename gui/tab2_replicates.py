@@ -16,17 +16,22 @@ from __future__ import annotations
 import json
 import os
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QKeyEvent, QPixmap
-from PyQt6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-                             QGroupBox, QHBoxLayout, QInputDialog, QLabel,
-                             QListWidget, QListWidgetItem, QMessageBox,
-                             QPushButton, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+                             QFormLayout, QGroupBox, QHBoxLayout, QInputDialog,
+                             QLabel, QListWidget, QListWidgetItem, QMessageBox,
+                             QProgressBar, QPushButton, QVBoxLayout, QWidget)
+
+from core.pretranscode import (DEFAULT_QUALITY, QUALITY_PRESETS,
+                               PretranscodeError, manifest_path_for,
+                               read_manifest, verify_manifest)
 
 from core.replicate_home import (describe_home, ensure_home, list_generations,
                                  replicate_dir, restore_generation,
                                  retire_current, sync_homes)
 from gui.state import AppState
+from gui.replicate_split import ReplicateSplitWorker
 from gui.video_panel import VideoPanel
 
 # A fixed palette so successive replicates are visually distinct.
@@ -49,6 +54,8 @@ _MOVE_ANYWAY = "Move it and retire the existing results"
 
 
 class Tab2Replicates(QWidget):
+    split_running_changed = pyqtSignal(bool)
+
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
@@ -128,7 +135,7 @@ class Tab2Replicates(QWidget):
         rl = QVBoxLayout(right)
         rl.setContentsMargins(4, 4, 4, 4)
 
-        box = QGroupBox("Replicate boxes")
+        box = self.box_group = QGroupBox("Replicate boxes")
         bl = QVBoxLayout(box)
         self.list = QListWidget()
         self.list.currentItemChanged.connect(self._on_select)
@@ -164,13 +171,53 @@ class Tab2Replicates(QWidget):
         row2.addWidget(load)
         bl.addLayout(row2)
 
-        to_live = QPushButton("Tune these in Preprocessing →")
-        to_live.setStyleSheet("padding:6px; font-weight:bold;")
-        to_live.clicked.connect(self._go_preprocess)
-        bl.addWidget(to_live)
+        self.to_live = QPushButton("Tune these in Preprocessing →")
+        self.to_live.setStyleSheet("padding:6px; font-weight:bold;")
+        self.to_live.clicked.connect(self._go_preprocess)
+        bl.addWidget(self.to_live)
         rl.addWidget(box)
 
-        std_box = QGroupBox("Selected replicate standardization")
+        split_box = QGroupBox("Replicate clips (optional)")
+        split_lay = QVBoxLayout(split_box)
+        split_help = QLabel(
+            "Split the source once into one full-resolution crop per replicate. "
+            "This can make later decoding cheaper; it does not resize pixels or "
+            "change the boxes. Clip use remains opt-in in Preprocessing.")
+        split_help.setWordWrap(True)
+        split_lay.addWidget(split_help)
+
+        split_row = QHBoxLayout()
+        self.split_quality = QComboBox()
+        for key, label in (("high", "High · CRF 12"),
+                           ("standard", "Standard · CRF 18"),
+                           ("lossless", "Lossless · FFV1")):
+            if key in QUALITY_PRESETS:
+                self.split_quality.addItem(label, key)
+        default_idx = self.split_quality.findData(DEFAULT_QUALITY)
+        self.split_quality.setCurrentIndex(max(0, default_idx))
+        self.split_quality.setToolTip(
+            "Quality changes storage and pixel provenance, not crop geometry. "
+            "High is the project default. Lossless preserves the encoded 8-bit "
+            "crop but commonly uses more total disk than the source.")
+        split_row.addWidget(self.split_quality, 1)
+        self.split_btn = QPushButton("Create replicate clips…")
+        self.split_btn.clicked.connect(self._split_or_cancel)
+        split_row.addWidget(self.split_btn)
+        split_lay.addLayout(split_row)
+
+        self.split_progress = QProgressBar()
+        self.split_progress.setRange(0, 1000)
+        self.split_progress.setTextVisible(True)
+        self.split_progress.setFormat("%p%")
+        self.split_progress.hide()
+        split_lay.addWidget(self.split_progress)
+        self.split_status = QLabel("Open a video and draw boxes to create clips.")
+        self.split_status.setWordWrap(True)
+        split_lay.addWidget(self.split_status)
+        rl.addWidget(split_box)
+        self._split_worker: ReplicateSplitWorker | None = None
+
+        std_box = self.std_box = QGroupBox("Selected replicate standardization")
         sf = QFormLayout(std_box)
         self.use_baseline = QCheckBox("Use an explicitly quiescent interval")
         self.use_baseline.setToolTip(
@@ -224,6 +271,7 @@ class Tab2Replicates(QWidget):
 
         state.video_loaded.connect(self._on_video_loaded)
         state.calibration_changed.connect(self._on_calibration_changed)
+        self._refresh_split_status()
 
     # -- per-video persistence ----------------------------------------------
 
@@ -301,6 +349,165 @@ class Tab2Replicates(QWidget):
 
     def _video_path(self) -> str:
         return self.state.source.info.path if self.state.source else ""
+
+    # -- optional per-replicate clip split ----------------------------------
+
+    def _split_state(self):
+        """Return ``(kind, manifest/detail)`` for this video and box geometry."""
+        video = self._video_path()
+        if not video:
+            return "none", ""
+        out_dir = os.path.dirname(os.path.abspath(video))
+        path = manifest_path_for(video, out_dir)
+        if not os.path.exists(path):
+            return "none", ""
+        try:
+            manifest = read_manifest(path)
+            verify_manifest(manifest, out_dir, self.replicates)
+        except (PretranscodeError, OSError, ValueError) as e:
+            return "stale", str(e)
+        return "ready", manifest
+
+    def _refresh_split_status(self):
+        if self._split_worker is not None:
+            return
+        video = self._video_path()
+        if not video:
+            self.split_btn.setEnabled(False)
+            self.split_btn.setText("Create replicate clips…")
+            self.split_status.setStyleSheet("")
+            self.split_status.setText("Open a video and draw boxes to create clips.")
+            return
+        if not self.replicates:
+            self.split_btn.setEnabled(False)
+            self.split_btn.setText("Create replicate clips…")
+            self.split_status.setStyleSheet("")
+            self.split_status.setText("Draw at least one replicate box first.")
+            return
+
+        self.split_btn.setEnabled(True)
+        kind, value = self._split_state()
+        if kind == "ready":
+            manifest = value
+            size = sum(int(c.size_bytes or 0) for c in manifest.clips)
+            self.split_btn.setText("Rebuild replicate clips…")
+            self.split_status.setStyleSheet("color:#287a3c;")
+            self.split_status.setText(
+                f"Ready: {len(manifest.clips)} {manifest.quality} clip(s), "
+                f"{manifest.frame_count} frames, {size / 1e6:.0f} MB total. "
+                "Enable 'Use ROI clips' in Preprocessing to use them.")
+        elif kind == "stale":
+            self.split_btn.setText("Rebuild stale clips…")
+            self.split_status.setStyleSheet("color:#a45b00;")
+            self.split_status.setText(f"Existing clips cannot be used: {value}")
+        else:
+            self.split_btn.setText("Create replicate clips…")
+            self.split_status.setStyleSheet("")
+            self.split_status.setText(
+                "No replicate clips yet. Detection can still use the source video.")
+
+    def _split_or_cancel(self):
+        if self._split_worker is not None:
+            if self._split_worker.isRunning():
+                self._split_worker.cancel()
+                self.split_btn.setEnabled(False)
+                self.split_btn.setText("Canceling…")
+                self.split_status.setText(
+                    "Canceling; partial clips will be removed safely…")
+            return
+
+        video = self._video_path()
+        if not video or not self.replicates:
+            self._refresh_split_status()
+            return
+        kind, value = self._split_state()
+        overwrite = kind in ("ready", "stale")
+        if overwrite:
+            if kind == "ready":
+                question = (
+                    "A verified split already exists for these boxes. Replace "
+                    "all of its replicate clips?")
+            else:
+                question = (
+                    "The existing split cannot be used with the current source "
+                    f"and boxes:\n\n{value}\n\nReplace its replicate clips?")
+            if QMessageBox.question(
+                    self, "Rebuild replicate clips", question,
+                    QMessageBox.StandardButton.Yes |
+                    QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != \
+                    QMessageBox.StandardButton.Yes:
+                return
+
+        out_dir = os.path.dirname(os.path.abspath(video))
+        quality = str(self.split_quality.currentData())
+        worker = ReplicateSplitWorker(
+            video, self.replicates, out_dir, quality=quality,
+            overwrite=overwrite, parent=self)
+        self._split_worker = worker
+        worker.progress.connect(self.split_progress.setValue)
+        worker.complete.connect(self._split_complete)
+        worker.failed.connect(self._split_failed)
+        worker.cancelled.connect(self._split_cancelled)
+        worker.finished.connect(self._split_thread_finished)
+
+        # Freeze every geometry writer while the worker's snapshot is becoming
+        # files. The manifest would detect a concurrent move as stale later,
+        # but letting a minutes-long cut finish unusable is avoidable.
+        self.video.setEnabled(False)
+        self.box_group.setEnabled(False)
+        self.std_box.setEnabled(False)
+        self.split_quality.setEnabled(False)
+        self.split_progress.setValue(0)
+        self.split_progress.show()
+        self.split_btn.setEnabled(True)
+        self.split_btn.setText("Cancel splitting")
+        self.split_status.setStyleSheet("")
+        self.split_status.setText(
+            f"Splitting {len(self.replicates)} replicate(s) at {quality} quality…")
+        self.split_running_changed.emit(True)
+        worker.start()
+
+    def _split_complete(self, manifest):
+        size = sum(int(c.size_bytes or 0) for c in manifest.clips)
+        self.split_progress.setValue(1000)
+        self.split_status.setStyleSheet("color:#287a3c;")
+        self.split_status.setText(
+            f"Created {len(manifest.clips)} clips, {manifest.frame_count} frames, "
+            f"{size / 1e6:.0f} MB total. Enable 'Use ROI clips' in "
+            "Preprocessing when you want to use them.")
+        self.state.status.emit(
+            f"Replicate split complete: {len(manifest.clips)} clips ({size / 1e6:.0f} MB).")
+
+    def _split_failed(self, message: str):
+        self.split_status.setStyleSheet("color:#a00000;")
+        self.split_status.setText(f"Split failed: {message}")
+        self.state.status.emit(f"Replicate split failed: {message}")
+
+    def _split_cancelled(self):
+        self.split_status.setStyleSheet("")
+        self.split_status.setText("Split canceled; partial clips were removed.")
+        self.state.status.emit("Replicate split canceled; partial clips removed.")
+
+    def _split_thread_finished(self):
+        worker = self._split_worker
+        self._split_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.video.setEnabled(True)
+        self.box_group.setEnabled(True)
+        self.std_box.setEnabled(True)
+        self.split_quality.setEnabled(True)
+        self.split_progress.hide()
+        self.split_running_changed.emit(False)
+        self._refresh_split_status()
+
+    def shutdown(self):
+        """Stop the ffmpeg/hash worker before Qt destroys its QThread wrapper."""
+        worker = self._split_worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            worker.wait()
 
     # -- drawing -------------------------------------------------------------
 
@@ -674,6 +881,7 @@ class Tab2Replicates(QWidget):
         # in a paint-adjacent path.
         self._refresh_retired()
         self.state.rois_changed.emit()
+        self._refresh_split_status()
 
     # -- list ----------------------------------------------------------------
 

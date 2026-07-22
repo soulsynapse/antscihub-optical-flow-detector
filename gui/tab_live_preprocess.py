@@ -80,6 +80,10 @@ class TabLivePreprocess(QWidget):
             # not reached it. This runs on every show, which is exactly when the
             # user could have been editing elsewhere.
             self._surface.refresh_replicate_metadata(self.state.replicate_specs)
+            # A split can be created on the Replicates tab without changing
+            # geometry. Re-entering this tab must therefore re-check manifest
+            # availability even though the expensive surface itself stands.
+            self._surface._sync_clip_availability()
             return
         self._drop()
         self._info.setVisible(False)

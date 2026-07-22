@@ -410,7 +410,8 @@ def quick_signature(path: str) -> str:
     return h.hexdigest()[:32]
 
 
-def full_sha256(path: str, *, progress=None, chunk: int = 8 << 20) -> str:
+def full_sha256(path: str, *, progress=None, should_cancel=None,
+                chunk: int = 8 << 20) -> str:
     """Whole-file digest, for the manifest's provenance record.
 
     Costs ~20 s on an 11 GB source, which is negligible beside the transcode it
@@ -422,6 +423,8 @@ def full_sha256(path: str, *, progress=None, chunk: int = 8 << 20) -> str:
     done = 0
     with open(path, "rb") as f:
         while True:
+            if should_cancel is not None and should_cancel():
+                raise PretranscodeCancelled("pre-transcode cancelled")
             b = f.read(chunk)
             if not b:
                 break
@@ -762,6 +765,18 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
                 "never examined")
         clip_frames.append(n_clip)
 
+    try:
+        source_sha256 = full_sha256(
+            video_path,
+            progress=None if progress is None
+            else (lambda f: progress(0.98 + 0.02 * f)),
+            should_cancel=should_cancel)
+    except BaseException:
+        # The clips are complete by this point but no manifest vouches for them.
+        # Treat them as partial job output exactly as the ffmpeg cancel path does.
+        _cleanup(out_paths)
+        raise
+
     man = Manifest(
         version=PRETRANSCODE_VERSION,
         source_path=os.path.abspath(video_path),
@@ -771,10 +786,7 @@ def build_pretranscode(video_path: str, replicates: list[dict], out_dir: str, *,
         # hang -- a user who kills it there discards a finished transcode. The
         # tail of the range is reserved for it so the reported fraction stays
         # monotonic.
-        source_sha256=full_sha256(
-            video_path,
-            progress=None if progress is None
-            else (lambda f: progress(0.98 + 0.02 * f))),
+        source_sha256=source_sha256,
         quick_sig=quick_signature(video_path),
         src_width=w, src_height=h,
         fps_num=fps_num, fps_den=fps_den, frame_count=decoded_frames,

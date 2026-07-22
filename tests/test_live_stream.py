@@ -543,6 +543,49 @@ class StreamWiringTests(_SurfaceTestCase):
         s._arm_detection.assert_called_once()
         s._explorer = None
 
+    def test_clip_rational_fps_rebuilds_the_rounded_source_explorer(self):
+        """The real failure was 59.94005994 from the manifest reaching an
+        explorer constructed at OpenCV's rounded 59.94. Frequency bins and every
+        cached cube belong to the former rate, so this must rebuild rather than
+        ask set_channel_data to absorb it."""
+        s = self._surface()
+        del s._show_live_window
+        s._explorer = MagicMock()
+        s._explorer.ny, s._explorer.nx = 1, 1
+        s._explorer.fps = 59.94
+        s._explorer.meta = {"clip_provenance": None}
+        s._stream_meta = {"fps": 60000 / 1001, "grid": [1, 1],
+                          "clip_provenance": "cut-at-high"}
+        s._swap_explorer = MagicMock()
+        s._arm_detection = MagicMock()
+
+        s._show_live_window(self._win(64, token=1))
+
+        s._swap_explorer.assert_called_once()
+        cd = s._swap_explorer.call_args[0][0]
+        self.assertEqual(cd.meta["fps"], 60000 / 1001)
+        s._explorer.set_channel_data.assert_not_called()
+        s._explorer = None
+
+    def test_source_provenance_change_rebuilds_even_when_fps_matches(self):
+        """Integer-rate footage would hide the fps seam but not the stale cube."""
+        s = self._surface()
+        s._explorer = MagicMock()
+        s._explorer.ny, s._explorer.nx = 1, 1
+        s._explorer.fps = 30.0
+        s._explorer.meta = {"clip_provenance": None}
+        s._stream_meta = {"fps": 30.0, "grid": [1, 1],
+                          "clip_provenance": "cut-at-high"}
+        cd = s._live_channel_data(self._win(64, token=1))
+        s._swap_explorer = MagicMock()
+
+        rebuilt = s._put_on_screen(cd, live=True)
+
+        self.assertTrue(rebuilt)
+        s._swap_explorer.assert_called_once_with(cd)
+        s._explorer.set_channel_data.assert_not_called()
+        s._explorer = None
+
     def test_a_truncated_pass_marks_the_span_it_left_on_screen(self):
         """The status line is not enough: anything reading cd.meta -- detection
         included -- would see a clean window."""

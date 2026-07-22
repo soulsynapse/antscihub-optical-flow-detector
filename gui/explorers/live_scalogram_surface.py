@@ -2348,25 +2348,34 @@ class LiveScalogramSurface(QWidget):
         self.navigator.set_cursor(self._explorer.absolute_frame())
 
     def _put_on_screen(self, cd, *, live: bool) -> bool:
-        """Build the explorer on the first window, rebuild it when the grid
-        moved, or update it in place. Returns whether it was (re)built.
+        """Build the explorer on the first window, rebuild it when measurement
+        identity moved, or update it in place. Returns whether it was (re)built.
 
-        The grid moves when a Block/Downsample change replans the pass onto a
-        new geometry: ``set_channel_data`` refuses that outright, because the
-        explorer derives its regions, block snap and cube budget from the grid
-        at construction and cannot remap them in place. Routing BOTH the live
-        pass and the seek-while-paused preview through here is what guarantees
-        neither reaches ``set_channel_data`` with a grid the explorer was not
-        built for -- the crash this replaced was a restart at a new block
-        handing the old (8×8) explorer a (113×115) window it could not take.
+        Grid and fps are constructor inputs: the explorer derives its regions,
+        block snap, cube budget and frequency bins from them, and
+        ``set_channel_data`` correctly refuses to mutate either. Source
+        provenance is the third rebuild axis even when grid/fps happen to match:
+        a source crop and an ROI clip are different pixels, so retaining a cube
+        transformed from the other route would put old measurements under the
+        new route's status. Routing BOTH the live pass and seek-while-paused
+        preview through here keeps all three identities behind one guard.
 
         A rebuild consumes ``_pending_state``, which the caller must have
         captured off the outgoing explorer first (``start_stream`` does; the
         preview does not need to, since it never changes the tuning).
         """
         ny, nx = map(int, cd.meta["grid"])
-        if self._explorer is None or (ny, nx) != (self._explorer.ny,
-                                                   self._explorer.nx):
+        new_fps = float(cd.meta["fps"])
+        new_provenance = cd.meta.get("clip_provenance")
+        old_meta = getattr(self._explorer, "meta", {})
+        old_provenance = (old_meta.get("clip_provenance")
+                          if isinstance(old_meta, dict) else new_provenance)
+        old_fps = getattr(self._explorer, "fps", new_fps)
+        fps_moved = (isinstance(old_fps, (int, float, np.floating)) and
+                     abs(new_fps - float(old_fps)) > 1e-6)
+        if (self._explorer is None or
+                (ny, nx) != (self._explorer.ny, self._explorer.nx) or
+                fps_moved or new_provenance != old_provenance):
             self._swap_explorer(cd)
             return True
         self._explorer.set_channel_data(cd, live=live)
