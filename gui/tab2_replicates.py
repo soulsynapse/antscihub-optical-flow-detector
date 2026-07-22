@@ -23,8 +23,9 @@ from PyQt6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout
                              QListWidget, QListWidgetItem, QMessageBox,
                              QPushButton, QVBoxLayout, QWidget)
 
-from core.replicate_home import (describe_home, ensure_home, replicate_dir,
-                                 sync_homes)
+from core.replicate_home import (describe_home, ensure_home, list_generations,
+                                 replicate_dir, restore_generation,
+                                 retire_current, sync_homes)
 from gui.state import AppState
 from gui.video_panel import VideoPanel
 
@@ -39,11 +40,12 @@ _PALETTE = ["#ff5a5a", "#4ac6ff", "#ffd24a", "#6ee06e", "#c78bff", "#ff9d3a",
 # T17 and the count-band re-denomination -- state that quietly stops meaning what
 # it meant -- and like those it cannot be converted.
 #
-# "no longer apply", not "will be lost": since the replicate's home survives a
-# move untouched (_confirm_move), promising loss would be a lie in the one
-# direction that matters -- a user who declines because they believe their marks
-# are about to be deleted has been talked out of a safe action by the warning.
-_MOVE_ANYWAY = "I recognize this replicate's existing results no longer apply"
+# "retire", not "lose" and not "keep": the results are neither destroyed nor
+# carried forward. They move into old_NNN/ with the rectangle they were measured
+# against, stay drawn where they were, and can be restored. Promising loss would
+# talk a user out of a recoverable action; promising they still apply would
+# attribute one animal's labelled behaviour to whatever the box now covers.
+_MOVE_ANYWAY = "Move it and retire the existing results"
 
 
 class Tab2Replicates(QWidget):
@@ -57,6 +59,10 @@ class Tab2Replicates(QWidget):
         # written before the field existed do not carry it.
         self.replicates: list[dict] = []
         self._next_id = 1
+        # Retired geometries of the CURRENT boxes, read from disk by
+        # _refresh_retired. Drawn as dashed ghosts and never interactive; disk is
+        # the record, this is only what the last listing found.
+        self._retired: list[dict] = []
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
@@ -107,9 +113,10 @@ class Tab2Replicates(QWidget):
             "and zoom to it, drag it to reposition, press Delete to remove it, "
             "right-click to zoom out. "
             "The stamp is always the SELECTED box's size. "
-            "A 🔒 box has been processed — moving it asks first, because its "
-            "existing measurements go stale rather than being re-aimed. Each "
-            "box owns a folder beside the video that keeps its results.")
+            "A 🔒 box has been processed — moving it asks first, and retires its "
+            "existing results rather than re-aiming them: they stay drawn as a "
+            "dashed OLD box and come back from 'Older geometries…'. Each box "
+            "owns a folder beside the video that keeps its results.")
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color:#333; font-size:11px;")
         ll.addWidget(self.hint)
@@ -139,6 +146,14 @@ class Tab2Replicates(QWidget):
             b.clicked.connect(fn)
             row.addWidget(b)
         bl.addLayout(row)
+
+        hist = QPushButton("Older geometries…")
+        hist.setToolTip(
+            "Moving a box retires its results rather than deleting them. This "
+            "lists the selected replicate's retired rectangles and restores one "
+            "— moving the box back and bringing its detections with it.")
+        hist.clicked.connect(self._show_generations)
+        bl.addWidget(hist)
 
         row2 = QHBoxLayout()
         save = QPushButton("Save boxes…")
@@ -233,6 +248,10 @@ class Tab2Replicates(QWidget):
                 self._next_id = self._resume_next_id(data)
             except (OSError, ValueError) as e:
                 self.state.status.emit(f"Could not read boxes: {e}")
+        # _rebuild_rois refreshes the retired listing, so the ghosts _redraw_boxes
+        # paints are this clip's. A new clip's homes may already hold generations
+        # from an earlier session -- that persistence is the whole reason the
+        # history lives on disk rather than in an undo stack.
         self._rebuild_rois()
         self._refresh_list()
         self._redraw_boxes()
@@ -397,6 +416,10 @@ class Tab2Replicates(QWidget):
             # no saved-position copy to restore and therefore none to get wrong.
             self._redraw_boxes()
             return
+        # Retire BEFORE the box's frac is overwritten: the rectangle the retired
+        # files were measured against is the one it is leaving, and this is the
+        # last moment anything holds it.
+        self._retire(rep)
         rep["frac"] = (x0, y0, x1, y1)
         # Moving it makes it fresh again: whatever had been processed against
         # the old rectangle is exactly what the user just agreed to invalidate,
@@ -424,15 +447,17 @@ class Tab2Replicates(QWidget):
         id and therefore the whole directory, while a redraw takes a fresh id and
         starts from nothing. The cheap gesture is also the recoverable one.
 
-        **It enumerates rather than threatens, and it deletes nothing.** The home
-        stays exactly as it is. Everything in it that depends on geometry already
-        knows how to notice: ``WholeVideoTrack`` stamps geometry per frame and
-        ``track_store.load_track`` refuses a mismatch, so a track measured on the
-        old rectangle comes back gray rather than passing as current. Deleting
-        would do destructively, and irreversibly, what that machinery already
-        does safely -- and would take a hand-curated marks corpus with it on a 2%
-        nudge. So the marks survive the move; they simply describe the rectangle
-        they were labelled against, which is what the text has to say plainly.
+        **It enumerates rather than threatens, and it deletes nothing -- but it
+        no longer says the results survive the move.** That was the earlier
+        ruling and it was reversed: a moved box can land on a different animal,
+        or on nothing, so there is no reason to believe the marks under it were
+        ever centred on the replicate the box now names. Carrying them forward as
+        current is not staleness (which ``TrackStamp`` and ``load_track`` already
+        catch and gray out) but **misattribution**, the failure class the
+        per-region track split exists to prevent. So the fileset is RETIRED into
+        ``old_NNN/`` with the rectangle it was measured against: still there,
+        still drawn where it was, restorable, and no longer presented as
+        describing the box's new position.
 
         ``to_origin`` is stated in the text because the box on screen is still
         drawn where it STARTED: FrameView clears the drag ghost before emitting
@@ -454,13 +479,14 @@ class Tab2Replicates(QWidget):
         box.setInformativeText(
             "Moving it changes the region every existing measurement was "
             "computed over. Those results describe the old rectangle and "
-            "cannot be re-aimed at the new one."
+            "cannot be re-aimed at the new one — the box may land on a "
+            "different animal, or on none."
             f"{inventory}"
-            "<br>Nothing is deleted — the folder and its contents stay where "
-            "they are. But work measured against the old rectangle no longer "
-            "answers the question the new one asks: a detection track will come "
-            "back stale and needs a fresh pass, and any saved marks still "
-            "describe where the box used to be.<br><br>"
+            "<br>Nothing is deleted. That work is <b>retired</b>: it moves into "
+            f"a dated folder alongside the rectangle it was measured against, "
+            f"stays drawn on this tab as a dashed <b>OLD {rep['label']}</b> box, "
+            "and can be brought back — with its detections — from "
+            "<b>Older geometries…</b>.<br><br>"
             f"Top-left would move from <b>{x0:.1%}, {y0:.1%}</b> to "
             f"<b>{nx:.1%}, {ny:.1%}</b> of the frame."
             "<br><br>The box keeps its name, colour, settings and folder.")
@@ -491,6 +517,129 @@ class Tab2Replicates(QWidget):
         self._sync_lock_badges()
         self._autosave()
 
+    # -- retired geometries (slice 6) ----------------------------------------
+
+    def _retire(self, rep: dict) -> None:
+        """Move a replicate's current fileset into a fresh ``old_NNN/``.
+
+        Called on every move, not only a gated one: an unprocessed box's home is
+        empty and ``retire_current`` returns None for it, so the guard is the
+        filesystem's rather than a second reading of ``processed`` that could
+        disagree with it.
+        """
+        try:
+            gen = retire_current(self._video_path(), rep["id"], rep["frac"],
+                                 label=rep.get("label", ""))
+        except OSError as e:
+            # Reported, never raised: this runs inside a mouse-release handler,
+            # where an exception is a crash. A failed retire leaves the files at
+            # the root, describing a rectangle the box has left -- which is the
+            # misattribution the retire prevents, so it must be said out loud.
+            self.state.status.emit(
+                f"Could not retire {rep.get('label', '')}'s existing results: "
+                f"{e}. They still sit in the folder and describe the OLD box.")
+            return
+        if gen is not None:
+            self.state.status.emit(
+                f"Retired {rep.get('label', '')}'s results as generation {gen}; "
+                "restore from 'Older geometries…'.")
+        # Announced whether or not anything moved on disk. A live surface may
+        # hold this replicate's track in memory and flushes it on close (that
+        # flush is deliberate -- it is how an accumulated pass survives a
+        # rebuild), so without this the retire is undone one tab switch later:
+        # old-rectangle band power written straight back into the home root the
+        # retire just emptied. Emitted even when gen is None because an
+        # in-memory track can outlive a home whose files never landed.
+        self.state.replicate_retired.emit(int(rep["id"]))
+        # No _refresh_retired here: every caller runs _rebuild_rois immediately
+        # after (the box's frac has just changed), and that is where the listing
+        # is refreshed.
+
+    def _refresh_retired(self) -> None:
+        """Re-read every current box's retired generations from disk.
+
+        Disk is the only record -- the box sidecar has no generation concept, by
+        ruling -- so this is a listing rather than a cache invalidation. Only
+        CURRENT boxes are scanned: a deleted box keeps its home (ruling 2) but is
+        no longer part of the layout, and drawing its history would put
+        rectangles on screen that no row in the list explains.
+        """
+        self._retired = []
+        for r in self.replicates:
+            for g in list_generations(self._video_path(), r["id"]):
+                if g["frac"] is not None:
+                    self._retired.append({**g, "rep": r})
+
+    def _show_generations(self):
+        """List the selected replicate's retired geometries and offer a restore."""
+        rep = self._selected_rep()
+        if rep is None:
+            QMessageBox.information(self, "Older geometries",
+                                    "Select a replicate first.")
+            return
+        gens = list_generations(self._video_path(), rep["id"])
+        if not gens:
+            QMessageBox.information(
+                self, "Older geometries",
+                f"<b>{rep['label']}</b> has never been moved, so it has no "
+                "older geometries.")
+            return
+        # Keyed by the leading "gen N", which is unique per home and is what the
+        # restore actually needs -- rather than matching the whole display string
+        # back to its entry, which two generations retired in the same second
+        # from the same rectangle would tie.
+        choices: dict[str, int | None] = {}
+        for g in gens:
+            if g["frac"] is None:
+                # Listed but not offered: restoring files without the rectangle
+                # they were measured against is exactly the misattribution the
+                # retirement prevented.
+                choices[f"gen {g['gen']} — rectangle unknown, cannot restore"] = None
+                continue
+            x0, y0 = g["frac"][:2]
+            held = ", ".join(g["held"]) or "nothing"
+            when = f" · retired {g['retired_at']}" if g["retired_at"] else ""
+            choices[f"gen {g['gen']} — at {x0:.1%}, {y0:.1%}{when} — {held}"] = \
+                g["gen"]
+        choice, ok = QInputDialog.getItem(
+            self, "Older geometries",
+            f"{rep['label']} — restoring moves the box back to that rectangle "
+            "and brings its results with it.\nWhat is there now is retired in "
+            "turn, so this is reversible.",
+            list(choices), 0, False)
+        if not ok:
+            return
+        gen = choices.get(choice)
+        if gen is None:
+            return
+        self._restore(rep, gen)
+
+    def _restore(self, rep: dict, gen: int) -> None:
+        try:
+            frac = restore_generation(self._video_path(), rep["id"], gen,
+                                      rep["frac"], label=rep.get("label", ""))
+        except (OSError, ValueError, FileNotFoundError) as e:
+            QMessageBox.warning(self, "Could not restore", str(e))
+            return
+        rep["frac"] = tuple(frac)
+        # A restore is a swap, so it retires the current fileset on the way past
+        # -- the same announcement the move path makes, and for the same reason:
+        # a live surface holding this replicate's track in memory would flush it
+        # over the results just restored underneath it.
+        self.state.replicate_retired.emit(int(rep["id"]))
+        # Restored work was measured against the rectangle now in force, so the
+        # box is processed again -- clearing the flag would let the next nudge
+        # move a box holding real results without asking.
+        rep["processed"] = True
+        self._rebuild_rois()          # refreshes the retired listing too
+        self._sync_lock_badges()
+        self._redraw_boxes()
+        self._zoom_to_selected()
+        self._autosave()
+        self.state.status.emit(
+            f"Restored {rep.get('label', '')} generation {gen} and moved the "
+            "box back to its rectangle.")
+
     def _redraw_boxes(self):
         # This 1:1, in-order mapping IS the contract behind the index carried by
         # box_grabbed / box_clicked / box_moved -- FrameView reports a position
@@ -503,11 +652,27 @@ class Tab2Replicates(QWidget):
         self.video.set_frac_boxes([
             (*r["frac"], r["label"], r["color"], r["id"] == sel)
             for r in self.replicates])
+        # Retired rectangles go to a SEPARATE view list, never into the one
+        # above: that list's indices are the drag contract. This is also why the
+        # ghosts are drawn on THIS tab only -- the explorers route a pass into
+        # whatever region is active, and a retired rectangle offered there could
+        # aim a fresh pass at superseded geometry.
+        self.video.set_ghost_frac_boxes([
+            (*g["frac"], f"OLD {g['rep']['label']} · gen {g['gen']}",
+             g["rep"]["color"])
+            for g in self._retired])
 
     def _rebuild_rois(self):
         """Publish replicate geometry to shared state so the live detection path
         and the other tabs pick up the current boxes."""
         self.state.set_replicate_specs(self.replicates)
+        # Here rather than at each call site: this is the one funnel every
+        # mutation of the box list already passes through (add, move, delete,
+        # clear, load, import), so the ghosts cannot be left describing boxes
+        # that no longer exist. Deliberately NOT in _redraw_boxes, which runs on
+        # every selection change and would put a directory listing per replicate
+        # in a paint-adjacent path.
+        self._refresh_retired()
         self.state.rois_changed.emit()
 
     # -- list ----------------------------------------------------------------

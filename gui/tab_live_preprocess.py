@@ -38,6 +38,11 @@ class TabLivePreprocess(QWidget):
 
         state.video_loaded.connect(self._drop)        # new clip invalidates all
         state.rois_changed.connect(self._maybe_refresh)
+        # Relayed even when this tab is not visible, unlike _maybe_refresh: the
+        # surface outlives a hidden tab and flushes its track on close, so
+        # deferring would let the retire be undone by the very rebuild that
+        # noticed the geometry changed.
+        state.replicate_retired.connect(self._on_replicate_retired)
 
     def _current_sig(self) -> tuple | None:
         if not self.state.has_video or not self.state.replicate_specs:
@@ -53,6 +58,10 @@ class TabLivePreprocess(QWidget):
             self._surface = None
         self._sig = None
         self._info.setVisible(True)
+
+    def _on_replicate_retired(self, replicate_id: int):
+        if self._surface is not None:
+            self._surface.discard_replicate_track(int(replicate_id))
 
     def _maybe_refresh(self):
         # Boxes are usually edited on another tab; only (re)build when visible.

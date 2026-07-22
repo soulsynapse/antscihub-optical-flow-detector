@@ -89,6 +89,14 @@ class FrameView(QLabel):
         self.box_drag_enabled = False
         # Persistent boxes to render: [(x0,y0,x1,y1 fractions, label, hex, selected)]
         self.boxes: list[tuple] = []
+        # Retired rectangles: drawn, never interactive. A SEPARATE list rather
+        # than a flag on `boxes`, because the index carried by box_grabbed /
+        # box_clicked / box_moved is a position in `boxes` that consumers use to
+        # index their own replicate list -- mixing non-interactive entries in
+        # would shift every index after one and silently move the wrong box.
+        # Keeping them apart makes "not selectable" structural: _box_at cannot
+        # see this list at all.
+        self.ghost_boxes: list[tuple] = []
         self._overlays_hidden = False
         self._detected = False
         self._rubber: tuple | None = None    # in-progress drag, display coords
@@ -99,6 +107,16 @@ class FrameView(QLabel):
 
     def set_boxes(self, boxes: list[tuple]) -> None:
         self.boxes = boxes
+        self.update()
+
+    def set_ghost_boxes(self, boxes: list[tuple]) -> None:
+        """Rectangles to draw but never hit-test: ``(x0,y0,x1,y1,label,hex)``.
+
+        Used for retired replicate geometries, which stay visible where they were
+        so a move is never a surprise, while remaining unselectable and
+        unroutable.
+        """
+        self.ghost_boxes = boxes
         self.update()
 
     def set_overlays_hidden(self, hidden: bool) -> None:
@@ -225,6 +243,30 @@ class FrameView(QLabel):
             max(1, int(round((py1 - py0) * self._pix.height()))))
         self._draw_rect = self._aspect_fit_rect(area, source.size())
         p.drawPixmap(self._draw_rect, self._pix, source)
+
+        # Retired geometries, UNDER the live boxes: a current box overlapping one
+        # must read as the thing in force. Dashed and desaturated so it cannot be
+        # mistaken for a box that is doing anything.
+        if not self._overlays_hidden:
+            for x0, y0, x1, y1, label, hexcol in self.ghost_boxes:
+                if x1 <= vx0 or x0 >= vx1 or y1 <= vy0 or y0 >= vy1:
+                    continue
+                rect = self._rect_for_frac(x0, y0, x1, y1)
+                # Blended toward mid-gray rather than desaturated through HSV:
+                # QColor.hue() is -1 for an achromatic colour, and a box sidecar
+                # can carry "#ffffff" however the palette was chosen.
+                src = QColor(hexcol)
+                col = QColor((src.red() + 128) // 2, (src.green() + 128) // 2,
+                             (src.blue() + 128) // 2)
+                p.setPen(QPen(col, 1, Qt.PenStyle.DashLine))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(rect)
+                if label:
+                    # A solid pen for the text: the dash pattern above applies to
+                    # glyph outlines too, and a dashed label is unreadable at the
+                    # size these are drawn.
+                    p.setPen(QPen(col, 1))
+                    p.drawText(rect.x() + 3, rect.bottom() - 4, label)
 
         # Persistent boxes.
         if not self._overlays_hidden:
@@ -494,6 +536,10 @@ class VideoPanel(QWidget):
         """Boxes in frame fractions, drawn directly on the view (not the block
         grid): [(x0,y0,x1,y1, label, hex, selected)]."""
         self.view.set_boxes(boxes)
+
+    def set_ghost_frac_boxes(self, boxes: list[tuple]) -> None:
+        """Non-interactive rectangles: [(x0,y0,x1,y1, label, hex)]."""
+        self.view.set_ghost_boxes(boxes)
 
     def set_focus_frac(self, frac: tuple[float, float, float, float] | None
                        ) -> None:

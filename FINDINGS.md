@@ -2085,3 +2085,165 @@ and `core/cost_model.py:89`. It took nine files: the new module, `framecount`
 spec named a function to ADD and a field to ADD, and adding a field to a value
 object is never local — every producer of that object and every consumer that
 groups by it moves with it.
+
+---
+
+## 26. Batch S slice 6: retiring a geometry, and the cache that undid it
+
+**The reversal this rests on.** Slice 3 ruled that marks survive a box move —
+stale, grayed by `TrackStamp`, but present. The user reversed it: they survive
+the *deletion*, not the *move*. The reason is stronger than staleness and it is
+what makes a gray-out insufficient. After a move there is no reason to believe
+the marks under the box were ever centred on the replicate it now names — a
+moved box can land on a different animal, or on nothing. Carrying them forward
+as current is **misattribution**, the failure class the per-region track split
+(slice 2) exists to prevent, not the milder "computed under old settings" that
+the stamp machinery handles. So the fileset is retired *with its rectangle*.
+
+**Home-authoritative geometry made a four-file slice a two-file one.** The
+retired rectangle lives at `<home>/old_NNN/geometry.json`, beside the files it
+describes, rather than as a `retired: []` list in `rois.json`. Two consequences
+fell out that the spec had not predicted:
+
+- **`rois.json`'s schema does not change**, so the per-video box record keeps
+  having no generation concept — which is also what keeps the second copy of
+  the frac from existing (the duplication T11, T17 and T34 each deleted).
+- **The three stores never learn generations exist.** They write to the home
+  *root* through `home_path`, and retiring moves that fileset down and out from
+  under them. The current generation is deliberately **unnumbered**: it sits at
+  the root and takes a number only when superseded.
+
+The generalization: *putting a new concept BELOW the layer that would otherwise
+have to know about it is what makes it local.* That was a property of the
+ruling, not of the implementation.
+
+**The counter is derived (`max(existing) + 1`), and this departs from `next_id`
+on purpose.** `next_id` must be persisted because a deleted box leaves no trace
+in `rois.json` — the counter is the only memory of it. A retired generation
+leaves a *directory*, which is itself the trace, so the filesystem enforces
+monotonicity for free. The hazard is the same one a scale down (a reissued
+generation would adopt a dead rectangle's marks), which is why it is read from
+the listing and never from `len(generations)`.
+
+**The real defect was in RAM, not on disk, and the retire was undoing itself.**
+`LiveScalogramSurface.closeEvent` flushes its `WholeVideoTrack` on the way out,
+deliberately — a replicate edit rebuilds the surface, and that flush is how an
+accumulated whole-video pass survives the rebuild. After a retire it wrote
+old-rectangle band power straight back into the home root the retire had just
+emptied, where it now reads as the NEW rectangle's. **`TrackStamp` made the next
+load refuse it, so it showed gray rather than lying** — detectable, not silent,
+and still not acceptable: a retire that reverses itself one tab switch later is
+not a retire.
+
+The fix is `AppState.replicate_retired(int)` → `discard_replicate_track`, which
+drops that replicate's in-memory track *without* flushing and re-reads the root.
+Three things about it:
+
+- **Per-replicate, not `rois_changed`.** `rois_changed` fires for any box edit,
+  and discarding every in-memory track when one box moved would throw away a
+  neighbour's accumulated pass — work the move did not invalidate. Non-active
+  tracks are already flushed on handover, so the only one at stake is the
+  active one, and only if it is the moved replicate's.
+- **The restore path emits it too.** A restore is a swap, so it retires the
+  current fileset on the way past; the in-memory staleness is identical.
+- **`_sync_track` was the wrong reload route.** It reloads only as a side effect
+  of pushing a stamp and returns early when there is no stamp yet (no channel
+  data, or a surface that has not run a pass), leaving `_track` pointing at the
+  object just dropped. `_activate_region` directly, with `_active_region`
+  cleared first — which also makes that call skip its own outgoing flush, so
+  the two requirements want the same assignment.
+
+**`ghost_boxes` is a separate list on `FrameView`, and that is structural, not
+stylistic.** The index carried by `box_grabbed` / `box_clicked` / `box_moved` is
+a position in `boxes` that the tab uses to index `self.replicates`. A
+non-interactive entry mixed into that list shifts every later index and silently
+moves the wrong replicate. Keeping the ghosts apart means `_box_at` cannot see
+them at all, so "retired rectangles are not selectable" cannot be regressed by
+forgetting a flag.
+
+**Two paint defects, both found in review.** `QColor.hue()` returns **-1 for an
+achromatic colour**, so desaturating a ghost through HSV is undefined for a box
+sidecar carrying `#ffffff` — replaced with a blend toward mid-gray, which is
+total. And the dashed pen was being reused for the label text: a dash pattern
+applies to glyph outlines too.
+
+**Locality, ninth firing — the first to fire INWARD.** Predicted four files,
+took two, for the ruling reason above. The hazard reappeared in the other
+direction: the file the spec did not name held the same state in memory and
+would write it again. **When a ruling makes a change local on disk, ask what
+holds that state in RAM.** A storage layer can be moved out from under its
+writers; it cannot be moved out from under a cache that will write again.
+
+---
+
+## 27. The teardown crash: a QThread outliving its widget, blamed on the machine
+
+**It was ours.** For four sessions a full-suite run intermittently reported all
+tests passing and then died at interpreter shutdown with `Windows fatal
+exception: access violation` and a faulthandler dump. It was recorded as an
+aggressive university endpoint blocker and repeatedly written off. Two real
+defects in `ScalogramExplorer` let a cube thread outlive the widget that owned
+it, and **Qt destroying a running `QThread` is an access violation, not an
+exception** — which is exactly why it appeared as a clean pass followed by a
+crash, with no failed test to point at.
+
+**The seam both defects come from.** `_ScalogramWorker.run` ends with
+`done.emit(...)`, and `done` is a queued connection. So `_on_cube_ready` runs on
+the GUI thread *while the thread that produced the cube is still unwinding* —
+`run()` has not returned and `finished` has not fired. Everything below follows
+from that overlap.
+
+**Hole 1: `self._worker` is not the set of threads to join.** `_on_cube_ready`
+clears `self._worker` and then calls `_request_cube()`, which may launch the
+next cube straight into that attribute. `closeEvent` waited on `self._worker`
+only — so in that window it waited on the *new* thread and let Qt destroy the
+old one, a child `QObject` of the widget, while it was still running. The fix
+separates the two questions that had been conflated: `self._worker` still
+answers *"is a build in flight"*, and a new `self._threads` answers *"what must
+be joined before this widget dies"*. Retirement from `_threads` is connected to
+`finished` **before** `deleteLater`, so the ordering is finished → untracked →
+freed, never freed → waited on.
+
+**Hole 2: `close()` is not deletion.** A closed widget keeps receiving queued
+signals until `deleteLater` gets an event-loop turn. A `done` arriving in that
+gap re-entered `_request_cube` and started a thread *after* `closeEvent` had
+joined every thread — undoing the join it had just performed. Fixed with a
+`_closed` latch set first thing in `closeEvent` and checked in `_request_cube`.
+This one is routine rather than exotic: the live surface closes an explorer on
+**every** pass restart (`_swap_explorer`), which is the single most travelled
+path in the app.
+
+**The debugging lesson, which is the durable part.** Four sessions of
+deselect-plus-isolate "proved" the crash was not ours. It proved only that the
+crash needs full-suite *context* — which is precisely what a timing-dependent
+thread race needs, so that evidence was consistent with the bug the entire time.
+"The diff did not touch `gui/stream_worker.py`" was equally true and equally
+irrelevant: the leaked threads are `_ScalogramWorker`s, and the `_serve_pending`
+frame the dump named belongs to a *different* thread, because faulthandler
+prints every thread's stack, not only the faulting one. **An intermittent crash
+that survives repeated "unrelated diff" arguments is evidence about
+reachability, not about ownership.**
+
+**What actually cracked it: instrument for the PRECONDITION, not the crash.**
+The crash could not be reproduced on demand (~35 clean full runs against one
+firing). But its precondition — a `QThread` still running when the test that
+started it ends — is deterministic, cheap to observe, and was never checked. A
+throwaway pytest plugin wrapping `QThread.start` and testing `isRunning()` in
+`pytest_runtest_teardown` found **14 tests leaking a running thread on the first
+run**. Prefer this whenever a fault is rare but its enabling condition is not.
+
+**How the fix is verified, and the limit on that claim.** Not against the crash,
+which will not reproduce. Against the precondition: leak events went 45 → 28,
+and — the part that matters — **every remaining entry is a finished-then-deleted
+thread, with none still running**. Both fixes carry regression tests
+(`tests/test_explorer_threads.py`) confirmed to fail with their own fix reverted
+and only their own, driven through the real `closeEvent`, since the bug lives
+entirely in that method's ordering against a queued signal.
+
+**A likely aggravator worth recording**: the user asked whether running the GUI
+app in the background could cause it. It cannot cause an access violation *in
+another process* — separate address spaces — but memory pressure (the cube cache
+budget is 6 GB) and decoder contention are exactly the kind of perturbation that
+turns a latent thread race from never-firing into occasionally-firing. That
+would explain both the original "roughly half of runs" and the ~1-in-35 measured
+later, without any of it being environmental in the sense first assumed.

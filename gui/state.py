@@ -29,6 +29,14 @@ class AppState(QObject):
     # than the replicate tab. The tab owns the list and its sidecar, so it is
     # what persists this; state only relays and keeps its own specs in step.
     calibration_changed = pyqtSignal(int, object)
+    # (replicate id) -- that replicate's fileset has just been retired into an
+    # old_NNN/ generation, because its box moved. Anything holding results for it
+    # IN MEMORY must drop them WITHOUT flushing: a flush would land old-rectangle
+    # data back at the home root the retire just emptied, i.e. under the new
+    # rectangle. Narrower than rois_changed on purpose -- that fires for any box
+    # edit, and discarding every replicate's in-memory work when one box moved
+    # would throw away results the move did not invalidate.
+    replicate_retired = pyqtSignal(int)
 
     def __init__(self, project_dir: str = "."):
         super().__init__()

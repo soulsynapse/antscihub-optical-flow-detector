@@ -1850,6 +1850,45 @@ class LiveScalogramSurface(QWidget):
             return
         save_tuning(self.video_path, {"view": view}, replicate_id=rid)
 
+    def discard_replicate_track(self, replicate_id: int) -> None:
+        """Drop a replicate's in-memory track WITHOUT writing it.
+
+        Called when the Replicates tab retires that replicate's fileset because
+        its box moved (``AppState.replicate_retired``). Every other route out of
+        this surface flushes on the way -- ``_activate_region`` on handover,
+        ``closeEvent`` on a rebuild -- and that is deliberate, because a rebuild
+        is the likeliest way an accumulated whole-video pass gets thrown away.
+        Here it is exactly wrong: the retire has just moved that band power into
+        an ``old_NNN/`` generation with the rectangle it was measured against, and
+        a flush would put it straight back at the home root, now meaning the NEW
+        rectangle. The stamp would make the next load refuse it, so it would show
+        gray rather than lie -- but a retire that undoes itself one tab switch
+        later is not something to leave detectable-but-wrong.
+
+        Re-syncing rather than blanking: ``_sync_track`` reads the home root back,
+        which is empty after a successful retire (so a fresh track) and still
+        holds the old one if the retire FAILED (so the surface keeps showing what
+        is actually on disk, which is what the failure notice says).
+        """
+        for region in [r for r in self._tracks
+                       if self._replicate_id_for(r) == int(replicate_id)]:
+            del self._tracks[region]
+            if region == self._active_region:
+                # An armed debounce would write the track that was just dropped.
+                self._track_save_debounce.stop()
+                # Cleared so _activate_region does not early-return on "already
+                # active" and skip the reload. It also makes that call skip its
+                # outgoing _save_track, which is the flush this method exists to
+                # avoid -- the two needs happen to want the same assignment.
+                self._active_region = None
+                # _activate_region directly, NOT _sync_track: that route reloads
+                # only as a side effect of pushing a stamp, and returns early
+                # when there is no stamp yet (no channel data, or a surface that
+                # has not run a pass). It would leave `_track` pointing at the
+                # object just dropped -- unflushable, since _save_track refuses
+                # with no active region, but still the one on screen.
+                self._activate_region(region)
+
     def _activate_region(self, region_index: int) -> None:
         """Make ``region_index``'s track the one this surface reads and writes.
 

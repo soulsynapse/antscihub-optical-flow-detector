@@ -844,5 +844,191 @@ class ReplicateIdentityTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in tab.replicates], [1, 2])
 
 
+class RetiredGeometryTest(unittest.TestCase):
+    """Slice 6: a move retires the work under the box rather than carrying it.
+
+    The failure being prevented is not staleness -- ``TrackStamp`` already grays
+    that out. It is that a moved box can land on a different animal, so marks
+    presented as current would attribute one animal's labelled behaviour to
+    another. These drive the tab so the RETIRE and the frac write cannot get out
+    of order: retiring after the box has moved would record the new rectangle
+    against the old results, which is the same misattribution with a receipt.
+    """
+
+    def _dir(self):
+        import tempfile
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        return d.name
+
+    def _tab(self, video, *, answer=True):
+        from unittest.mock import patch
+
+        from gui.state import AppState
+        from gui.tab2_replicates import Tab2Replicates
+        tab = Tab2Replicates(AppState())
+        for p in (patch.object(type(tab), "_video_path", lambda self: video),
+                  patch.object(type(tab), "_confirm_move",
+                               lambda self, rep, to_origin: answer)):
+            p.start()
+            self.addCleanup(p.stop)
+        return tab
+
+    def _work(self, video, rid, payload="{}"):
+        """Put something in a replicate's home, as a pass would."""
+        from core.replicate_home import home_path
+        with open(home_path(video, rid, ".marks.json"), "w") as f:
+            f.write(payload)
+
+    def test_moving_a_processed_box_retires_its_work_with_the_OLD_rectangle(self):
+        from core.replicate_home import list_generations
+        video = os.path.join(self._dir(), "clip.mp4")
+        tab = self._tab(video)
+        tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)
+        self._work(video, 1, '{"spans": {}}')
+        tab.mark_replicates_processed()
+
+        tab._on_box_moved(0, 0.50, 0.50, 0.70, 0.70)
+
+        (g,) = list_generations(video, 1)
+        self.assertEqual(g["frac"], (0.10, 0.10, 0.30, 0.30),
+                         "the generation must record where the work was MEASURED")
+        self.assertEqual(tab.replicates[0]["frac"], (0.50, 0.50, 0.70, 0.70))
+
+    def test_the_retired_work_is_no_longer_at_the_root(self):
+        """The whole point: what the next pass writes to must not already hold a
+        different rectangle's results."""
+        from core.replicate_home import home_path
+        video = os.path.join(self._dir(), "clip.mp4")
+        tab = self._tab(video)
+        tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)
+        self._work(video, 1)
+        tab.mark_replicates_processed()
+
+        tab._on_box_moved(0, 0.50, 0.50, 0.70, 0.70)
+
+        self.assertFalse(os.path.exists(home_path(video, 1, ".marks.json")))
+
+    def test_a_declined_move_retires_nothing(self):
+        from core.replicate_home import home_path, list_generations
+        video = os.path.join(self._dir(), "clip.mp4")
+        tab = self._tab(video, answer=False)
+        tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)
+        self._work(video, 1)
+        tab.mark_replicates_processed()
+
+        tab._on_box_moved(0, 0.50, 0.50, 0.70, 0.70)
+
+        self.assertEqual(list_generations(video, 1), [])
+        self.assertTrue(os.path.exists(home_path(video, 1, ".marks.json")))
+
+    def test_nudging_a_fresh_box_does_not_litter_generations(self):
+        """An empty home has nothing to retire, so repositioning a box you just
+        drew must not leave a numbered directory recording nothing."""
+        from core.replicate_home import list_generations
+        video = os.path.join(self._dir(), "clip.mp4")
+        tab = self._tab(video)
+        tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)
+        for i in range(3):
+            tab._on_box_moved(0, 0.2 + i / 100, 0.2, 0.4 + i / 100, 0.4)
+        self.assertEqual(list_generations(video, 1), [])
+
+    def test_retired_rectangles_are_drawn_but_never_enter_the_drag_list(self):
+        """The index carried by box_moved is a position in ``view.boxes``; a
+        ghost mixed in there would shift every later index and move the wrong
+        replicate."""
+        video = os.path.join(self._dir(), "clip.mp4")
+        tab = self._tab(video)
+        tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)
+        tab._on_box_drawn(0.60, 0.60, 0.80, 0.80)
+        self._work(video, 1)
+        tab.mark_replicates_processed()
+        tab._on_box_moved(0, 0.40, 0.40, 0.60, 0.60)
+
+        self.assertEqual(len(tab.video.view.boxes), 2,
+                         "the drag list holds the CURRENT boxes only")
+        (ghost,) = tab.video.view.ghost_boxes
+        self.assertEqual(ghost[:4], (0.10, 0.10, 0.30, 0.30))
+        self.assertIn("OLD", ghost[4])
+
+        # And the contract still holds: index 1 is still the second replicate.
+        tab._on_box_moved(1, 0.05, 0.05, 0.25, 0.25)
+        self.assertEqual(tab.replicates[1]["frac"], (0.05, 0.05, 0.25, 0.25))
+
+    def test_a_deleted_box_stops_drawing_its_history(self):
+        """Its home survives (ruling 2), but a rectangle no row in the list
+        explains is clutter the user cannot act on."""
+        video = os.path.join(self._dir(), "clip.mp4")
+        tab = self._tab(video)
+        tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)
+        self._work(video, 1)
+        tab.mark_replicates_processed()
+        tab._on_box_moved(0, 0.40, 0.40, 0.60, 0.60)
+        self.assertEqual(len(tab.video.view.ghost_boxes), 1)
+
+        from unittest.mock import patch
+        tab.list.setCurrentRow(0)
+        with patch.object(type(tab), "_confirm_discard",
+                          lambda self, reps, title, what: True):
+            tab._delete()
+        self.assertEqual(tab.video.view.ghost_boxes, [])
+
+    def test_restoring_moves_the_box_back_and_brings_the_work_with_it(self):
+        from core.replicate_home import home_path, list_generations
+        video = os.path.join(self._dir(), "clip.mp4")
+        tab = self._tab(video)
+        tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)
+        self._work(video, 1, '{"which": "first"}')
+        tab.mark_replicates_processed()
+        tab._on_box_moved(0, 0.50, 0.50, 0.70, 0.70)
+        self._work(video, 1, '{"which": "second"}')
+
+        tab.list.setCurrentRow(0)
+        tab._restore(tab.replicates[0], 1)
+
+        self.assertEqual(tab.replicates[0]["frac"], (0.10, 0.10, 0.30, 0.30))
+        with open(home_path(video, 1, ".marks.json")) as f:
+            self.assertIn("first", f.read())
+        # Reversible: what was current went into a generation of its own.
+        (g,) = list_generations(video, 1)
+        self.assertEqual(g["frac"], (0.50, 0.50, 0.70, 0.70))
+
+    def test_a_restored_box_is_processed_again(self):
+        """It now holds real results measured against the rectangle in force, so
+        the next nudge must ask rather than silently retiring them."""
+        video = os.path.join(self._dir(), "clip.mp4")
+        tab = self._tab(video)
+        tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)
+        self._work(video, 1)
+        tab.mark_replicates_processed()
+        tab._on_box_moved(0, 0.50, 0.50, 0.70, 0.70)
+        self.assertFalse(tab.replicates[0]["processed"])
+
+        tab._restore(tab.replicates[0], 1)
+        self.assertTrue(tab.replicates[0]["processed"])
+
+    def test_the_history_survives_reopening_the_clip(self):
+        """Disk is the record, not a session undo stack -- a box the user is told
+        is recoverable must still be recoverable tomorrow."""
+        import json
+        from unittest.mock import patch
+        d = self._dir()
+        video = os.path.join(d, "clip.mp4")
+        path = os.path.join(d, "clip.rois.json")
+        tab = self._tab(video)
+        with patch.object(tab.state, "video_sidecar", return_value=path):
+            tab._on_box_drawn(0.10, 0.10, 0.30, 0.30)
+            self._work(video, 1)
+            tab.mark_replicates_processed()
+            tab._on_box_moved(0, 0.50, 0.50, 0.70, 0.70)
+            with open(path) as f:
+                self.assertNotIn("old_", json.dumps(json.load(f)),
+                                 "the box sidecar has no generation concept")
+            tab._load_sidecar()                      # the reopen
+
+        (ghost,) = tab.video.view.ghost_boxes
+        self.assertEqual(ghost[:4], (0.10, 0.10, 0.30, 0.30))
+
+
 if __name__ == "__main__":
     unittest.main()

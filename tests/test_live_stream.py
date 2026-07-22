@@ -597,6 +597,64 @@ class StreamWiringTests(_SurfaceTestCase):
         self.assertIn("dropped", s.status_lbl.text())
 
 
+class RetiredTrackDiscardTests(_SurfaceTestCase):
+    """Batch S slice 6: a retire must not be undone by this surface's flush.
+
+    Every other exit from the surface writes the track on the way out -- and
+    should, since a rebuild is the likeliest way a whole-video pass gets thrown
+    away. After the Replicates tab retires a replicate's fileset into an
+    ``old_NNN/`` generation, that same flush would put old-rectangle band power
+    back at the home root, where it now reads as the NEW rectangle's. The stamp
+    makes the next load refuse it, so the failure shows gray rather than lying --
+    which is why it is asserted here rather than trusted to be noticed.
+    """
+
+    def test_discarding_drops_the_track_without_writing_it(self):
+        s = self._surface()
+        s._activate_region(0)
+        with patch.object(s, "_save_track") as save:
+            s.discard_replicate_track(0)
+        save.assert_not_called()
+
+    def test_it_stops_an_armed_save_debounce(self):
+        """The debounce is the quiet route back: it fires after the retire and
+        writes the track the retire just moved away."""
+        s = self._surface()
+        s._activate_region(0)
+        s._track_save_debounce.start()
+        s.discard_replicate_track(0)
+        self.assertFalse(s._track_save_debounce.isActive())
+
+    def test_the_track_is_re_read_from_disk_rather_than_kept(self):
+        s = self._surface()
+        s._activate_region(0)
+        before = s._track
+        s.discard_replicate_track(0)
+        self.assertIsNot(s._track, before,
+                         "the retired track must not still be the live one")
+
+    def test_another_replicate_is_untouched(self):
+        """Narrower than rois_changed on purpose: one box moving must not throw
+        away a neighbour's accumulated pass."""
+        reps = [{"id": 0, "label": "a", "frac": (0.0, 0.0, 0.5, 1.0)},
+                {"id": 1, "label": "b", "frac": (0.5, 0.0, 1.0, 1.0)}]
+        with patch("gui.explorers.live_scalogram_surface.QTimer.singleShot"):
+            s = LiveScalogramSurface(self.video, reps)
+        self.addCleanup(self._destroy, s)
+        s._show_live_window = MagicMock()
+        s._activate_region(0)
+        s._activate_region(1)
+        kept, dropped = s._tracks.get(0), s._tracks.get(1)
+
+        s.discard_replicate_track(1)
+
+        self.assertIs(s._tracks.get(0), kept,
+                      "the neighbour's accumulated track must survive")
+        # Region 1 is repopulated, but by a re-read rather than by what was
+        # dropped -- the cache entry is the reload, not the retired object.
+        self.assertIsNot(s._tracks.get(1), dropped)
+
+
 class OnDemandChannelSelectabilityTests(_QtTestCase):
     """A live pass carries only the selected channel (+ _ALWAYS_STREAM), so the
     others are absent until a replan. They must stay SELECTABLE anyway -- checking

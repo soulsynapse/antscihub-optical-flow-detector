@@ -447,6 +447,24 @@ class ScalogramExplorer(QWidget):
         # right place on the shared time axis. See DensityPlot.set_matrix.
         self._sg_span: dict[tuple, tuple[int, int]] = {}
         self._worker = None
+        # Every cube thread that has been started and has not yet emitted
+        # `finished`. This is NOT the same set as {self._worker}, and the
+        # difference is what made closing this widget crash intermittently.
+        # `_ScalogramWorker.run` ends with `done.emit(...)`, so `done` is
+        # delivered to _on_cube_ready while the thread is still unwinding -- and
+        # _on_cube_ready clears self._worker and may immediately launch the NEXT
+        # cube into it. A close landing in that window found self._worker
+        # pointing at the new thread, waited only for that one, and then let Qt
+        # destroy the old thread -- a child QObject of this widget -- while it
+        # was still running, which is an access violation rather than an error.
+        # `self._worker` stays the answer to "is a build in flight"; this is the
+        # answer to "what must be joined before this widget dies", and conflating
+        # the two is what the bug was.
+        self._threads: list[_ScalogramWorker] = []
+        # Latched by closeEvent. A closed widget is not necessarily a DELETED
+        # one -- it lives until deleteLater gets an event-loop turn, and it keeps
+        # receiving queued signals for the whole of that gap.
+        self._closed = False
         # The span the in-flight cube is being transformed over, captured at
         # launch: self.window_start/self.T may both have moved by the time it
         # lands, which is the normal case on a live pass.
@@ -1613,6 +1631,16 @@ class ScalogramExplorer(QWidget):
         channel is ever built (lazy): the running worker re-checks the current
         selection when it ends, so a rapid channel/region switch coalesces onto
         the latest target."""
+        if self._closed:
+            # A closed explorer must never start a thread. `done` is delivered by
+            # QUEUED connection, so a cube that finished just before the close
+            # lands in _on_cube_ready afterwards -- and that handler ends by
+            # asking for the next cube. Without this the close would join every
+            # thread, then immediately spawn one more, which then outlives the
+            # widget and is destroyed with it while running. A live pass closes
+            # an explorer on every restart, so this ordering is routine rather
+            # than exotic.
+            return
         if self.active_region_index < 0 or self._worker is not None:
             return
         key = (self.active_region_index, self.channel)
@@ -1637,11 +1665,28 @@ class ScalogramExplorer(QWidget):
         self._cube_span = (self.window_start, self.T)
         self._worker = _ScalogramWorker(key, blocks, self.fps, self.freqs, self)
         self._worker.done.connect(self._on_cube_ready)
+        self._threads.append(self._worker)
+        # Retired from the join list BEFORE deleteLater is connected, so the
+        # ordering is: thread has actually finished -> we stop tracking it -> Qt
+        # frees it. Connecting these the other way round would leave a window in
+        # which closeEvent could call wait() on a C++ object already scheduled
+        # for deletion.
+        self._worker.finished.connect(self._retire_thread)
         # Free the finished thread (and its private (T, B) blocks copy) instead
         # of letting it linger as a parented child until the window closes --
         # otherwise every channel/scope switch leaks one dead thread.
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
+
+    def _retire_thread(self) -> None:
+        """Drop a thread from the join list once it has genuinely finished.
+
+        ``self.sender()`` rather than a bound worker, so this holds no reference
+        that could outlive the ``deleteLater`` connected just after it.
+        """
+        w = self.sender()
+        if w in self._threads:
+            self._threads.remove(w)
 
     def _on_cube_ready(self, key, cube):
         stale = self._cube_gen != self._data_gen
@@ -1786,15 +1831,33 @@ class ScalogramExplorer(QWidget):
         # playback runs continuously -- so without this a tick can land on a
         # released VideoSource in the gap. A live pass closes an explorer on
         # every restart, so that gap is entered routinely.
+        # FIRST, before anything below can turn an event: from here on no new
+        # cube thread may start, or the joins below are undone by a queued `done`
+        # arriving afterwards. See _request_cube.
+        self._closed = True
         self.playing = False
         self._timer.stop()
         if self._event_filter_app is not None:
             self._event_filter_app.removeEventFilter(self)
             self._event_filter_app = None
         # Don't let Qt tear down a running QThread (crashes); wait it out.
-        if self._worker is not None:
-            self._worker.wait()
-            self._worker = None
+        #
+        # EVERY started thread, not just self._worker. A cube emits `done` as the
+        # last statement of run(), so _on_cube_ready -- which clears self._worker
+        # and may launch the next cube straight into it -- runs while the thread
+        # that produced the cube is still unwinding. Waiting only on
+        # self._worker therefore missed the one thread most likely to still be
+        # alive, and Qt destroyed it with this widget. `_threads` is emptied by
+        # `finished`, so in the common case this loop has nothing to do.
+        for w in list(self._threads):
+            try:
+                w.wait()
+            except RuntimeError:
+                # Its C++ side is already gone, so there is nothing left to
+                # join -- and nothing left to crash on either.
+                pass
+        self._threads.clear()
+        self._worker = None
         if self._owns_source and self.source is not None:
             self.source.release()
             self.source = None

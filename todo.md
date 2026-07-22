@@ -155,6 +155,8 @@ depends on framing. Remove when the organism-relative mode lands, which needs
 | 23. Batch Q continuous surface | the cube-build livelock, the 1-frame window that renders, the backwards-drifting cursor, and why a slice with no observable behaviour means the boundary is wrong |
 | 24. Batch Q continuous plots | the tier table, why the pooled Morlet is NOT the expensive call, the percentile that re-opened a closed decision, and the hatch that inverted its own purpose |
 | 25. Batch S routing | the three route outcomes and why the middle one cannot raise, the rational-fps fix the streaming path never inherited, and why the clips checkbox is not persisted |
+| 26. Batch S retired geometries | why a gray-out is not enough for a moved box, how the ruling made the slice local, and the in-memory cache that undid the retire |
+| 27. The teardown crash | it was ours, not the machine; the two ways a cube thread outlived its widget, and why instrumenting the PRECONDITION beat chasing the crash |
 
 ---
 
@@ -537,13 +539,21 @@ tensor channel is DONE** (shipped in `9d843c0`; see the current thread below) �
 built but not yet validated for want of a postural corpus. Signature fitting
 (T32) is its own branch.
 
-**Batch S is the live thread (2026-07-21): slices 1–5 landed, only 6 open.** It
-is where per-replicate ownership is being made real on disk, and it is ahead of
-everything else here because slices 1–3 each fixed a *silent cross-replicate
-overwrite* rather than adding a feature. **Slice 6 (retired geometries) is the
-one with unruled design questions and MUST be ruled before it is started** — it
-is now the only thing left in the batch, so there is nothing else here to do
-first.
+**Batch S is CLOSED (2026-07-21): all six slices landed.** It is where
+per-replicate ownership was made real on disk, and it ran ahead of everything
+else here because slices 1–3 each fixed a *silent cross-replicate overwrite*
+rather than adding a feature. Slice 6 closed the last of that class: a moved box
+no longer presents one animal's labelled behaviour as describing whatever the
+rectangle now covers.
+
+**So the plan has no live thread.** What remains, in the order the file argues
+for: **Batch L's two cheap measurements** (tile occupancy from the `change`
+channel; clip-backed throughput at N=8) — both measurements, not builds, and
+together they decide whether quiet-tile gating is the only remaining throughput
+lever. Then **T21** (the replicate-tab memory suspicion, which needs a
+`tracemalloc` run and must not be guessed at), **T32** (supervised signature
+fitting, its own branch), and the deferred **Occupancy** half of §20, which is
+blocked on a still-with-animal / animal-absent corpus rather than on code.
 
 ---
 
@@ -670,7 +680,44 @@ runs `seek_absolute` -> `_apply_frame` -> `_redraw_video`, i.e. a video decode
 per mouse-move. Pre-existing scrub behaviour, not introduced here, but the strip
 makes it much easier to hit.
 
-**Environment note, so the next session does not chase it:** this machine throws
+### The teardown crash was NOT environmental. FIXED 2026-07-21 · `FINDINGS.md` §27
+
+**Everything below this heading is the record of getting it wrong for four
+sessions, kept deliberately.** The "not ours" reading was reasonable at every
+step and was still false. Two real defects in `ScalogramExplorer`'s cube-thread
+lifetime let a `QThread` outlive the widget that owned it; Qt destroying a
+running thread is an access violation, not an exception, which is why it
+surfaced as *"843 passed"* followed by a faulthandler dump and a non-zero exit.
+
+**What the four sessions' evidence actually showed.** Deselect-plus-isolate
+proved only that the crash needs full-suite *context* — which is exactly what a
+timing-dependent thread race needs, so the proof pair was consistent with the
+bug the whole time. "The diff did not touch `gui/stream_worker.py`" was also
+true and also irrelevant: the leaked threads are `_ScalogramWorker`s, and the
+`_serve_pending` frame in the dump was a *different* thread that faulthandler
+prints alongside the crashing one, because it dumps every thread.
+
+**The generalizable lesson:** an intermittent crash that survives four
+"unrelated diff" arguments is evidence about *reachability*, not about
+ownership. The cheap decisive move was never attempted until now — instrument
+for the PRECONDITION (a QThread still running when its test ends) rather than
+try to reproduce the crash. That took one throwaway pytest plugin and found 14
+tests leaking a running thread on the first run.
+
+**How the fix is verified, and its limit.** The crash could NOT be reproduced on
+demand — ~35 clean full runs this session against one firing early on, so the
+rate is far below the "roughly half" originally recorded. So the fix is verified
+against the **precondition**, not the crash: the leak probe went from 45 leak
+events with ~14 tests leaving a *running* thread, to 28 events of which **every
+one is a finished-then-deleted thread and none is still running**. Both fixes
+also have regression tests that were confirmed to fail with their own fix
+reverted, and only their own. If the dump ever recurs, this note is wrong again
+and the probe is in the session log.
+
+---
+
+**The superseded environment note, kept because the reasoning is instructive:**
+this machine throws
 `Windows fatal exception: access violation` in `_serve_pending` during
 `tests/test_stream_worker.py` on roughly half of full-suite runs. User reports it
 is an aggressive university endpoint blocker; re-running gets through. An attempt
@@ -702,6 +749,16 @@ So it is a teardown-time crash, not a test failure, which is why "817 passed"
 and a non-zero exit code appear together. Proof pair again: 16/16 in isolation,
 801 deselected. This session did not touch `gui/stream_worker.py` at all.
 **Read the LAST line of the run, not the exit code.**
+
+**Slice 6 (2026-07-21) is the fifth firing, and the first with a caveat worth
+stating.** Same shape exactly: two full runs reported **840 passed**, a third
+reported 840 passed and then died at teardown with the faulthandler dump and
+exit 5. Proof pair again: **824 passed deselected, 16/16 in isolation.** The
+caveat: unlike the previous four, this session DID touch a file the stream
+worker is wired to (`live_scalogram_surface.py`, the `discard_replicate_track`
+seam) — though not `gui/stream_worker.py` and nothing on the `_serve_pending`
+path the dump names. So the evidence is one notch weaker than "never touched
+it", and still points the same way.
 
 ---
 
@@ -962,7 +1019,66 @@ changes the layout.
     were labelled against, or they inherit the legacy corpus's own defect.
 
 ### Open
-- **Slice 6 · retired geometries. NEW, and it REVERSES a ruling above.**
+*(nothing — slice 6 closed 2026-07-21, and Batch S with it.)*
+
+- **Slice 6 · retired geometries. LANDED 2026-07-21. It REVERSES a ruling above.**
+
+  **Built as ruled.** `core/replicate_home.py` grew `retire_current` /
+  `restore_generation` / `list_generations` / `next_generation`;
+  `gui/tab2_replicates.py` retires on an accepted move and offers
+  *Older geometries…*; `FrameView` grew a separate `ghost_boxes` list.
+  Four things worth not re-deriving:
+
+  **The rulings SHRANK the slice, and the reason generalizes.** Predicted to
+  span `rois.json`'s schema, `replicate_home`, `tab2_replicates` and both
+  stores. Home-authoritative geometry removed the schema change, and the three
+  stores never learned generations exist — they write to the home *root* via
+  `home_path`, and retiring moves the fileset out from under them. **Putting
+  the new concept below the layer that would have had to know about it is what
+  made it local**, and that was a consequence of the ruling, not of the build.
+
+  **`ghost_boxes` is a separate list on `FrameView`, not a flag on `boxes`.**
+  The index carried by `box_grabbed`/`box_clicked`/`box_moved` is a *position
+  in `boxes`* that the tab uses to index `self.replicates` — the contract
+  `_redraw_boxes` documents. A non-interactive entry mixed in would shift every
+  later index and silently move the wrong replicate. Keeping them apart makes
+  "not selectable" structural: `_box_at` cannot see the ghosts at all.
+
+  **The in-memory hazard this section predicted was REAL, reachable, and is
+  fixed.** `LiveScalogramSurface.closeEvent` flushes its track on purpose (a
+  replicate edit rebuilds the surface, and that flush is how an accumulated
+  whole-video pass survives) — so after a retire it wrote old-rectangle band
+  power straight back into the home root the retire had just emptied, **undoing
+  the retire one tab switch later**. `TrackStamp` would have made the next load
+  refuse it, so it showed gray rather than lying; detectable-but-wrong was not
+  good enough. Now `AppState.replicate_retired(int)` → `_on_replicate_retired`
+  → `discard_replicate_track`, which drops that replicate's track *without*
+  flushing and re-reads the root. **The signal is per-replicate, not
+  `rois_changed`**: one box moving must not throw away a neighbour's
+  accumulated pass. The restore path emits it too — a swap retires the current
+  fileset on the way past, so the staleness is identical.
+  *`_sync_track` was the wrong reload route* — it reloads only as a side effect
+  of pushing a stamp and returns early when there is no stamp yet, leaving
+  `_track` pointing at the object just dropped. `_activate_region` directly,
+  with `_active_region` cleared first (which also skips its outgoing flush —
+  the two needs want the same assignment).
+
+  **The generation counter is derived, and `_rebuild_rois` is where the listing
+  refreshes.** Not `_redraw_boxes`, which runs on every selection change and
+  would put a directory listing per replicate in a paint-adjacent path;
+  `_rebuild_rois` is the one funnel every mutation of the box list already
+  passes through.
+
+  *Found in review, both in the ghost paint:* `QColor.hue()` returns **-1 for
+  an achromatic colour** and a box sidecar can carry `#ffffff`, so the HSV
+  desaturation was replaced with a blend toward mid-gray; and the dashed pen
+  was being reused for the label text, whose glyph outlines dash too.
+
+  Suite 840 green. New: `RetiredGeometryTest` (10) in `test_replicate_tab.py`,
+  `GenerationTest` (11) in `test_replicate_home.py`, `RetiredTrackDiscardTests`
+  (4) in `test_live_stream.py`.
+
+  **The original statement, kept because the reasoning still binds:**
   Slice 3's spec said "marks survive a box move (ruled, and already reflected in
   `_confirm_move`'s text)". **The user reversed this on 2026-07-21:** the marks
   survive *the deletion*, not *the move* — they stay valid **for the geometry
@@ -1004,13 +1120,53 @@ changes the layout.
         old_002/                  <- retired generation, with its own frac
           …
 
-  Open questions for that slice: where the retired rectangle is persisted
-  (`rois.json` is the only per-video record of a box and has no generation
-  concept); whether the OLD box is drawn on every surface or only the Replicates
-  tab; and whether rollback is per-replicate or a single undo. **Do not start
-  this without ruling those** — it spans `rois.json`'s schema,
-  `core/replicate_home.py`, `gui/tab2_replicates.py` and both stores, which is
-  the file-locality hazard's sixth firing waiting to happen.
+  **RULED 2026-07-21, all three questions answered.** The rulings shrink the
+  slice rather than growing it — see the locality note at the end.
+
+  - **The retired rectangle lives IN THE HOME and is authoritative there.**
+    `old_NNN/geometry.json` carries the frac beside the marks and track it
+    describes. Slice 3 already ruled the box `frac` joins marks `provenance`,
+    so a `retired: [...]` list in `rois.json` would be a second copy of the same
+    fact — the state duplication T11, T17 and T34 each had to delete. The
+    Replicates tab discovers generations by listing the home.
+    **Consequence: `rois.json`'s schema does not change at all.**
+  - **`OLD_` boxes are drawn on the Replicates tab ONLY**, dashed and
+    desaturated, and are not selectable. The tab is the layout editor, so
+    "this used to be here" belongs there. The explorers route a detection pass
+    into whatever region is *active*; a selectable retired box on those surfaces
+    could aim a fresh pass at a retired generation, which re-creates the
+    cross-attribution failure slice 2 fixed, one level down.
+  - **Rollback is per-replicate, to ANY generation, and it is a swap.**
+    Restoring `old_002` moves its contents up to the home root and retires the
+    displaced current fileset as a new generation, so restore is a move in the
+    other direction rather than a second mechanism. Disk-backed, therefore it
+    survives a reload — a session-scoped undo would show a box labelled
+    recoverable with no way left to recover it.
+
+  **The generation counter is DERIVED, not persisted, and that is the one place
+  this departs from `next_id`.** Next generation is `max(existing old_NNN) + 1`.
+  `next_id` had to be persisted because a deleted box leaves *no trace* in
+  `rois.json`, so the counter was the only memory of it; a retired generation
+  leaves a **directory**, which is itself the trace. The filesystem enforces
+  monotonicity here for free, and the reissue hazard is the same failure class
+  (a reissued generation would adopt a dead rectangle's marks) — so it must be
+  derived from the listing, never from a count.
+
+  **Current geometry is UNNUMBERED.** It sits at the home root and takes a
+  number only when it is retired; `rep1 (gen 3)` is not a thing the layout can
+  say. That is what keeps the stores untouched.
+
+  *Locality, ninth firing — inverted for once.* The spec predicted
+  `rois.json`'s schema, `core/replicate_home.py`, `gui/tab2_replicates.py` and
+  both stores. The rulings remove three of those: the schema is unchanged
+  (home-authoritative), and `marks_store` / `tuning_store` / `track_store` all
+  write to `home_path(...)` = the home ROOT, so retiring is a move of the root
+  fileset *underneath* them and they never learn a generation exists. The
+  hazard's real form here is the other direction: the surface holds
+  `_tracks[region]` **in memory** across a retire on another tab, and flushing
+  that on handover would write old-rectangle data into the new generation's
+  root. `TrackStamp` makes it come back gray rather than pass as current, so it
+  is detected, not silent — but check it before assuming two files.
 - ~~**Slice 5 · routing + cost model.**~~ **LANDED 2026-07-21.** Full write-up
   in `FINDINGS.md` §25. Built as specced, plus three things the spec did not
   reach:
@@ -1072,6 +1228,16 @@ ask what holds the state, not where the state is written.**
 Treat slice 6's file list as a guess. Its own section already flags it as
 spanning four files, which is a prediction, not a reprieve. Slice 4 fired the
 hazard a seventh time, in the smallest possible way — see its entry.
+
+**Slice 6 was the ninth and the first to fire INWARD.** The spec predicted four
+files and took two, because the rulings put the new concept *below* the layer
+that would have had to know about it (see its entry). The hazard reappeared in
+the other direction instead: the file the spec did not name,
+`live_scalogram_surface.py`, held the replicate's track **in memory** and
+flushed it on close, undoing the retire. **The generalization: when a ruling
+makes a change local on disk, ask what holds the same state in RAM** — a
+storage layer can be moved out from under its writers, but not out from under a
+cache that will write again.
 
 **Slice 5 was the eighth, and it names the rule for a whole class of specs.**
 It named two things (`resolve_source(video)` and `core/cost_model.py:89`) and

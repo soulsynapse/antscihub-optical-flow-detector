@@ -14,8 +14,11 @@ import os
 import tempfile
 import unittest
 
-from core.replicate_home import (describe_home, ensure_home, home_name,
-                                 home_path, replicate_dir, sync_homes)
+from core.replicate_home import (GEOMETRY_NAME, describe_home, ensure_home,
+                                 generation_dir, home_name, home_path,
+                                 list_generations, next_generation,
+                                 replicate_dir, restore_generation,
+                                 retire_current, sync_homes)
 
 
 class HomeNamingTest(unittest.TestCase):
@@ -152,6 +155,147 @@ class DescribeHomeTest(unittest.TestCase):
                                    f"scratch{i}.bin"), "wb") as f:
                 f.write(b"x")
         self.assertEqual(describe_home(self.video, 1), ["5 other files"])
+
+
+class GenerationTest(unittest.TestCase):
+    """Retiring a geometry, and the swap that brings one back.
+
+    The defects here are the same shape as the rest of this file: a retire that
+    leaves one file behind, or a restore that moves the results without the
+    rectangle, produces a home that looks fine and attributes one rectangle's
+    measurements to another.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.video = os.path.join(self.tmp.name, "GX010047.MP4")
+        open(self.video, "wb").close()
+        ensure_home(self.video, 1)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _put(self, name: str, data="x"):
+        p = os.path.join(replicate_dir(self.video, 1), name)
+        mode = "wb" if isinstance(data, bytes) else "w"
+        with open(p, mode) as f:
+            f.write(data)
+        return p
+
+    def _root_files(self):
+        d = replicate_dir(self.video, 1)
+        return sorted(n for n in os.listdir(d)
+                      if os.path.isfile(os.path.join(d, n)))
+
+    def test_an_empty_home_retires_nothing(self):
+        """Otherwise every nudge of a fresh box leaves a numbered directory
+        recording nothing, and the history stops being readable."""
+        self.assertIsNone(retire_current(self.video, 1, (0.1, 0.1, 0.2, 0.2)))
+        self.assertEqual(list_generations(self.video, 1), [])
+
+    def test_retiring_moves_every_root_file_and_records_the_rectangle(self):
+        self._put("GX010047.track.npz", b"\0" * 512)
+        self._put("GX010047.marks.json", "{}")
+        self._put("scratch.bin", "note")
+        gen = retire_current(self.video, 1, (0.1, 0.2, 0.3, 0.4))
+
+        self.assertEqual(gen, 1)
+        # Nothing left at the root: a file that stayed would describe the OLD
+        # rectangle while sitting where the new one's results go.
+        self.assertEqual(self._root_files(), [])
+        (g,) = list_generations(self.video, 1)
+        self.assertEqual(g["frac"], (0.1, 0.2, 0.3, 0.4))
+        self.assertEqual(
+            sorted(n for n in os.listdir(g["path"]) if n != GEOMETRY_NAME),
+            ["GX010047.marks.json", "GX010047.track.npz", "scratch.bin"])
+
+    def test_generations_number_from_the_listing_not_from_a_count(self):
+        """A hand-removed directory must not let a later retirement reissue its
+        number and inherit its place in the history."""
+        for i in range(3):
+            self._put("GX010047.marks.json", f"{{\"n\": {i}}}")
+            retire_current(self.video, 1, (0.1, 0.1, 0.2, 0.2))
+        self.assertEqual([g["gen"] for g in list_generations(self.video, 1)],
+                         [1, 2, 3])
+
+        import shutil
+        shutil.rmtree(generation_dir(self.video, 1, 2))
+        self.assertEqual(next_generation(self.video, 1), 4)
+        self._put("GX010047.marks.json", "{}")
+        self.assertEqual(retire_current(self.video, 1, (0.5, 0.5, 0.6, 0.6)), 4)
+
+    def test_a_user_directory_is_not_mistaken_for_a_generation(self):
+        os.makedirs(os.path.join(replicate_dir(self.video, 1), "old_notes"))
+        self.assertEqual(list_generations(self.video, 1), [])
+        self.assertEqual(next_generation(self.video, 1), 1)
+
+    def test_restoring_swaps_and_returns_the_retired_rectangle(self):
+        self._put("GX010047.marks.json", '{"spans": {"0": []}, "gen": 1}')
+        retire_current(self.video, 1, (0.1, 0.1, 0.2, 0.2))
+        self._put("GX010047.marks.json", '{"spans": {"0": []}, "gen": 2}')
+
+        frac = restore_generation(self.video, 1, 1, (0.7, 0.7, 0.8, 0.8))
+
+        # The rectangle comes back WITH the files -- that is the whole gesture.
+        self.assertEqual(frac, (0.1, 0.1, 0.2, 0.2))
+        with open(home_path(self.video, 1, ".marks.json")) as f:
+            self.assertEqual(json.load(f)["gen"], 1)
+        # What was current is retired in turn, so the swap is reversible.
+        (g,) = list_generations(self.video, 1)
+        self.assertEqual(g["frac"], (0.7, 0.7, 0.8, 0.8))
+        self.assertFalse(os.path.exists(generation_dir(self.video, 1, 1)))
+
+    def test_restoring_twice_returns_to_where_it_started(self):
+        self._put("GX010047.marks.json", '{"gen": 1}')
+        retire_current(self.video, 1, (0.1, 0.1, 0.2, 0.2))
+        self._put("GX010047.marks.json", '{"gen": 2}')
+
+        back = restore_generation(self.video, 1, 1, (0.7, 0.7, 0.8, 0.8))
+        (g,) = list_generations(self.video, 1)
+        again = restore_generation(self.video, 1, g["gen"], back)
+
+        self.assertEqual(again, (0.7, 0.7, 0.8, 0.8))
+        with open(home_path(self.video, 1, ".marks.json")) as f:
+            self.assertEqual(json.load(f)["gen"], 2)
+
+    def test_a_generation_with_no_rectangle_is_listed_but_refuses_restore(self):
+        """Restoring results while leaving the box where it is recreates exactly
+        the misattribution the retirement prevented."""
+        self._put("GX010047.marks.json", "{}")
+        retire_current(self.video, 1, (0.1, 0.1, 0.2, 0.2))
+        os.remove(os.path.join(generation_dir(self.video, 1, 1), GEOMETRY_NAME))
+
+        (g,) = list_generations(self.video, 1)
+        self.assertIsNone(g["frac"])
+        with self.assertRaises(ValueError):
+            restore_generation(self.video, 1, 1, (0.7, 0.7, 0.8, 0.8))
+
+    def test_a_missing_generation_raises_rather_than_silently_doing_nothing(self):
+        with self.assertRaises(FileNotFoundError):
+            restore_generation(self.video, 1, 9, (0.1, 0.1, 0.2, 0.2))
+
+    def test_generations_are_named_as_kept_never_as_at_stake(self):
+        """describe_home backs a dialog about what a MOVE risks. Retired
+        generations are the one thing a move does not put at risk, so counting
+        them among the "other files" would invert the warning."""
+        self._put("GX010047.marks.json", "{}")
+        retire_current(self.video, 1, (0.1, 0.1, 0.2, 0.2))
+        self._put("GX010047.track.npz", b"\0" * 512)
+
+        held = describe_home(self.video, 1)
+        self.assertIn("1 retired geometry (kept)", held)
+        self.assertFalse([h for h in held if "other file" in h])
+
+    def test_a_generation_describes_its_own_contents(self):
+        self._put("GX010047.track.npz", b"\0" * 2048)
+        self._put("GX010047.marks.json",
+                  json.dumps({"spans": {"0": [[0.0, 1.0, "flying"]]}}))
+        retire_current(self.video, 1, (0.1, 0.1, 0.2, 0.2))
+
+        (g,) = list_generations(self.video, 1)
+        held = " | ".join(g["held"])
+        self.assertIn("detection track", held)
+        self.assertIn("1 marked span", held)
+        # Its own geometry record is structure, not content.
+        self.assertNotIn("other file", held)
 
 
 if __name__ == "__main__":
