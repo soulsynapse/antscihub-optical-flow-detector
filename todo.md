@@ -712,7 +712,9 @@ events with ~14 tests leaving a *running* thread, to 28 events of which **every
 one is a finished-then-deleted thread and none is still running**. Both fixes
 also have regression tests that were confirmed to fail with their own fix
 reverted, and only their own. If the dump ever recurs, this note is wrong again
-and the probe is in the session log.
+— re-run **`scripts/qthread_leak_probe.py`** (its docstring has the invocation
+and how to read the report) and look for an entry WITHOUT the `(deleted)`
+marker, which is the crash-capable case. Baseline is 28 events, all `(deleted)`.
 
 ---
 
