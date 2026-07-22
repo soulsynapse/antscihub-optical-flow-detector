@@ -109,6 +109,39 @@ class Preprocessor:
         return np.asarray(gray, np.float32)
 
     @property
+    def accepts_native_gray16(self) -> bool:
+        """Whether a decoder-native gray16 tile can skip the 0..255 conversion.
+
+        Only a bare z-score pipeline is scale-invariant.  Registration, masks,
+        temporal operations, background subtraction and CLAHE all attach
+        meaning to the input grey scale or dtype and therefore retain the usual
+        :meth:`apply` path.
+        """
+        return (self.cfg.registration == "off" and self._mask is None
+                and self.cfg.denoise == "off"
+                and self.cfg.bg_subtract == "off"
+                and self.cfg.normalize == "zscore")
+
+    def apply_native_gray16(self, gray16: np.ndarray) -> np.ndarray:
+        """Normalize a working-size gray16 decoder tile without an intermediate.
+
+        Z-scoring ``gray16`` gives the same mathematical result as first scaling
+        it by 255/65535: the positive scale cancels from ``(x-mean)/std``.  The
+        normal output remains float32 on the established 128 +/- 32 convention.
+        """
+        if not self.accepts_native_gray16:
+            raise ValueError("native gray16 requires a bare z-score pipeline")
+        if gray16.ndim != 2 or gray16.dtype != np.uint16:
+            raise ValueError("native gray16 input must be a uint16 HxW plane")
+        if gray16.shape != (self.height, self.width):
+            raise ValueError(
+                f"native gray16 input is {gray16.shape[1]}x{gray16.shape[0]}, "
+                f"expected {self.width}x{self.height}")
+        return np.asarray(
+            self._normalize(gray16, std_scale=(255.0 / 65535.0)),
+            np.float32)
+
+    @property
     def mask(self) -> np.ndarray | None:
         return self._mask
 
@@ -132,7 +165,10 @@ class Preprocessor:
     @staticmethod
     def _to_gray(bgr: np.ndarray) -> np.ndarray:
         if bgr.ndim == 2:
-            return bgr.astype(np.float32)
+            # ROI decoding already returns float32.  copy=False avoids copying
+            # every tile once more before normalization, while retaining the
+            # established conversion for integer full-frame inputs.
+            return bgr.astype(np.float32, copy=False)
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
     def _register(self, gray: np.ndarray) -> np.ndarray:
@@ -184,7 +220,7 @@ class Preprocessor:
             return gray
         return np.abs(gray - self._bg).astype(np.float32)
 
-    def _normalize(self, gray: np.ndarray) -> np.ndarray:
+    def _normalize(self, gray: np.ndarray, *, std_scale: float = 1.0) -> np.ndarray:
         if self.cfg.normalize == "clahe":
             # KNOWN ISSUE (see KNOWN_ISSUES.md): CLAHE runs per replicate box, per
             # frame, on the hard crop. Its edge tiles have truncated histograms
@@ -207,8 +243,11 @@ class Preprocessor:
         # accumulates in float64 where ndarray.std() accumulated in float32.
         m, s = cv2.meanStdDev(gray)
         mean, std = float(m[0, 0]), float(s[0, 0])
-        if std < 1e-6:
-            return gray - mean
+        # ``std_scale`` preserves the established near-constant cutoff when the
+        # native gray16 fast path delays its 1/257 input scaling.  It otherwise
+        # cancels algebraically from the z-score and need not touch the pixels.
+        if std * std_scale < 1e-6:
+            return (gray - mean) * std_scale
         a = 32.0 / std
         out = cv2.multiply(gray, a, dtype=cv2.CV_32F)
         return cv2.add(out, 128.0 - mean * a, dst=out)

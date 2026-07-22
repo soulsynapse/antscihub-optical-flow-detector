@@ -271,6 +271,18 @@ class _AtlasStream:
         tile = atlas[self.slices[int(replicate_id)]]
         return tile.astype(np.float32) * (255.0 / 65535.0)
 
+    def crop_native(self, atlas: np.ndarray, replicate_id: int) -> np.ndarray:
+        """This tile as the decoder's native gray16 view.
+
+        Most consumers need the 0..255 float convention from :meth:`crop`.
+        Z-score normalization is invariant to a positive input scale, however,
+        so the tensor extractor can normalize this view directly and avoid a
+        full-plane uint16 -> float32 conversion before immediately applying a
+        second affine transform.  Keeping this as a separate method makes that
+        exception explicit instead of weakening ``crop``'s public contract.
+        """
+        return atlas[self.slices[int(replicate_id)]]
+
     def iter_frames(self):
         if self.proc.stdout is None:
             return

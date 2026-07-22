@@ -205,6 +205,21 @@ class AtlasTest(_Base):
             roi.release()
         self.assertAlmostEqual(float(got.mean()), 120.0, delta=2.0)
 
+    def test_native_crop_is_a_uint16_view_of_the_atlas(self):
+        """The tensor fast path must avoid both conversion and another copy."""
+        tiles, fps = _tiles(self.square, _two_replicates())
+        roi, frames = tc._open_roi(self.square, tiles, 3, 1, fps)
+        self.assertIsNotNone(roi)
+        try:
+            _, atlas = next(frames)
+            got = roi.crop_native(atlas, 0)
+            expected = atlas[roi.slices[0]]
+            self.assertEqual(got.dtype, np.uint16)
+            self.assertTrue(np.shares_memory(got, atlas))
+            np.testing.assert_array_equal(got, expected)
+        finally:
+            roi.release()
+
     def test_tiles_do_not_overlap_in_the_atlas(self):
         """Distinct source content must land in distinct atlas rows."""
         video = os.path.join(self._dir, "halves.mp4")

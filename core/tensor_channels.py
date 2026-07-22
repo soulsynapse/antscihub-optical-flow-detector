@@ -56,7 +56,7 @@ from core.video import (ClipAtlasSource, ReplicateVideoSource, VideoSource,
 
 CHANNELS = ("intensity", "change", "appearance", "texture", "tensor_speed",
             "u", "v")
-CHANNEL_VERSION = 4     # bump when the extraction math changes (sidecar key)
+CHANNEL_VERSION = 5     # bump when the extraction math changes (sidecar key)
 
 # What each channel costs beyond the frame itself, which is what makes selecting
 # one worth doing (FINDINGS.md section 1: tensor_products is ~7% of a pass, the
@@ -459,9 +459,18 @@ def stream_channel_planes(video_path: str, plan: ChannelPlan, *,
                     # steps collapse to no-ops and the remaining steps (normalize,
                     # mask, ...) run on identical input. Same geometry either way,
                     # because both derive it from the same source_box and scale.
-                    owned = (roi.crop(frame, ti) if roi is not None
-                             else frame[y0:y1, x0:x1])
-                    g = pres[rid].apply(owned)
+                    pre = pres[rid]
+                    if roi is not None and pre.accepts_native_gray16:
+                        # Z-score is invariant to the decoder's positive 1/257
+                        # grey-scale conversion.  Normalize the uint16 view
+                        # directly, avoiding a full float32 plane and a second
+                        # read of it before the inevitable normalized output.
+                        owned = roi.crop_native(frame, ti)
+                        g = pre.apply_native_gray16(owned)
+                    else:
+                        owned = (roi.crop(frame, ti) if roi is not None
+                                 else frame[y0:y1, x0:x1])
+                        g = pre.apply(owned)
                 th, tw = ay1 - ay0, ax1 - ax0
 
                 gp = prev_g[rid]

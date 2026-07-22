@@ -2257,3 +2257,33 @@ budget is 6 GB) and decoder contention are exactly the kind of perturbation that
 turns a latent thread race from never-firing into occasionally-firing. That
 would explain both the original "roughly half of runs" and the ~1-in-35 measured
 later, without any of it being environmental in the sense first assumed.
+
+---
+
+## 28. Native gray16 z-score: remove an affine transform that cancels itself
+
+The ROI decoder stores its atlas as gray16, but `crop()` converted each tile to
+0..255 float32 before the default z-score normalization immediately applied a
+second affine transform. The first transform is mathematically irrelevant:
+for positive `k`, `(kx - mean(kx)) / std(kx) == (x - mean(x)) / std(x)`.
+
+The tensor path now normalizes a native uint16 view when, and only when, the
+pipeline is a bare z-score. Registration, masks, denoising, background
+subtraction, CLAHE and normalization-off retain the established 0..255 path.
+`crop()` also retains its public float32 contract; `crop_native()` is the narrow
+exception, so another consumer cannot accidentally inherit uint16 semantics.
+
+Measured end to end on a generated 1280x720, 24 fps, six-replicate, 200-frame
+ROI workload (`change` only, block 64, scale 1.0), four runs per path:
+
+| path | median extraction | speedup |
+|---|---:|---:|
+| 0..255 float conversion before z-score | 1.026 s | 1.00x |
+| native gray16 z-score | **0.789 s** | **1.30x** |
+
+This is a representative geometry benchmark, not the 5.3K reference footage.
+The saved work is memory traffic, so the ratio will vary with tile size and
+memory pressure. Output is mathematically equivalent but not bit-identical due
+to float32 rounding: over the benchmark, change-energy max absolute delta was
+0.000488, p99 0.000244, and mean absolute delta 0.0000315. `CHANNEL_VERSION`
+therefore moved 4 -> 5 rather than filing the new arithmetic under the old key.
