@@ -1,0 +1,26 @@
+The isolate handoff is aiming to rebuild the process tab from this repo, which serves as the oracle for the rewrite repo.
+
+It is reimplementing everything in tiny steps. The handoff files are what I define mostly, but you can make suggestions for the next handoff.
+
+Some of these handoffs will be hints from the oracle for improving processing speed from hard-won results. Be explicit that they're hints and shouldn't be implemented at the cost of breaking things in the new implementation, and they should be benchmarked before and after to see if they're actually an improvement.
+
+## Practices for every handoff
+
+- Keep each handoff to one user-verifiable increment. State the outcome, what is
+  explicitly out of scope, and where implementation must stop.
+- Treat the rewrite's implemented contracts as the starting point. When older
+  handoffs conflict with a newer decision, state the intended precedence without
+  discarding unrelated correctness requirements.
+- Separate required behavior from suggested implementation and from oracle
+  hints. Do not let an example command, filename, class layout, or optimization
+  become a permanent public contract accidentally.
+- Preserve clean ownership boundaries, but do not build speculative frameworks
+  for future features. Introduce an abstraction when the current increment
+  needs it or when an existing contract already requires it.
+- For oracle-derived performance hints, protect correctness first, the handoff should specify to measure the
+  rewrite before and after on the same representative inputs, change one
+  hypothesis at a time, and retain only demonstrated improvements. Record useful
+  negative results.
+- Include focused automated tests and a short manual acceptance path. Automated
+  success does not substitute for the user's validation of visible interaction.
+- Do not continue into the next numbered feature after completing the handoff.

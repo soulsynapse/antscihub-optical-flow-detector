@@ -1,0 +1,253 @@
+# Isolate tab — tentative handoff plan
+
+Status: non-binding roadmap.
+
+This file lists plausible small increments for rebuilding the oracle Processing
+tab as the rewrite's Isolate tab. It is not an implementation contract for all
+of them.
+
+Each increment still requires its own user-approved handoff. The order and
+boundaries may change after hands-on validation or when the rewrite's current
+implementation reveals a cleaner seam. Completing one increment does not
+authorize beginning the next.
+
+Existing handoffs:
+
+1. `1-Build-the-player.md`
+2. `2-Media-service-handoff.md`
+
+## Candidate next increments
+
+### 3 — Define the working window
+
+Establish the non-Qt request for loading the selected frame window:
+
+- Active asset reference.
+- Half-open frame range.
+- Rational timestamps.
+- Explicit requested and returned media plane.
+- Latest-request cancellation and supersession.
+- Returned shape, coordinates, and validity.
+
+Do not compute a scientific channel yet.
+
+This creates the narrow pixel-delivery seam later channels can use without
+designing a general processing framework.
+
+### 4 — Build the working grid
+
+Add only the spatial working geometry:
+
+- Downsample control.
+- Block-size control.
+- Source-pixel and working-pixel dimensions.
+- Partial right and bottom blocks.
+- Optional block-grid overlay on the player.
+
+Do not add detection.
+
+Downsample and block size remain separate: downsample changes the pixel evidence
+and compute cost, while block size changes spatial aggregation.
+
+### 5 — Add the first channel
+
+Add one real, inexpensive channel end to end, probably block-mean intensity:
+
+- Compute it headlessly over the looping window.
+- Display its time/block data in one channel panel.
+- Synchronize its cursor with the player.
+- Cancel or supersede it when the window or upstream settings change.
+
+Do not create a channel registry or general add/remove framework yet. Let the
+first real channel expose the smallest useful panel and data contract.
+
+### 6 — Add normalization
+
+Add the preprocessing modes actually needed by the first channels:
+
+- `off`.
+- Per-frame z-score.
+- CLAHE only if it remains appropriate for this increment.
+
+Requirements:
+
+- Apply normalization to scientific input pixels, never to a display raster.
+- Record which normalization produced the displayed channel.
+- Recompute the selected window when normalization changes.
+- Compare results against small oracle fixtures.
+
+CLAHE may deserve a separate handoff because of its known signal and boundary
+artifacts.
+
+### 7 — Add change energy
+
+Port the oracle's `change` / `J_tt` path:
+
+- Correct frame pairing.
+- Explicit temporal alignment and validity.
+- Block reduction.
+- Selected-channel-only computation.
+- A channel panel and current-frame overlay.
+
+This is the first channel that visibly responds to behavior and exercises
+multi-frame channel state.
+
+### 8 — Add static value filtering
+
+Add a value band directly to a channel without requiring a frequency transform:
+
+```text
+channel
+  -> value band
+  -> selected blocks
+```
+
+Display:
+
+- The selected value interval.
+- Selected blocks on the current frame.
+- A per-frame selected-block count.
+
+Do not add Morlet processing in this increment.
+
+Making this path real before the spectral path helps prevent the Isolate
+implementation from assuming that every valid signal must have a frequency band.
+
+### 9 — Add the Morlet view
+
+Port the oracle spectral representation:
+
+```text
+channel
+  -> Morlet power
+  -> frequency band
+  -> frequency-band power
+```
+
+Add:
+
+- The windowed scalogram.
+- The draggable frequency band.
+- Cone-of-influence display/validity behavior.
+
+Stop before implementing the complete detector.
+
+### 10 — Add value density and block highlighting
+
+Port:
+
+- Per-block band-power density.
+- A draggable value band.
+- Current-frame in-band block highlighting.
+- Cached display layers where measurement proves them useful.
+
+Require numerical agreement between the preview computation and the oracle
+contract on small fixtures. Performance changes remain benchmarked hypotheses.
+
+### 11 — Add the windowed detector
+
+Add the remaining preview chain:
+
+```text
+selected blocks
+  -> block count
+  -> centered or trailing detection window
+  -> count band
+  -> gate
+  -> largest spatial clump
+```
+
+The shared formulas remain headless and independent of widget visibility.
+
+At the end of this increment, the looping window should reproduce the essential
+oracle signal-isolation workflow, while both static and Morlet representations
+remain possible.
+
+### 12 — Build the result timeline
+
+Extend the bottom timeline to display accumulated result state:
+
+- Unexamined.
+- Examined and quiet.
+- Detected.
+- Current versus stale settings.
+- Click-to-seek and looping-window repositioning.
+
+Initially, the timeline may accumulate only the windows the user has actually
+previewed. It must not present uncovered footage as negative.
+
+### 13 — Process the whole asset
+
+Add whole-asset execution through the same headless channel and detector
+functions used by the preview:
+
+- Continuous execution.
+- Structured progress.
+- Cancellation.
+- Segment-by-segment result delivery.
+- Explicit validity and cone-of-influence handling.
+- Preview/whole-run numerical agreement.
+
+Do not add alternative processing schedules until the continuous path is working
+and validated.
+
+### 14 — Add processing plans
+
+After continuous whole-asset processing works, add:
+
+- From the current position.
+- Binary-split sampling.
+- Uniform sampling.
+- Fill uncovered or stale gaps.
+- Skip coverage produced under the current settings.
+
+Partial runs must preserve finished work and report honestly which footage
+remains unexamined.
+
+### 15 — Save and restore isolation
+
+Add settings and result persistence only after the working state and
+invalidation behavior are known:
+
+- Scientific settings separate from GUI presentation state.
+- Atomic writes.
+- Active asset and implementation identity.
+- Coverage and validity.
+- Retained intermediates where their cost is acceptable.
+- Explicit stale/current compatibility.
+
+This increment does not own validation, presentation rendering, derived assets,
+or detection stacking.
+
+### 16 — Expose the headless recipe
+
+Make the proven isolation settings executable noninteractively:
+
+- Validate settings.
+- Resolve them against one active asset.
+- Run the same computation from CLI/HPC.
+- Emit structured progress and results.
+- Compare GUI-launched and direct headless results.
+
+Do not add consumer-specific validation or rendering options to the isolation
+recipe. Later consumers should operate on stable result artifacts.
+
+## Current recommended near-term path
+
+The most useful sequence after the player and media-service work currently
+appears to be:
+
+```text
+working window
+  -> working grid
+  -> intensity
+  -> normalization
+  -> change energy
+  -> static value filtering
+  -> Morlet representation
+```
+
+This order remains tentative. Its purpose is to keep each increment visible and
+testable, make static filtering real before spectral assumptions harden, and
+delay broad recipe/CLI generalization until at least two genuinely different
+isolation paths exist.
