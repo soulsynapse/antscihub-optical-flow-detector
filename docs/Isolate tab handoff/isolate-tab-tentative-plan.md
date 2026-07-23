@@ -16,39 +16,47 @@ Existing handoffs:
 1. `1-Build-the-player.md`
 2. `2-Media-service-handoff.md`
 3. `3-Working-window.md`
+4. `4-Working-grid.md`
 
 ## Candidate next increments
 
-### 3 — Define the working window (handoff written)
+### 3 — Define the working window (handoff and review written; revision pending)
 
 Establish the non-Qt request for loading the selected frame window:
 
-- Active asset reference.
+- Stable resolved asset/content reference.
 - Half-open frame range.
-- Rational timestamps.
-- Explicit requested and returned media plane.
-- Latest-request cancellation and supersession.
-- Returned shape, coordinates, and validity.
+- Rational timebase resolved from authoritative asset metadata.
+- One explicit native-resolution plane supported by the current media service.
+- Synchronous bounded delivery with decoded/delivered span and source outcome.
+- GUI generations and latest-request publication kept outside the reusable
+  headless request.
 
 Do not compute a scientific channel yet.
 
 This creates the narrow pixel-delivery seam later channels can use without
-designing a general processing framework.
+designing a general processing framework. Apply the corrections in
+`3-Working-window-review.md` before implementation; decoded pixels must not be
+reported as scientifically examined coverage.
 
-### 4 — Build the working grid
+### 4 — Build the working grid (handoff and review written; revision pending)
 
 Add only the spatial working geometry:
 
-- Downsample control.
-- Block-size control.
+- Explicit downsample control, defaulting to native `1.0`.
+- Working-pixel block-size control with visible automatic source-footprint
+  tracking.
 - Source-pixel and working-pixel dimensions.
-- Partial right and bottom blocks.
-- Optional block-grid overlay on the player.
+- Compact ceil-sized geometry with fractionally weighted partial right and
+  bottom blocks.
+- Optional block-grid overlay on the player that does not decode the working
+  window.
 
-Do not add detection.
+Do not add pixel preprocessing, a channel, or detection.
 
 Downsample and block size remain separate: downsample changes the pixel evidence
-and compute cost, while block size changes spatial aggregation.
+and compute cost, while block size changes spatial aggregation. The rewrite
+must report divergences from the handoff's assumptions before implementation.
 
 ### 5 — Add the first channel
 

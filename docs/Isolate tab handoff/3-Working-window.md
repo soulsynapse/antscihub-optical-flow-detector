@@ -1,668 +1,611 @@
 # 3 — Define the Isolate working window
 
-Status: implementation handoff for the third Isolate-tab milestone.
+Reviewed and updated against the current checkout on
+`2026-07-23 14:41:35 -07:00` at commit `7707968`.
 
-This milestone establishes the headless boundary through which later Isolate
-computations obtain pixels for the selected time window. It does not add a
-scientific channel or change what the player displays.
+Status: corrected implementation handoff for the third Isolate-tab milestone.
 
-The result is a small, testable request/result contract:
+This milestone establishes the small headless boundary through which a later
+Isolate channel can obtain native pixels for a selected time window. It does
+not add a scientific channel, computation worker, or user-facing processing
+action.
+
+The required result is:
 
 ```text
-active asset + selected half-open frame range + requested media plane(s)
-    -> resolved working-window source
-    -> bounded batches of correctly identified pixels
+registered asset reference
++ absolute half-open frame span
++ native rgb24 plane
++ bounded execution options
+    -> resolved source facts
+    -> synchronous bounded frame batches
+    -> explicit final source outcome
 ```
 
 “Working window” means the selected temporal input to future computation. It
-does **not** mean that the entire interval must be decoded and retained as one
-array.
+does not mean that all selected frames are decoded or retained as one array.
 
-## 1. Precedence and starting point
+## 1. Precedence and current starting point
 
-This is a later, user-authorized increment in the Isolate rebuild. For the work
-explicitly in scope, it follows:
+This handoff follows:
 
 - `1-Build-the-player.md` and its review.
-- The rewrite's implemented active-asset and media-service contracts.
-- `2-Media-service-handoff.md` and its review where media performance work has
-  already been accepted.
-- The current rewrite v2 and scientific-computation contracts for asset
-  identity, media-plane semantics, time, coordinates, and validity.
+- The implemented active-asset and Isolate player contracts.
+- `2-Media-service-handoff.md`, its review, and the accepted media performance
+  work.
+- The current source and tests in this checkout.
 
-Do not replace a working v2 contract merely to match an illustrative type or
-method name in this handoff. Names and pseudocode below describe required
-information and behavior, not a frozen public API.
+Oracle contracts and pseudocode are evidence, not current APIs. Do not create a
+future executor contract merely because the oracle assumed one already existed.
 
-Older oracle code is evidence about behavior and possible optimizations. It is
-not authoritative over the rewrite's newer correctness boundaries.
+### Present in this checkout
 
-## 2. Outcome
+- Asset sidecars contain `asset_id`, `media.content_sha256`, media location,
+  dimensions, rational fps, duration, and lineage.
+- `ActiveAsset` is an immutable GUI-facing snapshot, but it does not contain
+  the active media's `content_sha256`.
+- `ActiveAsset` and `ActiveAssetController` currently share a module that
+  imports PyQt. A headless working-window module must not import that module.
+- `MediaSession.read_frame_rgb(frame, max_width=None)` returns immutable
+  `rgb24` bytes.
+- Adjacent reads through one `MediaSession` reuse one mutable FFmpeg decoder
+  cursor.
+- Calling `read_frame_rgb` without `max_width` requests native dimensions.
+- The Isolate player explicitly requests a width-limited display
+  representation. That representation is not scientific evidence.
+- `IsolateSession._generation` is a private GUI lifecycle token used to reject
+  late display results.
+- Ordinary `MediaSession` construction does not fully decode the asset merely
+  to verify its final frame.
 
-At the end of this increment, headless code can request the current active
-asset's full-frame pixels over any valid, nonempty, asset-bounded half-open frame
-range.
+### Not present
 
-The request explicitly identifies:
+- A headless working-window request or frame-span type.
+- A general media-plane API or descriptor registry.
+- Encoded-luma, alpha, native-codec-plane, or multi-plane delivery.
+- A scientific worker, queue, cancellation system, or latest-only publisher.
+- General validity, coverage, recipe, executor, or result-artifact types.
 
-- The active asset using the rewrite's existing stable asset identity.
-- The requested absolute frame range `[start, stop)`.
-- The asset's exact rational timebase.
-- One or more named media planes.
-- A unique request or generation identity.
+The implementation should add only the narrow types and behavior required
+below.
 
-The resolved source returns bounded frame batches carrying:
+## 2. Scope
 
-- Absolute frame indices.
-- Exact time coordinates derived from the rational timebase.
-- The requested plane buffers and their semantic descriptors.
-- Array shapes, dtypes, and value domains.
-- Coordinates in the active asset's own pixel space.
-- Explicit valid and examined coverage.
-- Truncation, cancellation, and failure information.
+Implement:
 
-The working-window source is independent of Qt and can be exercised without
-constructing the Isolate tab. The Isolate controller can resolve its current
-selection into this request, but no channel consumes the pixels yet.
-
-## 3. Scope boundary
-
-Implement only:
-
-- A headless working-window request and resolved-result boundary.
-- Resolution against the existing active-asset and media metadata contracts.
-- Bounded sequential delivery of the requested frames and media planes.
-- Exact temporal, spatial, plane, and validity metadata on returned data.
-- Cancellation and generation/supersession behavior.
-- Minimal Isolate-controller hookup needed to form a request from the current
-  asset and selected window.
-- Focused tests and a small headless diagnostic or test fixture.
+- A Qt-independent request containing a registered asset reference, an
+  absolute half-open frame span, and one explicit plane id.
+- Resolution through the existing asset and media services.
+- A descriptor for the one supported plane, native `rgb24`.
+- A synchronous, bounded, closeable stream of immutable frame batches.
+- Exact rational timebase and active-asset coordinates in resolved metadata.
+- Explicit extent provenance and delivered frame span.
+- Cancellation checks between bounded decode operations.
+- A final source outcome that remains inspectable after iteration.
+- A pure GUI adapter that snapshots the current asset and Isolate-local window
+  into the headless request without starting a decode.
+- Focused headless tests, small GUI adapter regressions, and a development
+  diagnostic or test helper.
 
 Do not implement:
 
-- Downsampling.
-- A working block grid.
-- Block-size controls.
-- Normalization or color-space preprocessing.
-- Intensity, change, tensor, optical-flow, or other scientific channels.
-- Static value filtering.
-- Morlet transforms, scalograms, frequency bands, or cone-of-influence rules.
-- Detection, thresholds, gates, counts, clumps, marks, or events.
-- A channel registry, graph planner, plugin system, or general executor.
-- Whole-asset processing.
-- Result persistence, coverage accumulation between requests, or caches of
-  scientific artifacts.
-- Recipe/settings serialization.
-- CLI or HPC commands.
-- Validation, presentation rendering, export, or detection stacking.
-- A new asset identity system or a competing media service.
-
-Do not add speculative parameters for those later features to the
-working-window request.
+- A GUI computation worker, producer thread, cross-thread queue, or mailbox.
+- GUI job generation, request publication, or latest-result orchestration.
+- Continuous working-window decoding on window changes.
+- Downsampling, a working block grid, or block-size controls.
+- Normalization, color-space preprocessing, or scientific channels.
+- Filtering, transforms, detections, gates, events, or marks.
+- A plane registry, multi-plane batches, or speculative plane aliases.
+- Persistent pixel caches or scientific result artifacts.
+- Recipes, job directories, export, CLI/HPC processing, or a graph executor.
+- A new canonical asset identity system.
 
 Stop after this contract is integrated and validated. Do not begin the working
-grid or first channel.
+grid or first scientific channel.
 
-## 4. Ownership boundary
+## 3. Ownership and dependency boundaries
 
-The working-window component owns:
+The headless working-window source owns:
 
-- Validating and resolving a requested temporal window.
-- Asking the existing media service for declared pixel planes.
-- Delivering bounded, correctly described pixel batches.
-- Reporting what was actually delivered and valid.
-- Releasing its own in-flight work and temporary buffers.
+- Resolving a registered asset reference.
+- Validating the requested frame span against the declared extent.
+- Opening and closing its own request-local `MediaSession`.
+- Delivering ordered native `rgb24` frames in bounded batches.
+- Reporting resolved facts, delivered span, cancellation, and failure.
 
 It does not own:
 
-- Active-asset selection.
-- The player's playhead, loop timer, or display raster.
-- Media probing or low-level decoder implementation.
-- Scientific preprocessing or channel computation.
-- Long-lived result artifacts.
-- GUI presentation.
+- Active-asset selection or GUI lifecycle generations.
+- The player's playhead, display decoder, timer, or preview raster.
+- Scientific computation or claims that footage was examined.
+- Long-lived caches, results, or presentation.
 
-The intended dependency direction is:
+The dependency direction is:
 
 ```text
-Isolate player/window state
-          |
-          v
-Isolate controller -----> working-window request
-                                  |
-                                  v
-                         existing media service
-                                  |
-                                  v
-                    typed, bounded pixel batches
+IsolateSession and current ActiveAsset
+               |
+               | pure snapshot; no decode
+               v
+headless WorkingWindowRequest
+               |
+               v
+headless asset resolution
+               |
+               v
+request-local MediaSession
+               |
+               v
+bounded immutable rgb24 batches
 ```
 
-Later grids and channels may depend on the working-window boundary. The
-working-window component must never import or call those consumers.
+The headless request, resolved metadata, batches, stream, and outcome must live
+in modules that can be imported without importing PyQt. The GUI adapter may
+depend on both the GUI snapshot and the headless request type.
 
-## 5. Request contract
+## 4. Request contract
 
-A request contains the following semantics. Reuse existing v2 value objects
-where they already express them correctly.
+The request contains:
 
 ```text
 asset_ref
-asset_generation
+expected_asset_id
+expected_content_sha256
 start_frame
 stop_frame
-requested_planes
-request_id
+plane_id = rgb24
 ```
 
-Execution-only limits such as a batch-size or memory budget may be supplied
-through an existing execution context. They are not scientific settings and
-must not change the values delivered.
+`asset_ref` identifies an existing registered asset, normally through its asset
+sidecar path. A raw unregistered video is not silently initialized by the
+working-window source or diagnostic.
 
-### 5.1 Asset identity
+`expected_asset_id` and `expected_content_sha256` reuse the identity already
+stored in the sidecar. They protect an immutable request from silently resolving
+to a different sidecar identity later. They are not a second asset identity
+scheme.
 
-`asset_ref` is the same stable identity used by the active-asset layer. A path
-alone is insufficient if the rewrite already distinguishes asset identity from
-location or records content/provenance identity.
+The GUI adapter may obtain the active content hash through the existing asset
+inspection path, or the implementation may add that existing sidecar field to
+the immutable GUI snapshot. Do not import the PyQt-bearing
+`application.active_asset` module into the headless source.
 
-The request targets the active asset itself:
+Do not put these values in the headless request:
 
-- A source asset is decoded in its own coordinates.
-- A derived child is decoded from the child's own media in the child's
-  coordinates.
-- The working-window service does not reopen a parent and recreate a child crop
-  at request time.
+- `IsolateSession._generation`.
+- A GUI publication or request id.
+- Width, height, fps, duration, or frame-count claims supplied by the caller.
+- Widget size, zoom, device-pixel ratio, or the display preview width.
+- Future scientific settings.
 
-`asset_generation` represents the active-asset/session generation already used
-by the application, or an equivalent monotonic invalidation token. It prevents
-late data from a previous active asset from being published into the new one.
+Batch size and a cancellation predicate are execution options supplied when the
+stream is opened. They do not change the scientific request or delivered pixel
+values.
 
-Do not invent a second canonical definition of asset identity solely for
-Isolate.
+## 5. Frame-span contract
 
-### 5.2 Frame range
-
-The range is an absolute, integer, half-open interval:
+The requested interval is absolute, integer, and half-open:
 
 ```text
 [start_frame, stop_frame)
 ```
 
-with:
+For `[17, 20)`, the requested frames are exactly `17`, `18`, and `19`.
+
+Validate before substantial decoding:
 
 ```text
-0 <= start_frame < stop_frame <= verified_available_stop
+0 <= start_frame < stop_frame <= declared_stop
 ```
 
-The underlying model accepts any nonempty asset-bounded interval. The player's
-initial UI range is not a durable limit on this contract.
+The headless model accepts any nonempty span admitted by the asset's declared
+extent. It does not inherit the player's initial window length, UI minimum, or
+UI maximum.
 
-For a request `[17, 20)`, the only requested frames are `17`, `18`, and `19`.
-No conversion through rounded display seconds is allowed.
+Do not silently clamp malformed headless requests. The GUI already settles user
+gestures before taking a request snapshot.
 
-If verified availability is still being established by the existing media
-layer, use that layer's current explicit resolution behavior. Do not block
-first use merely to reproduce an oracle frame-count assumption, and do not
-pretend an unverified container count is exact.
+## 6. Identity and media resolution
 
-### 5.3 Rational time
+Resolution must:
 
-The authoritative rate is the existing exact pair:
+1. Require an existing valid asset sidecar.
+2. Resolve its media path through `AssetService`.
+3. Confirm that the sidecar's `asset_id` and recorded `content_sha256` match the
+   request's expected identity.
+4. Compare cheap current facts—file size, width, height, and rational fps—with
+   the sidecar and fail on a mismatch.
+5. Open a new request-local `MediaSession`.
+6. Obtain current duration, media metadata, and declared extent from that
+   session.
+7. Resolve the single supported plane descriptor.
+
+The sidecar content hash is a recorded content identity. Reading it is not
+equivalent to rehashing and verifying the current media bytes. Resolved metadata
+must describe the identity status honestly:
+
+```text
+recorded
+```
+
+Ordinary small-window resolution must not hash or fully decode a large video
+merely to label it verified. This milestone reports the sidecar identity as
+recorded. Explicit content verification remains a separate `AssetService`
+operation and is not smuggled into ordinary window-open latency.
+
+Resolution fails clearly for:
+
+- A missing or invalid sidecar.
+- Unreachable media.
+- Mismatched expected asset or content identity.
+- Invalid requested bounds.
+- An unsupported plane id.
+- Media metadata insufficient to describe native `rgb24`.
+
+## 7. Extent provenance
+
+`MediaSession.frame_count` may currently come from:
+
+1. Decoded-frame count.
+2. Packet count.
+3. Container frame count.
+4. Duration multiplied by rational fps.
+
+Carry both the admitted `declared_stop` and its provenance in resolved metadata.
+Use explicit provenance such as:
+
+```text
+decoded_count
+packet_count
+container_count
+duration_estimate
+```
+
+Do not collapse all four into “verified.” In particular, packet and container
+counts do not establish that every indexed frame can be decoded successfully.
+
+The working-window source validates requests against the declared extent and
+reports what it actually delivered. It does not run a full-video count merely
+to admit a small request.
+
+## 8. Exact time and coordinates
+
+Resolution obtains the authoritative rational pair:
 
 ```text
 fps_num / fps_den
 ```
 
-Frame `t` has the exact presentation time:
+The exact presentation time for absolute frame `t` is:
 
 ```text
 t * fps_den / fps_num seconds
 ```
 
-The request or its resolved form must retain the rational pair. Returned batches
-carry absolute frame indices, from which exact times can be derived without
-accumulating floating-point drift.
+Batches carry absolute frame indices plus the resolved rational pair or an
+unambiguous reference to it. A floating-point timestamp array is not required
+and must not become the authoritative identity for frame selection.
 
-Floating-point seconds may be supplied for display or diagnostics, but they are
-not authoritative identifiers and must not be fed back into scientific frame
-selection.
-
-### 5.4 Requested media planes
-
-Planes are requested by explicit semantic identity. Examples may include:
-
-- Encoded luma.
-- RGB with a declared color interpretation.
-- A declared native codec plane.
-- Alpha, when present and explicitly requested.
-
-The actual supported plane identifiers come from the rewrite's media contract.
-Do not create an Isolate-only alias with ambiguous meaning such as `gray`,
-`image`, or `display_frame`.
-
-The media service must not silently substitute:
-
-- RGB for requested encoded luma.
-- A display-sized preview for native-size evidence.
-- A parent asset's pixels for a child asset.
-- A derived color space for a decoder plane.
-
-HSV, Lab, normalized intensity, linear-light luminance, and similar derived
-representations remain explicit later preprocessing nodes. They are not hidden
-inside the working-window source.
-
-The first diagnostic may request only one inexpensive plane supported by the
-current backend. Supporting every conceivable plane is not required in this
-increment.
-
-## 6. Resolved request
-
-Validate the request before starting substantial decoding. The resolved form
-records at least:
+Native full-frame coordinates are:
 
 ```text
-stable asset identity and generation
-verified or currently authoritative available frame interval
-resolved requested frame interval
-exact rational timebase
-resolved plane descriptors
-active-asset width and height
-spatial coordinate reference
-request identity
-execution limits used for delivery
+x in [0, width)
+y in [0, height)
 ```
 
-Resolution must fail clearly when:
+Metadata uses `(x, y)`. Array semantics use `[frame, y, x, channel]`.
 
-- The asset cannot be resolved or opened.
-- The range is empty, inverted, negative, or outside verified availability.
-- A requested plane is unsupported or ambiguous.
-- Media metadata needed to interpret the plane is ambiguous under the current
-  media policy.
-- The request refers to a stale asset generation.
+A derived child is a complete processing world. Resolve and decode the child's
+own media at the child's own dimensions. Never reopen the parent and recreate a
+crop at request time.
 
-Do not silently clamp a malformed headless request. The GUI controller may
-clamp user gestures before constructing the request, as already required by the
-player handoff.
+## 9. Supported plane
 
-## 7. Batch/result contract
-
-The delivery shape may follow the rewrite's existing media-service conventions.
-A representative batch has these semantics:
+This milestone supports one explicit plane:
 
 ```text
-request_id
-asset identity and generation
+plane_id: rgb24
+resolution: native active-asset width and height
+per-frame shape: [height, width, 3]
+batch axes: [frame, y, x, channel]
+dtype: uint8
+value domain: [0, 255]
+channel order: R, G, B
+buffer: immutable bytes
+coordinates: active-asset pixel coordinates
+backend: FFmpeg through MediaSession
+```
+
+Record relevant probed source color metadata, including unknown values, and the
+fact that FFmpeg produced `rgb24`. Missing optional source color tags are not
+silently relabeled as known, but they also do not automatically require a
+general color-policy subsystem in this milestone.
+
+The source must call `read_frame_rgb` without the player's `max_width=1280`
+display cap.
+
+Do not add encoded luma, alpha, native codec planes, plane maps, or a registry.
+Later channels may justify those extensions without changing frame, time,
+coordinate, or bounded-delivery semantics.
+
+## 10. Batch and stream contract
+
+A batch carries at least:
+
+```text
 absolute_frame_indices
-exact rational timebase
-plane_id -> pixel buffer
-plane descriptors
-array shape and dtype
-active-asset spatial coordinates
-validity
+immutable rgb24 frame buffers
+frame_count
+per-frame shape
+plane descriptor or resolved-plane reference
 ```
 
 Requirements:
 
-- Frame indices are absolute within the active asset, not offsets within the
-  selected window or batch.
-- Batches are ordered by increasing frame index for ordinary sequential
-  delivery.
-- Every delivered frame lies inside `[start_frame, stop_frame)`.
-- Plane arrays agree with the declared frame and spatial axes.
-- Plane buffers are contiguous when the downstream media contract requires it.
-- Buffer ownership and lifetime are explicit. A consumer must not observe a
-  buffer being mutated when the decoder advances.
-- Native-size full-frame planes use the active asset extent:
-  `[0, width) x [0, height)`.
-- Metadata uses `(x, y)` while arrays use `[y, x]`.
-- A display letterbox, widget size, device-pixel ratio, or zoom state never
-  changes scientific pixel coordinates.
+- Indices increase in ordinary sequential order.
+- Every index lies inside `[start_frame, stop_frame)`.
+- No batch crosses `stop_frame`.
+- A final short batch is valid.
+- Changing batch size changes grouping only, not indices or pixel values.
+- The implementation need not concatenate frames into one large byte array.
+- Previously yielded immutable buffers are never mutated by later reads.
+- The stream does not retain all previously yielded batches.
 
-If batches contain multiple requested planes, their frame axis and asset
-identity must agree. A plane that cannot be produced is an explicit failure; it
-is not omitted silently.
+Use a synchronous stream. It has natural backpressure because no next batch is
+decoded until the consumer requests it.
 
-## 8. Validity, coverage, truncation, and failure
+The stream must be explicitly closeable and usable as a context manager. It
+owns the request-local `MediaSession` and closes it in `finally` on:
 
-Returned data distinguishes at least:
-
-- Requested coverage.
-- Successfully decoded/examined coverage.
-- Valid coverage.
+- Normal exhaustion.
 - Cancellation.
-- Truncation or decode failure.
+- Decode failure.
+- Explicit close.
+- Early consumer abandonment when used through the required context-manager
+  path.
 
-Unknown or missing frames are not converted into black pixels, zeros, quiet
-signal, or negative detections.
+Cancellation is checked between bounded frame reads or batches. This milestone
+does not promise that a token can interrupt one already-blocking FFmpeg read;
+that would require worker/thread lifecycle which remains deferred.
 
-For an ordinarily decoded full-frame plane, validity may be represented
-compactly as valid frame intervals plus a declaration that the complete plane
-extent is valid. If the backend can report partial or spatial invalidity, retain
-it explicitly rather than overwriting the pixels. Do not introduce a large
-per-pixel mask when the current media contract and evidence do not require one.
+## 11. Outcome and source truth
 
-Decoder exhaustion before the resolved requested stop is truncation:
+The stream exposes a final outcome after termination without requiring callers
+to recover a generator's `StopIteration.value`.
 
-- Preserve batches already delivered.
-- Report the final successfully decoded frame or covered stop.
-- Mark all remaining requested frames unexamined.
-- Do not report the request as complete.
-
-A decode error carries the media layer's stable error code and enough structured
-context to identify the asset, request, range, plane, and failing frame. The
-working-window layer should add context without replacing a more specific
-underlying cause.
-
-## 9. Bounded memory and streaming
-
-Do not require:
+The outcome distinguishes:
 
 ```text
-frames x full_height x full_width x all_planes
+complete
+cancelled
+truncated
+failed
 ```
 
-to fit in RAM.
+It records:
 
-The source delivers bounded batches or an equivalent bounded iterator/stream.
-At any time, memory use must be limited by the accepted execution policy plus
-documented decoder and consumer buffers.
+- Requested span.
+- Delivered contiguous prefix or delivered span.
+- Final outcome kind.
+- Structured underlying `SieveError`, when present.
+- The frame at which delivery stopped, when applicable.
 
-Required properties:
+Request-resolution errors raise before a stream is returned. A runtime decode
+failure sets the stream's failed outcome, closes its media session, and
+re-raises the structured `SieveError`. Cancellation and explicit clean-EOF
+truncation end iteration normally; the caller distinguishes them from success
+by inspecting the required outcome.
 
-- Batch size is an execution choice, not a change in scientific meaning.
-- Changing batch size returns the same frame identities and pixel values.
-- Backpressure or a bounded queue prevents an unbounded producer backlog.
-- Cancellation can be observed between bounded units of work.
-- Released batches do not remain retained by an accidental session-wide list.
+Decoded delivery is not scientific examination. Do not use these terms for
+source output:
 
-It is acceptable for a tiny test or explicitly bounded caller to assemble
-batches into one array. That convenience must not define the core contract or
-be used automatically for an arbitrary player-selected interval.
+```text
+examined
+processed
+quiet
+detected
+```
 
-Do not add a persistent pixel cache in this milestone. If the existing media
-service already has a safe in-memory cache, reuse it through its public
-contract; do not duplicate it in the working-window layer.
+For the current `rgb24` backend, a successful exact-sized frame establishes a
+valid full-frame buffer. A failed frame is not replaced by zeros, black pixels,
+or a validity mask. Do not build general spatial-validity machinery until a
+backend can actually report partial spatial validity.
 
-## 10. Cancellation and latest-request behavior
+### EOF versus decode failure
 
-The Isolate controller treats the current request as generation-scoped and
-latest-only.
+The current `MediaSession` reports a short raw-frame read as
+`FRAME_DECODE_FAILED`; it does not expose whether FFmpeg reached clean EOF or
+failed decoding.
 
-A request becomes obsolete when any of these changes:
+Therefore:
 
-- Active asset.
-- Selected frame range.
-- Requested media planes.
-- The controller or application closes.
+- Report `truncated` only when the media layer supplies an explicit clean-EOF
+  or equivalent structured reason before the requested stop.
+- Otherwise preserve the delivered prefix and report `failed` with the
+  underlying error.
+- Do not infer truncation from error-message text or an empty stderr string.
+- A minimal structured EOF reason may be added to `MediaSession` if it can be
+  implemented and tested without broad decoder redesign.
 
-When a request is superseded:
+Cancellation is neither success nor truncation.
 
-1. Signal cancellation through the existing cancellation mechanism.
-2. Stop producing new batches as promptly as the bounded media operation
-   permits.
-3. Release queued buffers and request-local resources.
-4. Ignore any late batch whose request id or asset generation is no longer
-   current.
-5. Never let an obsolete completion or error overwrite the state of the newer
-   request.
+## 12. Player relationship and minimal GUI hookup
 
-Cancellation is not truncation and is not success. Report it distinctly.
-
-Rapid window dragging must not build an unbounded queue of complete-window
-decodes. The controller may defer starting expensive work until a consumer
-exists. In this milestone there is no scientific consumer, so do not eagerly
-decode every window change merely to prove that the hookup exists.
-
-## 11. Relationship to player decoding
-
-Player display requests and working-window scientific requests have different
-semantics:
+Player display requests and working-window requests have different semantics:
 
 ```text
 player
-  latest requested display frame, optimized for interactive latency
+  latest requested display frame
+  width-limited representation
+  mutable display-session decoder
 
 working window
-  ordered bounded delivery over an explicit frame interval
+  ordered bounded delivery
+  native rgb24 representation
+  request-local media session
 ```
 
-They may reuse the same media service and safe shared caches. They must not
-corrupt each other's position, generation, or request ordering.
+Do not pass the live player's `MediaSession` into the source. A working-window
+read would reposition its mutable decoder cursor, and cancellation could
+terminate the player's in-flight decode.
 
-Do not require a second physical decoder if the rewrite already supports the two
-request patterns correctly through one service. Conversely, do not force a
-single mutable decoder cursor to serve both patterns if that causes seeking,
-stale-frame, or lifecycle bugs. Decoder ownership remains an implementation
-choice to inspect and benchmark.
-
-Within one media-session generation and one resolved representation, passive
-consumers must not accidentally cause duplicate decodes of the same request.
-This is not permission to build a general cross-job frame cache.
-
-The media-service performance hints remain hypotheses:
-
-- Protect correctness and lifecycle first.
-- Benchmark before and after a proposed optimization.
-- Retain only measured improvements.
-- Do not copy an oracle technique that breaks the rewrite's current contract.
-
-## 12. Minimal Isolate hookup
-
-Add only enough controller behavior to prove that the current GUI selection can
-form the same headless request:
-
-- Read the shared active asset identity and generation.
-- Read the Isolate-local `[window_start, window_stop)`.
-- Obtain the exact rational timebase from authoritative asset metadata.
-- Accept an explicit plane request from a headless caller or diagnostic.
-- Resolve or cancel work outside the widgets.
-
-The player and timeline widgets must not decode or accumulate a working window.
-They continue to own presentation and interaction only.
-
-Because there is no channel yet:
-
-- Do not add fake plots or channel cards.
-- Do not continuously decode the complete selection after every GUI gesture.
-- Do not add a new permanent `Prepare`, `Process`, or `Run` button solely for
-  this plumbing milestone.
-- Do not show a success state implying that scientific isolation has run.
-
-A development diagnostic may report the resolved range, planes, batches,
-coverage, and cancellation state. Keep it headless and structured so tests can
-assert it; it is not the future user-facing CLI recipe.
-
-## 13. Suggested implementation shape
-
-Fit this work into the rewrite's existing packages. The following split is
-illustrative:
+The only GUI hookup in this milestone is a pure snapshot operation:
 
 ```text
-domain or processing boundary
-  WorkingWindowRequest
-  ResolvedWorkingWindow
-  FrameBatch
-  WorkingWindowOutcome
-
-headless service
-  resolve(request)
-  iter_batches(resolved, cancellation)
-
-Isolate controller
-  form request from active asset + local window
-  own current request id
-  cancel/supersede obsolete work
-  reject stale results
+current registered asset identity
++ current Isolate [window_start, window_stop)
+    -> immutable WorkingWindowRequest
 ```
 
-Prefer existing types for:
+Changing GUI state later must not mutate a previously created request. Taking a
+snapshot must not open the working-window stream or decode frames.
 
-- Asset references and generations.
-- Rational rates and frame spans.
-- Media-plane ids and descriptors.
-- Cancellation.
-- Structured errors.
-- Coverage intervals.
+Do not add a permanent Prepare, Process, or Run button. Do not add plots,
+channel cards, success indicators, or fake processing states.
 
-Do not create a broad pipeline base class in order to implement this split. A
-small typed function/service is sufficient until real channels demonstrate what
-additional lifecycle is necessary.
+GUI job generations, request ids, cancellation ownership, stale-result
+rejection, and cross-thread queues belong to the first milestone with a real
+GUI scientific consumer.
 
-## 14. Automated tests
+## 13. Development diagnostic
 
-Use deterministic, tiny media fixtures with known per-frame content. At least
-one fixture should encode its frame number into the pixels so off-by-one and
-seek errors are observable.
+Provide either a focused test helper or a development-only diagnostic accepting:
 
-### 14.1 Request resolution
+```text
+registered asset reference
+start
+stop
+plane = rgb24
+batch size
+optional deterministic cancellation point
+```
 
-Test:
+It reports structured:
 
-- `[2, 5)` resolves to frames `2`, `3`, and `4`, never `5`.
-- Empty, inverted, negative, and out-of-range requests fail before decoding.
-- A valid one-frame headless interval is accepted by this boundary.
-- The player's initial maximum window length is not enforced by the headless
-  model.
-- A direct child asset resolves to the child's media and coordinate extent.
-- A stale asset generation is rejected.
-- An unsupported or ambiguous plane request fails explicitly.
+- Resolved asset id and recorded content identity.
+- Identity-verification status.
+- Media path.
+- Requested span.
+- Declared extent and provenance.
+- Width, height, and exact rational fps.
+- `rgb24` descriptor.
+- Per-batch absolute indices and shapes.
+- Delivered span.
+- Final outcome and structured error, if any.
 
-### 14.2 Time and coordinates
+This is an implementation-validation surface, not the future processing CLI.
+Do not add recipe parsing, export, job directories, or HPC behavior.
 
-Test:
+Because no cross-process bridge to live Qt state exists, the diagnostic does
+not claim to consume another running GUI process's current private window.
 
-- A fixture at `60000/1001` retains that exact rational pair.
-- Frame `t` maps to `t * 1001 / 60000` seconds without accumulated drift.
-- Returned indices remain absolute when the requested range starts after zero.
-- Full-frame arrays have the declared `[frame, y, x, ...]` axes.
-- Spatial extent is the active asset's `[0, width) x [0, height)`.
-- Widget resizing, letterboxing, and zoom state cannot alter returned pixels or
-  scientific coordinates.
+## 14. Tests
 
-### 14.3 Plane semantics
+Use deterministic tiny lossless fixtures. Reuse the numbered FFV1 fixture
+direction for exact same-backend pixel comparisons and off-by-one detection.
 
-For each plane supported in this milestone, test:
-
-- The returned plane id and descriptor match the request.
-- Shape, dtype, bit depth or numeric range, and color/range interpretation are
-  explicit.
-- Known fixture pixels agree with the declared interpretation.
-- Requesting one plane does not silently materialize or return a different one.
-- A native-size request cannot be satisfied by a cached display-sized raster.
-
-### 14.4 Batching and memory
+### Headless request and resolution
 
 Test:
 
-- Different batch sizes return identical ordered frame identities and pixels.
-- The final short batch is handled correctly.
-- No batch crosses the requested stop.
-- The queue and number of live batches remain bounded with a deliberately slow
-  consumer.
-- Released buffers are not mutated by later decoder reads.
-- The implementation does not retain all decoded frames after iteration.
+- `[2, 5)` delivers only `2`, `3`, and `4`.
+- Negative, empty, inverted, and out-of-declared-extent spans fail before
+  frame decoding.
+- A valid one-frame headless interval is accepted.
+- GUI window-length limits do not constrain the headless model.
+- A missing or unregistered sidecar fails without creating one.
+- Expected asset-id or content-hash mismatch fails.
+- Caller-supplied media facts do not exist in the request.
+- `rgb24` is accepted and another plane id fails explicitly.
 
-Use a direct invariant or instrumentation for boundedness rather than relying
-only on a process-wide memory measurement.
-
-### 14.5 Validity and truncation
-
-Test:
-
-- A successful request reports complete examined and valid coverage.
-- Early decoder exhaustion reports partial coverage and truncation.
-- Remaining frames are unexamined, not invalid zeros.
-- A media failure preserves the underlying stable error code and adds request
-  context.
-- A partial result is never labelled complete.
-
-### 14.6 Cancellation and supersession
+### Extent, time, and coordinates
 
 Test:
 
-- Cancelling during iteration stops further delivery within a bounded amount of
-  work.
-- Cancellation is distinct from success, failure, and truncation.
-- A new range supersedes an older range.
-- Switching assets invalidates pending results from the old generation.
-- A late old batch, completion, or error cannot become current.
-- Rapidly replacing requests does not grow an unbounded queue.
-- Closing the controller releases requests, buffers, workers, and media
-  resources it owns.
+- Each available count source retains its provenance.
+- Duration-derived extent is labeled an estimate.
+- Exact `60000/1001` or another non-integer fixture rate remains rational.
+- Returned frame indices remain absolute when the request starts after zero.
+- Native shapes and coordinates match the active asset.
+- A child resolves its own media and dimensions.
 
-### 14.7 Player regression
+### Batching, lifecycle, and outcomes
 
 Test:
 
-- Existing player frame accuracy and loop boundaries remain unchanged.
-- Forming or cancelling a working-window request does not move the player
-  playhead.
-- Player and window-source requests cannot corrupt one another's decoder
-  position or generation.
-- With no scientific consumer, ordinary window dragging does not trigger a full
-  selected-window decode.
+- Different batch sizes return identical ordered indices and bytes.
+- The final short batch is correct.
+- Yielded buffers remain immutable after subsequent reads.
+- The stream retains only bounded request-local data.
+- Normal exhaustion, cancellation, explicit close, failure, and early consumer
+  exit close the request-local `MediaSession`.
+- Cancellation is observed between bounded reads and yields a cancelled
+  outcome.
+- Explicit clean EOF yields truncation and a delivered prefix.
+- Ambiguous current-media short read yields failure rather than guessed
+  truncation.
+- The final outcome remains accessible after iteration.
 
-## 15. Headless diagnostic
+### GUI adapter and player regression
 
-Provide a focused test helper or development diagnostic that can:
+Run Qt tests with:
 
-1. Resolve one asset and `[start, stop)` range.
-2. Request one declared media plane.
-3. Consume every returned batch.
-4. Emit structured facts:
-   - Asset identity and generation.
-   - Requested and resolved frame range.
-   - Rational timebase.
-   - Plane descriptor.
-   - Per-batch frame bounds and shapes.
-   - Examined and valid coverage.
-   - Final outcome.
-5. Optionally hash fixture frames or plane buffers for repeatability.
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"
+```
 
-This diagnostic is an implementation-validation surface, not a supported
-analysis CLI. Do not add recipe parsing, job directories, export choices, or
-HPC behavior here.
+Test:
 
-## 16. Manual acceptance
+- Current active asset and Isolate-local window produce the expected immutable
+  headless request.
+- Later asset/window changes do not mutate the earlier request.
+- Taking or changing a window snapshot never starts a working-window decode.
+- Existing player seek, loop, scrub, preview sizing, generation rejection, and
+  cleanup tests continue to pass.
 
-After automated tests pass, stop and return this milestone for validation.
+Do not create a GUI computation worker solely to test stale scientific results.
 
-The manual check is intentionally small because this increment is primarily
-headless:
+## 15. Manual acceptance
 
-1. Open an ordinary source asset in Replicates and switch to Isolate.
-2. Confirm the existing player still seeks, loops, and scrubs normally.
-3. Change the selected window several times, including rapid dragging.
-4. Confirm the UI remains responsive and does not begin decoding every frame in
-   each transient selection.
-5. Run the focused diagnostic on the settled window and inspect its structured
-   range, timebase, plane, shape, and coverage.
-6. Open a derived child asset and repeat the diagnostic.
-7. Confirm the child reports its own media dimensions and coordinates.
-8. Start a deliberately slow diagnostic, change the active asset or range, and
-   confirm the obsolete request cancels or is ignored without stale output
-   becoming current.
+After automated tests pass, stop and return this milestone for user validation.
 
-Do not judge scientific channel values in this milestone; none exist yet.
+The executable manual path is:
 
-## 17. Definition of done
+1. Run the development diagnostic on a registered source asset and inspect its
+   identity, extent provenance, timebase, native shape, batches, delivered
+   span, and outcome.
+2. Repeat on a derived child and confirm the child's media and dimensions.
+3. Run the deterministic cancellation diagnostic and confirm a cancelled
+   outcome and clean resource release.
+4. Open the GUI and confirm the existing Isolate player still seeks, loops,
+   scrubs, and uses its display-sized representation.
+5. Change the GUI window rapidly and confirm no scientific working-window
+   decode starts.
+
+Live “change the GUI while a scientific job runs” acceptance is deferred until
+a real GUI channel worker and consumer exist.
+
+## 16. Definition of done
 
 This milestone is complete only when:
 
-- A non-Qt caller can resolve and consume an explicit active-asset frame window.
-- The range is absolute, integer, half-open, and asset-bounded.
-- Exact rational time is preserved.
-- Media planes and their interpretations are explicit.
-- Returned batches carry frame identity, axes, coordinates, shape, dtype, and
-  validity/coverage.
-- Delivery is bounded and does not require a full-window allocation.
-- Cancellation and supersession prevent stale asset or range results from
-  becoming current.
-- Player interaction and frame accuracy have not regressed.
-- The implementation does not introduce grids, channels, recipes, persistence,
-  exports, or a general pipeline framework.
-- Automated tests pass.
+- A non-Qt caller can resolve and consume a registered asset frame window.
+- Importing the source contract does not import PyQt.
+- The range is absolute, integer, half-open, and validated without clamping.
+- Stable recorded asset/content identity and its verification status are
+  explicit.
+- Declared extent and provenance are explicit.
+- Exact rational time and native asset coordinates are preserved.
+- Only explicit native `rgb24` is supported.
+- Delivery is synchronous, bounded, immutable, and independently closeable.
+- The final source outcome remains inspectable.
+- Decoded delivery is not mislabeled scientific examination.
+- The GUI hookup snapshots state without launching processing.
+- The player continues to use its independent display session and preview.
+- No grids, channels, workers, queues, caches, recipes, persistence, exports,
+  or general pipeline framework were introduced.
+- Headless and offscreen GUI tests pass.
 - The user has reviewed and accepted the milestone.
 
-Stop here. The next possible handoff is the working grid, but it is not
-authorized by completion of this one.
+Stop here. The working grid is a later handoff and is not authorized by
+completion of this milestone.
