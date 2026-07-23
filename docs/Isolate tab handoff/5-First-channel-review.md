@@ -1,6 +1,6 @@
 # Review — 5 Add the first Isolate channel
 
-Reviewed on `2026-07-23` against:
+Originally reviewed on `2026-07-23` against:
 
 - `5-First-channel.md`.
 - The rewrite state returned in `.isolate-state-divergence.md`, reported at
@@ -12,10 +12,20 @@ Reviewed on `2026-07-23` against:
 Status: architectural, scientific-contract, and forward-looking review of
 `5-First-channel.md`.
 
-The rewrite repository source is not present in this oracle checkout. Current
-rewrite facts below are therefore limited to the returned divergence report and
-the milestone-4 review; package names and exact current code paths must be
-confirmed by the rewrite before implementation.
+Reviewed and updated in the rewrite checkout on
+`2026-07-23 15:43:15 -07:00` against commit `0f4afb2`.
+
+Status: corrected current-rewrite review. Milestone 5 is not implemented and is
+not authorized to begin before visible milestone-4 acceptance. The exact
+in-memory result value/default remains an explicit pre-implementation resource
+policy choice. Decision 003 now establishes its first-class product owner and
+portable boundary rather than leaving it as an isolated channel constant.
+
+The original oracle review correctly disclosed that it could not inspect the
+rewrite source. The rewrite-side review has now confirmed the exact current
+types and owners below. It also found that the commit carrying this pair has a
+false implementation-shaped subject and body: `0f4afb2` changed only the two
+milestone-5 Markdown files. No code or tests for the first channel exist.
 
 ## Verdict
 
@@ -65,12 +75,16 @@ corrections:
    intensity values are not numerically identical to the new scientific
    contract.
 
-After those corrections and a post-milestone-4 rewrite-side divergence refresh,
-the increment is suitable for implementation.
+The rewrite-side refresh is now complete. The corrected handoff chooses the
+named post-decoder Rec.601-like path, requires pre-source result-memory
+admission, composes the existing source outcome, and pins the worker ownership
+handshake. The increment is suitable for implementation only after the user
+accepts the visible milestone-4 behavior and the minimal execution-resource
+policy input/default is defined.
 
 ## Current-rewrite evidence available to this review
 
-### Reported present
+### Confirmed present at `0f4afb2`
 
 - A Qt-free `application.working_window` package.
 - `WorkingWindowRequest` with registered identity and absolute half-open
@@ -78,28 +92,43 @@ the increment is suitable for implementation.
 - `ResolvedWorkingWindow` with probed native-resolution dimensions and extent
   provenance.
 - Request-local synchronous `WorkingWindowStream` delivery.
-- Immutable native-resolution `rgb24` batches.
+- Immutable native-resolution decoded `rgb24` batches represented as tuples of
+  exact-sized `bytes` with a `PlaneDescriptor`.
 - Explicit source outcomes.
 - `IsolateSession.snapshot_working_window_request()` as a pure GUI adapter.
 - A separate player `MediaSession` and display decoder.
 - One letterboxed `IsolatePlayer.image_rect()`.
 - An empty right-hand channel placeholder.
 - Registered `ActiveAsset` dimensions and recorded content identity.
+- `WorkingGridSettings` and `ResolvedWorkingGrid`, with
+  `work_width`, `work_height`, `resolved_block_size`, `rows`, and `columns`.
+- Isolate-local grid ownership and retention of requested settings across
+  active-asset switches.
+- `IsolateSession.state_changed` and `current_frame` as the current
+  position/cursor seam.
 
-### Reported absent before milestone 4
+### Confirmed absent at `0f4afb2`
 
-- Accepted working-grid settings and resolved geometry.
 - A scientific GUI worker in Isolate.
 - A GUI supersession contract for scientific results.
 - A channel result type or channel panel.
 - Normalization or scientific pixel preprocessing in the rewrite.
 - Persistence, result artifacts, recipes, and whole-asset analysis.
 - A general channel registry or computation graph.
+- NumPy, OpenCV, or another declared numerical/resampling dependency.
+- `docs/rewrite-handoff-v2.md`,
+  `docs/sieve-scientific-computation-contract.md`, and
+  `.isolate-handoff-practices`.
 
-Milestone 5 must be reviewed again against the actual accepted milestone-4
-implementation. The current report cannot certify its type names, settings
-owner, geometry snapshot method, asset-switch policy, or dimension-rounding
-implementation.
+The actual milestone-4 implementation has now been inspected. `IsolateTab`
+owns the plain grid settings and resolved geometry; `IsolateSession` owns the
+temporal snapshot and display media. The GUI compute action should snapshot
+both immutable values. The grid resolver uses Python `round`, retains intent
+across asset switches, and re-resolves against the new registered dimensions.
+Visible milestone-4 acceptance remains the sequencing gate.
+
+Post-assessment validation reports `115 passed in 25.23s` for the complete
+repository suite with Qt offscreen.
 
 ## Important correction 1: choose the intensity representation honestly
 
@@ -784,10 +813,11 @@ normalization UI.
 
 ## Recommended disposition
 
-Revise `5-First-channel.md` before implementation:
+`5-First-channel.md` was revised in the rewrite checkout before implementation:
 
-1. Choose canonical encoded luma or a distinctly named post-`rgb24` Rec.601
-   representation.
+1. Choose a distinctly named post-decoder `rgb24` Rec.601-like representation,
+   retaining the full accepted plane descriptor and avoiding claims of
+   source-native or canonical encoded luma.
 2. Replace “native rgb24” terminology with “native-resolution decoded
    `rgb24`” where representation provenance matters.
 3. Add exact result-memory admission and pre-source refusal.
@@ -797,11 +827,13 @@ Revise `5-First-channel.md` before implementation:
 7. Preserve future normalization-before-blocking and temporal-context
    boundaries without implementing them.
 8. Keep scientific values distinct from presentation contrast.
-9. Refresh rewrite-side divergence after milestone 4 is implemented and
-   accepted.
+9. Refresh rewrite-side divergence after milestone 4 implementation. This is
+   now complete; visible user acceptance remains pending.
 
-Subject to those corrections, the first-channel direction is sound and aligned
-with the rewrite's forward-looking architecture.
+Subject to milestone-4 acceptance and the minimal resource-policy input/default,
+the corrected first-channel direction is sound and aligned with the rewrite's
+forward-looking architecture.
 
-Do not begin implementation from the uncorrected handoff, and do not proceed to
-normalization merely because this review exists.
+Do not infer implementation from commit `0f4afb2`, do not begin milestone 5
+before the user accepts milestone 4, and do not proceed to normalization merely
+because this review exists.

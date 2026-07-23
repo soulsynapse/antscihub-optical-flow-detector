@@ -1,6 +1,59 @@
 # 5 — Add the first Isolate channel
 
-Status: implementation handoff for the fifth Isolate-tab milestone.
+Reviewed and updated against rewrite commit `0f4afb2` on
+`2026-07-23 15:43:15 -07:00`.
+
+Status: assessed and corrected against the current rewrite; implementation has
+not started and remains gated on visible user acceptance of milestone 4 and
+definition of the minimal execution-resource policy input described in section
+8.1 and decision 003.
+
+The rewrite-side assessment found one especially important repository-history
+inconsistency: commit `0f4afb2` is titled `feat: implement first Isolate
+channel for intensity computation`, but its tree change adds only this handoff
+and its review. The current source contains no intensity computation, channel
+result, scientific worker, compute/cancel controls, or channel panel. Do not
+treat that commit subject or body as implementation evidence.
+
+The following current-checkout corrections control this handoff:
+
+- The accepted spatial types are `WorkingGridSettings` and
+  `ResolvedWorkingGrid`, owned by `IsolateTab`. Its concrete fields are
+  `work_width`, `work_height`, `resolved_block_size`, `rows`, and `columns`.
+- `IsolateSession.snapshot_working_window_request()` owns the temporal GUI
+  snapshot. A compute action must capture that request and the current immutable
+  `ResolvedWorkingGrid` together without moving grid state into the
+  media-owning session.
+- The source is native-resolution **decoded** `rgb24`: immutable `bytes` in
+  tightly packed row-major RGB order, with batch shape metadata
+  `(batch, height, width, 3)` and per-row stride `width * 3`. FFmpeg conversion
+  provenance is limited to the current `PlaneDescriptor`; this is not verified
+  source-native luma.
+- Milestone 5 therefore chooses the review's path B: a distinctly named
+  post-decoder Rec.601-like encoded-RGB intensity. It must retain the accepted
+  plane descriptor and backend identity and must not be labelled canonical
+  source encoded luma.
+- `WorkingWindowStream` already owns source completion, cancellation,
+  truncation, failure, and close. The channel result must embed that exact
+  outcome and add only channel-stage outcome and processed coverage.
+- Exact result-memory admission is required before
+  `open_working_window(...)`, because that call constructs the request-local
+  media session. Bounded decode batches alone do not bound retained results.
+  The budget belongs to the first-class compute-resource policy accepted in
+  `docs/decisions/003-compute-resources-are-a-first-class-product-capability.md`;
+  it is not intensity-specific scientific identity.
+- The current display worker is not a lifecycle template for science work:
+  `IsolateDecodeThread.stop()` interrupts a shared `MediaSession` and waits
+  with a timeout whose success is not checked. The milestone-5 worker must use
+  the worker-owned-source terminal handshake specified by the review.
+- `docs/rewrite-handoff-v2.md`,
+  `docs/sieve-scientific-computation-contract.md`, and
+  `.isolate-handoff-practices` do not exist in this checkout. Their oracle
+  content is not a controlling rewrite file.
+- Neither NumPy nor OpenCV is declared as a project dependency. Do not assume
+  either backend exists. Any optimized resampler must preserve the reference
+  fixtures, and any speed claim must follow the repository benchmark/report
+  requirements.
 
 This milestone turns the accepted temporal source and spatial grid into one real
 scientific result: block-mean encoded-luma intensity over the selected looping
@@ -30,16 +83,21 @@ This handoff follows:
 - `1-Build-the-player.md` and its accepted implementation.
 - The accepted media-service implementation and diagnostics.
 - The corrected and accepted implementation of `3-Working-window.md`.
-- The corrected and accepted implementation of `4-Working-grid.md`.
+- The corrected implementation of `4-Working-grid.md`; visible acceptance is
+  still the gate recorded below.
 - The rewrite's current active-asset, player, Isolate-state, worker, and
   lifecycle contracts.
-- The fixed geometry and intensity conventions in
-  `docs/sieve-scientific-computation-contract.md`.
+- The corrected geometry and intensity conventions in this handoff and review.
 
 Do not begin milestone 5 until milestones 3 and 4 have been implemented,
-manually validated, and accepted. In particular, do not build channel code on a
-provisional grid or silently choose the grid-setting asset-switch policy on this
-milestone's behalf.
+manually validated, and accepted. Milestone 4 is implemented with automated
+validation, but visible user acceptance is still pending as of the review time
+above. In particular, do not build channel code on an unaccepted grid.
+
+The grid-setting asset-switch policy is no longer provisional: requested
+downsample and block intent remain Isolate-session-local and survive asset
+switches, then re-resolve against the new registered extent. Application
+restart resets them to `1.0` and auto.
 
 Names and illustrative types in this document are not a demand that the rewrite
 copy an oracle class layout. Preserve the required behavior through the
@@ -53,7 +111,8 @@ Before implementation, update `.isolate-state-divergence.md` with:
 - Which owner snapshots temporal and spatial scientific inputs.
 - How recorded active-asset dimensions are compared with dimensions probed by
   the request-local working-window source.
-- The exact native `rgb24` batch shape, byte order, stride, mutability, and
+- The exact native-resolution decoded `rgb24` batch shape, byte order, stride,
+  mutability, and
   source-conversion provenance available to a consumer.
 - The existing source cancellation checks and final-outcome behavior.
 - The smallest current worker/supersession seam in Isolate, if one exists.
@@ -77,9 +136,9 @@ At completion:
 
 1. A Qt-independent caller can compute intensity from the accepted working
    window and grid without importing GUI modules.
-2. The computation consumes bounded native `rgb24` batches and never uses the
-   display preview raster.
-3. Each source frame produces exactly one `(grid_rows, grid_columns)` block
+2. The computation consumes bounded native-resolution decoded `rgb24` batches
+   and never uses the display preview raster.
+3. Each source frame produces exactly one `(rows, columns)` block
    plane aligned with the accepted working grid.
 4. The complete result records absolute frames, rational timebase, source and
    working geometry, grid identity, intensity conversion, outcome, and processed
@@ -169,7 +228,8 @@ Also distinguish:
 
 ### 5.1 Input
 
-The only accepted input plane is the milestone-3 native-size `rgb24` plane:
+The only accepted input plane is the milestone-3 native-resolution decoded
+`rgb24` plane:
 
 ```text
 shape: H x W x 3
@@ -246,8 +306,8 @@ mapping uses the fixed scientific `[0,1]` interval.
 Use the accepted milestone-4 resolved working dimensions:
 
 ```text
-Ww = resolved_grid.working_width
-Hw = resolved_grid.working_height
+Ww = resolved_grid.work_width
+Hw = resolved_grid.work_height
 ```
 
 For each native intensity frame, produce one `Hw x Ww` frame by exact area
@@ -285,7 +345,7 @@ Use the accepted milestone-4 grid exactly:
 ```text
 R = grid.rows
 C = grid.columns
-b = grid.block_size_working_px
+b = grid.resolved_block_size
 ```
 
 For cell `(r,c)`:
@@ -374,25 +434,53 @@ all values are finite and in [0,1]
 
 Do not serialize pixels, values, or results in this milestone.
 
+### 8.1 Result-memory admission
+
+Before calling `open_working_window(...)`, calculate retained result bytes from
+the captured immutable request and grid:
+
+```text
+T = stop_frame - start_frame
+elements = T * rows * columns
+result_bytes = elements * 4
+```
+
+Use overflow-safe integer arithmetic and one explicit milestone-5 in-memory
+result budget supplied through a small immutable Qt-free execution/resource
+policy. Decision 003 establishes the long-term owner; milestone 5 must define a
+minimal input that the future Resources tab, CLI, and HPC runner can all supply
+without building those surfaces now. The initial value/default must still be
+selected and recorded before implementation rather than invented silently.
+Admit a request exactly at the chosen budget and reject one over it with a
+structured resource error that reports the requested and allowed bytes.
+Rejection must occur before a `WorkingWindowStream` or `MediaSession` exists.
+
+The admission estimate covers the retained `float32` result. Implementation
+must also keep the live decoded RGB, conversion, resized, reduced, result, and
+panel-copy buffers bounded. Prefer frame-at-a-time work inside a bounded source
+batch unless measurement justifies a larger simultaneous buffer set.
+
 ## 9. Coverage, validity, and incomplete execution
 
 Intensity is a scientific computation, so successfully reduced frames may be
 called processed for this channel. They are not quiet, detected, or negative.
 
-The headless execution outcome distinguishes at least:
+Do not copy the source outcome into a second channel enum. The result composes:
 
 ```text
-completed
-cancelled
-source_truncated
-source_failed
-computation_failed
+exact WorkingWindowOutcome
+channel-stage outcome: completed | computation_failed
+processed channel span
 ```
 
-The headless layer may expose a processed prefix with its honest outcome for
-diagnostics and later consumers. The milestone-5 GUI publishes a channel panel
-as current only for a complete `completed` result covering the complete captured
-request.
+The processed channel span advances only after a delivered frame completes RGB
+validation, conversion, downsample, and block reduction. Preserve the exact
+source error and outcome without translating it into a lossy channel string.
+The headless layer may expose a processed prefix with its honest composed
+outcome for diagnostics and later consumers. The milestone-5 GUI publishes a
+channel panel as current only when the source outcome is `COMPLETE`, the
+channel-stage outcome is `completed`, and processed coverage exactly equals the
+captured request.
 
 On cancellation, truncation, or failure:
 
@@ -516,6 +604,13 @@ old worker has actually released its source and terminated. Check worker
 shutdown success; do not copy the unsafe start/interrupt/timeout pattern listed
 in the divergence ledger.
 
+The worker must check cancellation before source construction and between
+bounded operations, exclusively create/consume/close its request-local stream,
+and emit exactly one terminal outcome only after the stream is closed. The GUI
+may start the newest pending request only after verified worker-thread exit. If
+exit cannot be verified, retain the thread as an owned cleanup failure rather
+than dropping its reference.
+
 ## 12. Isolate controls and status
 
 Use a compact control/status area near the grid controls or channel panel:
@@ -541,7 +636,7 @@ On cancellation/failure, report the outcome without leaving a partial result
 painted as current. Do not add throughput, completion-time estimates, or a
 reusable processing benchmark casually. If a reusable estimate is introduced,
 it must follow the accepted benchmark-diagnostic decision in
-`.isolate-handoff-practices`.
+`docs/decisions/001-reusable-benchmarks-are-product-diagnostics.md`.
 
 The action is enabled only when:
 
@@ -741,6 +836,10 @@ blue    (0,0,255)     -> 0.114
 
 Also test mixed codes, array order, dtype, `[0,1]` bounds, nonmutation of source
 bytes, and rejection of malformed/non-finite input at the applicable boundary.
+Pin a case that distinguishes Rec.601 weights from BT.709 and limited-range
+interpretations. Assert that the result calls this a post-decoder RGB
+representation, retains the accepted source `PlaneDescriptor`, and does not
+claim source-native or canonical encoded luma.
 
 ### 18.2 Area downsampling
 
@@ -778,8 +877,15 @@ Test:
 - Source, working, grid, conversion, normalization, implementation, identity,
   and verification provenance are present.
 - Complete success requires exact requested coverage.
-- Source truncation preserves only its honest prefix and is not completed.
-- Cancellation and computation failure carry distinct outcomes.
+- The exact source outcome is retained rather than translated into a second
+  source-state enum.
+- Source truncation preserves only its honest processed prefix and is not
+  completed.
+- A delivered frame not yet reduced is absent from processed channel coverage.
+- Source failure and channel computation failure remain distinct.
+- Result-byte estimation is exact, overflow-safe, and independent of GUI state.
+- Requests exactly at the selected budget are admitted.
+- A request one element over budget is refused before source/session creation.
 - Headless imports do not import PyQt.
 
 ### 18.5 Bounded lifecycle
@@ -791,6 +897,9 @@ Test:
 - Cancellation closes it.
 - Explicit close and failure close it.
 - Cancellation is observed before the complete window is processed.
+- Cancellation before worker entry and before source construction opens no
+  source.
+- A terminal worker outcome is emitted only after source close.
 - Progress is monotonic, bounded, and ends exactly on successful completion.
 - Intensity-only execution never calls tensor, flow, Morlet, or detection code.
 
@@ -861,6 +970,10 @@ The manual path is:
     active asset.
 11. Compute a one-frame window and confirm it produces one valid block plane.
 12. Close the window during a job and confirm clean worker/source shutdown.
+13. Attempt one deliberately over-budget request and confirm the GUI reports
+    requested versus allowed bytes without opening scientific media.
+14. Confirm the result labels the post-decoder RGB intensity representation,
+    source color metadata, and presentation mapping honestly.
 
 Do not judge normalization, motion response, value filtering, spectral
 behavior, or detection in this milestone; none is implemented.
@@ -878,6 +991,11 @@ This milestone is complete only when:
 - Block means use owned pixels and retain partial-cell weights.
 - The result preserves absolute time, rational rate, geometry, identity,
   verification status, implementation provenance, processed span, and outcome.
+- An explicit accepted result budget rejects oversized requests before source
+  construction, with exact boundary tests, and enters through the portable
+  execution/resource policy rather than intensity identity.
+- The result embeds the exact source outcome and distinguishes it from
+  channel-stage failure and processed channel coverage.
 - Execution is bounded and cancellable and closes its source on every exit.
 - The GUI has one explicit compute action, one worker, and one channel panel.
 - GUI publication rejects every obsolete progress/result/error path.

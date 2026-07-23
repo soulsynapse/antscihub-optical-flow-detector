@@ -1,96 +1,287 @@
-The isolate handoff is aiming to rebuild the process tab from this repo, which serves as the oracle for the rewrite repo.
+This file exists as a summary of divergence between the handoffs from the oracle and the current, present state of the rewrite repository. It isn't meant to be a summary of the state; it is a summary of the divergence that was found when assessing the handoff and review files.
 
-It is reimplementing everything in tiny steps. The handoff files are what I define mostly, but you can make suggestions for the next handoff.
+## 2026-07-23 14:41:35 -07:00 — Working-window handoff
 
-Some of these handoffs will be hints from the oracle for improving processing speed from hard-won results. Be explicit that they're hints and shouldn't be implemented at the cost of breaking things in the new implementation, and they should be benchmarked before and after to see if they're actually an improvement.
+Reviewed against current checkout commit `7707968`.
 
-## Practices for every handoff
+Corrections the oracle should carry into later handoffs:
 
-- Keep each handoff to one user-verifiable increment. State the outcome, what is
-  explicitly out of scope, and where implementation must stop.
-- Treat the rewrite's implemented contracts as the starting point. When older
-  handoffs conflict with a newer decision, state the intended precedence without
-  discarding unrelated correctness requirements.
-- The oracle cannot assume that a forward-looking contract is already
-  implemented in the rewrite. Mark unverified rewrite capabilities as
-  assumptions or intended behavior, and do not require a new abstraction merely
-  because an architecture document anticipates it.
-- Before implementation, have the rewrite report where its current types,
-  ownership, lifecycle, and supported behavior diverge from the handoff's
-  assumptions. Use that report to narrow or adapt the handoff while preserving
-  its required outcome; do not force the rewrite to imitate stale oracle shapes.
-- Separate required behavior from suggested implementation and from oracle
-  hints. Do not let an example command, filename, class layout, or optimization
-  become a permanent public contract accidentally.
-- Preserve clean ownership boundaries, but do not build speculative frameworks
-  for future features. Introduce an abstraction when the current increment
-  needs it or when an existing contract already requires it.
-- For oracle-derived performance hints, protect correctness first, the handoff should specify to measure the
-  rewrite before and after on the same representative inputs, change one
-  hypothesis at a time, and retain only demonstrated improvements. Record useful
-  negative results.
-- Include focused automated tests and a short manual acceptance path. Automated
-  success does not substitute for the user's validation of visible interaction.
-- Do not continue into the next numbered feature after completing the handoff.
+- The current rewrite has no headless asset-generation contract. The private
+  `IsolateSession._generation` value is GUI display lifecycle state and must not
+  be placed in reusable source requests, batches, or scientific identity.
+- `ActiveAsset` is immutable but shares a module with the PyQt
+  `ActiveAssetController`. A genuinely headless contract must not import that
+  module; use a headless request/reference plus a thin GUI snapshot adapter.
+- The active asset snapshot does not currently contain the active media's
+  `content_sha256`, although the asset sidecar does. Reading the recorded
+  sidecar hash is not the same as verifying the current media bytes. Ordinary
+  resolution may compare cheap current facts such as size, dimensions, and
+  rational fps, but explicit content verification remains separate.
+- Scientific source requests should require an existing registered sidecar.
+  They must not silently initialize a raw video merely to manufacture stable
+  identity.
+- The current media API exposes only FFmpeg-produced `rgb24` bytes through
+  `MediaSession.read_frame_rgb`. It has no general plane ids, plane registry,
+  luma/alpha/native-plane delivery, or multi-plane batches.
+- Isolate display explicitly requests a width-limited preview. Scientific
+  source handoffs must require native decode and must not reuse that preview as
+  evidence.
+- `MediaSession.frame_count` may come from decoded, packet, container, or
+  duration-derived counts. Later handoffs must retain this provenance and must
+  not call every admitted extent verified.
+- The current `MediaSession` owns one mutable FFmpeg cursor. A scientific
+  iterator must use a request-local session rather than sharing the live player
+  session.
+- For a source with no consumer, the smallest bounded contract is synchronous
+  iteration with natural backpressure. Do not require a worker, producer queue,
+  GUI latest-only mailbox, or cross-thread cancellation until a real channel
+  consumes the source.
+- A source stream must make its final outcome accessible after ordinary
+  iteration and must close request-local media on normal completion,
+  cancellation, failure, explicit close, and early consumer exit.
+- Current short RGB reads all become `FRAME_DECODE_FAILED`; the media layer does
+  not preserve a structured clean-EOF versus decode-error reason. Do not require
+  the working-window layer to guess truncation from message text or stderr.
+- Decoded/delivered source span is not examined scientific coverage. Reserve
+  `examined`, `processed`, `quiet`, and `detected` for completed scientific
+  nodes.
+- The current backend returns a complete exact-sized frame or an error. General
+  spatial validity masks and coverage artifact types are not yet justified.
+- A standalone headless diagnostic cannot observe another running Qt process's
+  private current window or generation without an explicitly designed bridge.
+  Until a real GUI consumer exists, use explicit diagnostic inputs and a pure
+  GUI request-snapshot test.
 
-## Accepted benchmark-diagnostic decision
+## 2026-07-23 14:53:33 -07:00 — Working-grid handoff
 
-Status: accepted on 2026-07-23.
+Reviewed against current checkout commit `4b09232`.
 
-Reusable benchmarks that help a user estimate responsiveness, runtime,
-throughput, or feasibility are product diagnostics, not disposable development
-scripts. When a handoff introduces or extends one:
+Corrections the rewrite should carry into its assessment of the working-grid
+handoff:
 
-- Put reusable measurement logic in an importable package module and expose it
-  through a supported CLI or deliberate UI surface.
-- Design useful human output alongside a versioned machine-readable result.
-- Report the asset/content identity, source and measured representation, sample
-  and cache conditions, median and a tail statistic when supported, the
-  software/backend environment, and whether each conclusion is measured,
-  extrapolated, or interpreted.
-- Keep expensive diagnostics behind explicit user action; do not silently run
-  whole-asset work during ordinary startup.
-- Keep Qt diagnostics importable within GUI packages and out of headless CLI
-  imports. Different layers, such as media service, visible GUI painting, and
-  scientific processing, require their own honestly labelled measurements.
+- Commit `4b09232` contains the corrected milestone-3 documentation, but no
+  working-window implementation. Milestone 4 must remain queued until milestone
+  3 is implemented and accepted, then rerun its divergence check against the new
+  headless package and GUI snapshot seams.
+- `ActiveAsset.width` and `height` are registered native dimensions, but
+  `ActiveAsset` still lives in a PyQt-bearing module. Pass primitive native
+  dimensions into the headless grid resolver; do not import `ActiveAsset` there.
+- `IsolatePlayer.frame_size` is the capped display-preview size, not the native
+  source extent. It must not be used to resolve working dimensions or block
+  geometry.
+- `IsolatePlayer` currently exposes only `image_rect()` for its letterboxed
+  preview. It has no native-source-coordinate transform. Map grid boundaries
+  directly by normalized working coordinates into `image_rect()` rather than
+  creating a general display adapter.
+- The normalized current-player mapping is:
+  `view_x = left + (working_x/work_width)*drawn_width` and equivalently for
+  `y`. The outside grid boundary therefore matches `image_rect()` even when the
+  preview dimensions were capped or rounded.
+- `IsolatePlayer` has no overlay input, zoom, or overlay-hide shortcut. Add one
+  grid-specific optional paint input; do not copy the interactive Replicates
+  `FrameView` or introduce a general overlay framework. Do not add zoom or a
+  shortcut for this milestone.
+- `IsolateSession` currently owns temporal playback, a mutable display
+  `MediaSession`, timers, and the display decoder thread. Keep the grid resolver
+  Qt-independent and do not make it part of this media-owning session merely for
+  convenience. The smallest current GUI owner is `IsolateTab`; milestone 3's
+  later request-snapshot method remained temporal and did not replace that
+  owner.
+- The rewrite currently has no downsample/block settings or persistence policy.
+  The original review proposed initializing `1.0` and auto once per Isolate-tab
+  session and retaining those intents across asset changes. The post-milestone-3
+  refresh below supersedes that proposal as an assumed policy: retain versus
+  reset requires a user decision. Do not add sidecars or `QSettings` either way.
+- The loaded player already has `IsolateDecodeThread`. “No worker or decode on
+  grid change” means no additional grid worker and no additional request to the
+  existing display decoder, not that the application has zero threads.
+- Current temporal controls use `can_loop` and are disabled on one-frame assets.
+  Grid controls are spatial and must instead be enabled from valid active-asset
+  geometry so one-frame assets remain supported.
+- Dense-grid suppression belongs inside player presentation. It must not change
+  the resolved grid, silently increase block size, or feed widget resize back
+  into scientific settings.
+- The right-hand channel placeholder is still intentionally empty. Grid
+  controls should not replace it or introduce a fake channel; use a compact
+  separate control/readout area in the existing Isolate layout.
 
-Top-level scripts remain appropriate for disposable hypothesis tests, one-time
-investigations or migrations, fixture construction, and thin development
-launchers whose reusable logic lives in the package. A JSON file in `findings/`
-does not by itself make a benchmark a supported product contract.
+## 2026-07-23 15:14:42 -07:00 — Working-grid post-milestone-3 refresh
 
-The accepted initial media surface is:
+Reviewed and updated against current checkout commit `01b256f`.
 
-```powershell
-sieve media benchmark ASSET
-sieve media benchmark ASSET --native
-sieve media benchmark ASSET --json
-```
+Corrections the oracle should carry into later handoffs:
 
-The default measures the same capped display representation used by Isolate;
-native-resolution measurement is explicit because it is more expensive and
-answers a different question. Media-service results must not claim to measure
-GUI painting, overlays, or scientific processing.
+- The milestone-4 review's central checkout description is now stale.
+  Milestone 3 was implemented in `5bffca7`; the rewrite now has a Qt-free
+  `WorkingWindowRequest`, `ResolvedWorkingWindow`, native `rgb24` batches,
+  request-local synchronous streaming, explicit extent provenance and final
+  outcomes, and a GUI request-snapshot adapter.
+- `WorkingWindowRequest` contains registered asset identity and half-open
+  temporal bounds. It intentionally contains neither source dimensions nor
+  spatial tuning. `ResolvedWorkingWindow` contains probed native width and
+  height, but obtaining it opens a request-local media session. Milestone 4
+  must not open a working-window source merely to resolve or repaint geometry.
+- The implemented GUI adapter is
+  `IsolateSession.snapshot_working_window_request()`. It snapshots the current
+  asset identity and temporal window without opening scientific media, but it
+  does not establish a general Isolate settings controller. Grid intent should
+  remain a plain Qt-independent value owned by `IsolateTab`, not be added to
+  the playback/media lifecycle of `IsolateSession`.
+- `ActiveAsset` now carries registered native `width`, `height`,
+  `content_sha256`, and sidecar/media references. It still lives in a
+  PyQt-bearing module. Pass primitive width and height from the active snapshot
+  into the headless grid resolver; do not import `ActiveAsset` into the
+  resolver.
+- For immediate UI geometry, registered `ActiveAsset.width,height` are the
+  available no-I/O extent. They are recorded facts, not freshly
+  content-verified evidence. When a later channel combines a resolved grid with
+  pixels, it should require equality with
+  `ResolvedWorkingWindow.width,height` and retain that source's recorded
+  identity and extent provenance.
+- The rewrite still has no working-grid type, downsample setting, block
+  setting, spatial-settings persistence, or accepted spatial dimension
+  rounding rule. The handoff's Python `round` rule remains available, but must
+  be defined once in the grid resolver and pinned at half ties.
+- The review's proposed session-local retention across active-asset switches is
+  not current rewrite behavior and has not been accepted as a product decision.
+  Whether asset switches retain `downsample` and block intent or reset them is
+  the only true behavior choice still requiring the user; either policy can
+  re-resolve safely against the new primitive native dimensions.
+- The current `IsolatePlayer` remains a capped-preview painter with one
+  letterboxed `image_rect()` and no zoom or overlay seam. The review's
+  normalized mapping directly into `image_rect()` remains the smallest correct
+  projection. No milestone-3 implementation created a display adapter that the
+  grid should reuse.
+- Grid control changes must create no `WorkingWindowStream`, no
+  `MediaSession`, no grid worker, and no request to the existing
+  `IsolateDecodeThread`. The existing display thread does not violate this
+  rule; only additional work caused by a grid change would.
+- The review's out-of-scope implementation findings remain separate from
+  milestone 4. In particular, milestone 3 did not repair the stale GUI decode
+  error path, GUI decoder start/interrupt shutdown race, derivation's
+  metadata-only trust of recorded content identity, synchronous first-open
+  registration, capped-preview aspect distortion, or incomplete benchmark
+  provenance. Grid code must not absorb those responsibilities.
+- Focused post-refresh validation passed:
+  `tests/test_working_window.py`, `tests/test_isolate_player.py`, and
+  `tests/test_domain_and_services.py` report `49 passed in 10.46s` with Qt
+  offscreen. This supersedes the review's pre-milestone-3 `34 passed` evidence
+  for current-checkout assessment, while leaving the handoff's manual
+  acceptance path outstanding.
 
-## Forward-looking goals
+## 2026-07-23 15:26:23 -07:00 — Working-grid implementation
 
-Each increment should remain small while preserving these later capabilities:
+Reviewed against headless-grid commit `1d09b6f` plus the current GUI change.
 
-- Scientific work is headless and Qt-independent so the same resolved settings
-  can eventually run through the GUI, CLI, or HPC execution.
-- Large windows and whole assets can use bounded, cancellable streaming rather
-  than requiring full-video arrays in memory.
-- Asset identity, rational time, media planes, coordinates, validity, coverage,
-  and provenance remain explicit at component boundaries.
-- Static value filtering and spectral processing are both legitimate paths; do
-  not design the common boundary around Morlet or any other single method.
-- Stable results can later be consumed by validation, presentation rendering,
-  exports, derived children, and stacked detections without making Isolate own
-  those consumers.
-- Interactive generation tokens and latest-request policy stay in GUI
-  orchestration; reusable headless contracts use stable asset/content identity.
-- Pixel input ranges remain distinct from downstream output ranges so later
-  transforms may request temporal context without changing result ownership.
-- Components provide enough stable source and implementation provenance for
-  later artifacts to identify their evidence, without prematurely building the
-  artifact or pipeline system.
+Current rewrite state the oracle should carry forward:
+
+- The user accepted milestone 3, accepted the corrected milestone-4 plan, and
+  chose to retain requested downsample and block intent across active-asset
+  switches. The intents re-resolve against each new registered native extent;
+  application restart returns to `1.0` and auto. No `QSettings`, sidecar, or
+  per-asset tuning persistence was added.
+- `application.working_grid` is the Qt-free spatial contract. It provides
+  immutable settings, tagged auto/explicit block intent, deterministic Python
+  half-tie rounding, compact resolved geometry, derived half-open block bounds,
+  partial area weights, and working-to-source boundary projection.
+- `IsolateTab` owns the one plain settings value, controls, resolved readout,
+  and active-asset re-resolution. `IsolateSession` remains temporal
+  playback/media ownership and was not given grid state.
+- `IsolatePlayer` has one grid-specific optional presentation input. It maps
+  normalized working boundaries directly into `image_rect()`, draws the true
+  outside boundary, and suppresses all internal lines before generating them
+  when projected spacing is below four logical pixels.
+- Grid changes create no working-window stream, media session, frame request,
+  grid worker, timer, cache, result, or coverage artifact. The right-hand
+  channel placeholder remains unchanged.
+- The controls remain available for valid one-frame active assets even though
+  temporal looping is disabled.
+- Focused grid/player validation reports `39 passed in 2.37s`; the complete
+  offscreen repository suite reports `115 passed in 23.71s`.
+- Visible user acceptance remains outstanding. Do not begin the first channel
+  merely because the grid implementation and automated tests are complete.
+
+## 2026-07-23 15:43:15 -07:00 — First-channel handoff
+
+Reviewed against current checkout commit `0f4afb2`.
+
+Corrections the oracle should carry into later handoffs:
+
+- Commit `0f4afb2` is titled and described as an implemented first intensity
+  channel, but its complete tree change adds only
+  `5-First-channel.md` and `5-First-channel-review.md`. The rewrite has no
+  intensity computation, channel result, scientific worker, compute/cancel
+  controls, panel, or milestone-5 tests. Commit metadata is not implementation
+  evidence.
+- Milestone 4 is implemented and automatically validated, so the review's
+  pre-milestone-4 absence list and “reported” type descriptions are stale.
+  Visible user acceptance is still outstanding and remains the milestone-5
+  sequencing gate.
+- The implemented spatial contract is
+  `application.working_grid.WorkingGridSettings` plus
+  `ResolvedWorkingGrid`. Concrete resolved fields are `work_width`,
+  `work_height`, `resolved_block_size`, `rows`, and `columns`; the handoff's
+  illustrative `working_width`, `working_height`, and
+  `block_size_working_px` names do not exist.
+- `IsolateTab` owns session-local grid intent and its current immutable
+  resolution. Requested downsample and block intent survive asset switches and
+  re-resolve against each new registered extent; application restart resets to
+  `1.0` and auto. `IsolateSession` remains the temporal player/media owner and
+  provides `snapshot_working_window_request()`.
+- A future compute action should capture the temporal request and current
+  resolved grid together. When the source opens, it must compare
+  `ResolvedWorkingWindow.width,height` with
+  `ResolvedWorkingGrid.source_width,source_height` before consuming pixels.
+- `FrameBatch` exposes shape `(batch, height, width, 3)`. Its buffers are
+  immutable exact-sized `bytes` from `MediaSession.read_frame_rgb`, tightly
+  packed in row-major RGB order with pixel stride 3 and row stride
+  `width * 3`. Short frames raise a structured decode failure; no padding or
+  approximate reshape exists.
+- The source plane is native-resolution decoded `rgb24`, not source-native
+  luma. `PlaneDescriptor` records FFmpeg, source pixel format, color range,
+  color space, transfer, and primaries, but the current source contract does
+  not establish a canonical source encoded-luma plane or fully pin FFmpeg's
+  conversion implementation/version.
+- The smallest honest milestone-5 representation is therefore the review's
+  path B: a distinctly named post-decoder Rec.601-like weighted RGB intensity.
+  Its result must retain the accepted plane descriptor and backend provenance
+  and must not claim canonical/source-native luma.
+- `WorkingWindowStream` already checks cancellation before each frame read and
+  owns one final `COMPLETE`, `CANCELLED`, `TRUNCATED`, or `FAILED` outcome.
+  Normal completion, cancellation, failure, explicit close, and context exit
+  close the request-local session. A channel should embed this exact outcome
+  and separately record only channel-stage outcome and actually reduced span.
+- `open_working_window(...)` constructs the request-local `MediaSession`
+  immediately. Exact retained-result admission therefore has to use the
+  captured span and grid to reject over-budget work before calling it.
+- Decision 003 now establishes available compute resources and execution policy
+  as first-class product concepts. It does not supply the initial numeric
+  in-memory result budget; milestone 5 must define that value/default and accept
+  it through a portable Qt-free resource-policy seam rather than silently
+  inventing an intensity-specific limit.
+- There is no scientific worker/supersession seam yet. The existing
+  `IsolateDecodeThread` is a display worker around a shared session; its stop
+  path interrupts cross-thread, waits up to three seconds without checking the
+  return value, then drops the decoder reference. Milestone 5 must not copy
+  that lifecycle.
+- The safe new-worker boundary is: GUI owns cancellation/token/pending request;
+  worker checks cancellation before creating, then exclusively creates,
+  consumes, and closes its request-local stream; worker emits one terminal
+  outcome only after close; GUI starts a pending replacement only after
+  verified thread exit and retains ownership on cleanup failure.
+- `IsolateSession.state_changed` exposes current-frame changes, and
+  `timeline_seek`/`timeline_scrub` provide seek paths. The right-hand channel
+  area is still the explicit `No channels added yet.` placeholder. No channel
+  cursor signal, result owner, or panel is implemented.
+- There is no current channel behavior that conflicts with the fixed
+  conversion/downsample/block/publication rules because no channel exists.
+  There is also no NumPy or OpenCV project dependency, so no vectorized or
+  backend area reducer may be assumed before implementation.
+- The oracle-only files `docs/rewrite-handoff-v2.md`,
+  `docs/sieve-scientific-computation-contract.md`, and
+  `.isolate-handoff-practices` are absent from this rewrite. Later oracle
+  handoffs should carry any indispensable rule directly or cite a file that
+  exists in both repositories.
+- Post-assessment validation reports `115 passed in 25.23s` for the complete
+  repository suite with Qt offscreen. No milestone-5 implementation was added
+  by this assessment.
