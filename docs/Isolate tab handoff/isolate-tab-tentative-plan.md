@@ -17,10 +17,47 @@ Existing handoffs:
 2. `2-Media-service-handoff.md`
 3. `3-Working-window.md`
 4. `4-Working-grid.md`
+5. `5-First-channel.md`
+
+## Current handoff state and gates
+
+The current rewrite snapshot returned to the oracle was commit `01b256f`.
+Milestone 3 was implemented in rewrite commit `5bffca7`, but the returned
+material still describes it as awaiting user acceptance.
+
+The current implementation sequence is gated as follows:
+
+```text
+accept milestone 3
+  -> choose retain/reset behavior for grid intent across asset switches
+  -> implement and accept corrected milestone 4
+  -> refresh milestone-5 divergence against that implementation
+  -> revise, implement, and accept milestone 5
+```
+
+Milestone 5's known revision gates are:
+
+- Choose canonical encoded luma or a distinctly named post-`rgb24` Rec.601
+  intensity representation.
+- Add explicit retained-result memory admission before opening scientific media.
+- Compose the accepted working-window source outcome instead of duplicating its
+  lifecycle states.
+- Define a race-safe scientific-worker creation, cancellation, close, and
+  termination handshake.
+- Pin numerical conformance to the accepted scientific representation rather
+  than raw equality with the oracle's historical grayscale scale.
+
+`.isolate-state-divergence.md` separately tracks stale display-decode errors,
+decoder shutdown, recorded-versus-verified content identity, first-registration
+GUI blocking, preview aspect distortion, and media-benchmark provenance. Those
+findings do not change the numbered feature order. A finding becomes a milestone
+prerequisite only when that milestone touches the affected boundary; in
+particular, milestone 5 must not copy the unsafe decoder lifecycle and must
+preserve identity-verification status.
 
 ## Candidate next increments
 
-### 3 — Define the working window (handoff and review written; revision pending)
+### 3 — Define the working window (implemented; user acceptance pending)
 
 Establish the non-Qt request for loading the selected frame window:
 
@@ -34,12 +71,13 @@ Establish the non-Qt request for loading the selected frame window:
 
 Do not compute a scientific channel yet.
 
-This creates the narrow pixel-delivery seam later channels can use without
-designing a general processing framework. Apply the corrections in
-`3-Working-window-review.md` before implementation; decoded pixels must not be
-reported as scientifically examined coverage.
+The rewrite reports that this narrow pixel-delivery seam is implemented with
+Qt-free requests, resolved source facts, request-local native-resolution
+`rgb24` streaming, explicit outcomes and provenance, and a pure GUI request
+snapshot. Decoded pixels must not be reported as scientifically examined
+coverage. Acceptance remains a user gate before milestone 4 begins.
 
-### 4 — Build the working grid (handoff and review written; revision pending)
+### 4 — Build the working grid (handoff and review refreshed; implementation gated)
 
 Add only the spatial working geometry:
 
@@ -56,9 +94,11 @@ Do not add pixel preprocessing, a channel, or detection.
 
 Downsample and block size remain separate: downsample changes the pixel evidence
 and compute cost, while block size changes spatial aggregation. The rewrite
-must report divergences from the handoff's assumptions before implementation.
+completed the required post-milestone-3 divergence refresh. Before
+implementation, the user must accept milestone 3 and choose whether downsample
+and block intent are retained or reset across active-asset changes.
 
-### 5 — Add the first channel
+### 5 — Add the first channel (handoff and review written; revision pending)
 
 Add one real, inexpensive channel end to end, probably block-mean intensity:
 
@@ -69,6 +109,12 @@ Add one real, inexpensive channel end to end, probably block-mean intensity:
 
 Do not create a channel registry or general add/remove framework yet. Let the
 first real channel expose the smallest useful panel and data contract.
+
+Before implementation, revise the handoff using
+`5-First-channel-review.md`, then refresh its rewrite-side divergence against
+the accepted milestone-4 types, ownership, geometry, worker, and player seams.
+The scientific representation, result-memory admission, source-outcome
+composition, and worker lifecycle must be resolved explicitly.
 
 ### 6 — Add normalization
 
@@ -247,9 +293,10 @@ The most useful sequence after the player and media-service work currently
 appears to be:
 
 ```text
-working window
-  -> working grid
-  -> intensity
+accept working window
+  -> choose grid asset-switch policy
+  -> implement and accept working grid
+  -> revise and implement intensity
   -> normalization
   -> change energy
   -> static value filtering

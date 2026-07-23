@@ -2,6 +2,9 @@
 
 Status: implementation handoff for the fourth Isolate-tab milestone.
 
+Reviewed and updated against rewrite commit `01b256f` on
+`2026-07-23 15:16:37 -07:00`.
+
 This milestone adds the spatial geometry that later channels will use. The user
 can choose a working scale and block size, see the resolved source, working, and
 grid dimensions, and optionally inspect the grid over the current player frame.
@@ -26,8 +29,8 @@ explicitly in scope, it follows:
 
 - `1-Build-the-player.md` and its accepted implementation.
 - The rewrite's accepted media-service implementation and diagnostics.
-- The corrected and accepted implementation of `3-Working-window.md`, including
-  its review corrections.
+- The corrected implementation of `3-Working-window.md`, including its review
+  corrections, once the user accepts that milestone.
 - The rewrite's current active-asset, media, and Isolate-state contracts.
 - The fixed geometry conventions in the scientific-computation contract where
   they are already accepted by the rewrite.
@@ -35,6 +38,12 @@ explicitly in scope, it follows:
 Do not begin this milestone until the previous working-window milestone has been
 accepted. Do not implement against an uncorrected handoff merely because its
 number is earlier.
+
+Milestone 3 is implemented in the current checkout. It provides a Qt-free
+working-window request, resolved source facts, request-local native `rgb24`
+streaming, explicit outcomes and provenance, and an immutable GUI request
+snapshot. Its implementation still awaits user acceptance, so the milestone-4
+implementation gate remains closed.
 
 Names and illustrative types in this document are not a demand that the rewrite
 copy an oracle class layout. Preserve the required behavior through the
@@ -70,6 +79,12 @@ true behavior conflict requiring a user decision
 Use the report to adapt the handoff to current rewrite ownership. Do not create a
 parallel settings model, coordinate transform, or overlay framework just to
 imitate the examples here.
+
+The required post-milestone-3 assessment is recorded in
+`.isolate-state-divergence.md` at `2026-07-23 15:14:42 -07:00`. It confirms one
+remaining true behavior choice: whether downsample and block intent persist or
+reset across active-asset switches. Resolve that choice with the user before
+implementation.
 
 If the rewrite already has a scientifically coherent and tested dimension
 rounding rule that differs at exact half-pixel ties, report it before changing
@@ -447,9 +462,17 @@ Resolution is synchronous and cheap. It:
 - Writes no files.
 - Produces no result coverage.
 
-The active asset is responsible for authoritative source dimensions. Do not ask
-the caller to supply dimensions that conflict with the resolved asset and then
-silently choose one.
+For immediate UI geometry, `ActiveAsset.width,height` provide the registered
+native dimensions without opening media. Pass those primitive values into the
+resolver; do not import the PyQt-bearing `ActiveAsset` module into headless
+geometry.
+
+These are recorded sidecar facts, not freshly content-verified evidence.
+`ResolvedWorkingWindow.width,height` are available only after opening a
+request-local source and probing current media, which this milestone must not do
+merely to resolve or repaint geometry. A later channel must reject a mismatch
+between its resolved working-window dimensions and its captured grid rather than
+silently choosing one.
 
 ## 10. Isolate controls and readout
 
@@ -512,15 +535,23 @@ base source block = 64
 show grid = a presentation choice
 ```
 
-Use the rewrite's current reset/open-asset behavior. Do not introduce a new
-sidecar or settings file solely for these controls.
+The rewrite has no existing spatial-setting reset or asset-switch behavior to
+preserve. Before implementation, choose one of these session-only policies:
+
+```text
+retain
+  keep requested downsample and block intent across active-asset changes
+
+reset
+  restore downsample 1.0 and block auto on each active-asset change
+```
+
+Whichever policy is accepted, application restart returns to defaults. Do not
+introduce a sidecar, `QSettings` key, per-asset tuning store, or reset button
+solely for these controls.
 
 On asset change, resolve geometry against the new asset's dimensions. An old
 resolved grid may not remain painted over the new asset.
-
-If the rewrite already restores Isolate-local settings, preserve its accepted
-ownership and report how these two settings will participate. Do not invent
-persistence in the oracle handoff.
 
 ## 11. Grid overlay
 
@@ -603,6 +634,13 @@ working-grid resolver
 
 This milestone may snapshot both in one Isolate controller state view for later
 use, but it must not make the geometry resolver decode pixels.
+
+The implemented milestone-3 GUI snapshot is
+`IsolateSession.snapshot_working_window_request()`. It captures registered
+asset identity and half-open temporal bounds; it does not contain source
+dimensions or spatial tuning and is not a general settings controller. Do not
+extend it merely to make the grid resolvable. Keep grid settings as a plain
+Qt-independent value owned by `IsolateTab`.
 
 The next real channel may combine them:
 
@@ -728,21 +766,23 @@ Do not build that product diagnostic as part of this geometry milestone.
 
 ## 17. Suggested implementation shape
 
-Fit the work into the rewrite's current packages. A small shape may be:
+Fit the work into the rewrite's current packages. The smallest current shape is:
 
 ```text
-headless geometry module
+Qt-independent application geometry module
   settings/intents
   resolve source extent -> working extent and block grid
   pure block-bound and weight calculations
 
-Isolate-local state/controller
-  own current downsample and block intent
-  resolve against current active asset
-  expose current resolved grid to presentation
+IsolateTab
+  owns one plain settings value and its controls/readout
+  resolves against primitive ActiveAsset.width,height
+  passes the current resolved grid to the player
 
-player presentation
-  paint optional grid through the existing source-to-display transform
+IsolatePlayer
+  accepts one optional grid-specific presentation input
+  maps normalized boundaries directly into image_rect()
+  paints a bounded grid without owning scientific state
 ```
 
 Do not add a pipeline base class, artifact registry, generic renderer, or worker
@@ -926,6 +966,8 @@ This milestone is complete only when:
   transform and remains responsive for dense grids.
 - Changing geometry performs no working-window decode and creates no scientific
   coverage or result.
+- The accepted retain-or-reset policy is applied consistently on active-asset
+  changes, and the old overlay is never shown over the new asset.
 - Existing player behavior has not regressed.
 - No channel, normalization, detector, persistence, recipe, cache, or general
   executor was added.

@@ -1,7 +1,8 @@
 # Review — 4 Build the Isolate working grid
 
-Reviewed against the current rewrite checkout on
-`2026-07-23 14:53:33 -07:00` at commit `4b09232`.
+Originally reviewed on `2026-07-23 14:53:33 -07:00` at commit `4b09232`.
+Reviewed and updated after milestone 3 on `2026-07-23 15:16:37 -07:00` at
+commit `01b256f`.
 
 Status: architectural and current-rewrite review of `4-Working-grid.md`.
 
@@ -32,21 +33,26 @@ The handoff needs a few current-checkout clarifications before implementation.
 Most are not scientific changes; they prevent an implementer from inventing
 abstractions around GUI capabilities the rewrite does not have.
 
-The largest sequencing fact is:
+The largest sequencing fact is now:
 
-> At rewrite commit `4b09232`, milestone 3 is corrected documentation only.
-> There is no implemented working-window source yet.
+> Milestone 3 is implemented in commit `5bffca7`, but still awaits user
+> acceptance.
 
-Milestone 4 must therefore remain queued until milestone 3 is implemented and
-accepted. The rewrite-side divergence check should be repeated at that point,
-because milestone 3 may introduce the headless package seam and GUI snapshot
-adapter that milestone 4 should reuse.
+The required post-milestone-3 divergence check is complete and recorded in
+`.isolate-state-divergence.md`. Milestone 4 remains queued only until milestone
+3 is accepted, the corrected milestone-4 documents are accepted, and the
+asset-switch setting policy is chosen.
 
 ## Current-checkout evidence
 
 ### Present
 
-- `ActiveAsset` carries registered source width and height.
+- `ActiveAsset` carries registered source width, height, content hash, and
+  sidecar/media references.
+- `application.working_window` provides Qt-free request, resolved-source,
+  plane, batch, stream, provenance, and outcome contracts.
+- `IsolateSession.snapshot_working_window_request()` captures registered
+  identity and temporal bounds without opening scientific media.
 - `IsolateSession` owns temporal window state, playback, the display
   `MediaSession`, and its decoder thread.
 - `IsolateTab` owns the widgets and connects active-asset changes to
@@ -62,7 +68,6 @@ adapter that milestone 4 should reuse.
 
 ### Absent
 
-- The milestone-3 working-window implementation.
 - A headless working-grid settings or resolved-geometry type.
 - A downsample or block-size setting in Isolate.
 - A grid readout.
@@ -76,41 +81,39 @@ adapter that milestone 4 should reuse.
 These absences do not require a broad new architecture. The current player and
 tab already provide a small place to add this milestone.
 
-## Important correction 1: rerun divergence after milestone 3 is implemented
+## Important correction 1: use the implemented milestone-3 seams precisely
 
 The handoff correctly says milestone 3 must be accepted first. That requirement
 is material, not ceremonial.
 
-The current rewrite contains the corrected milestone-3 handoff and review but
-no:
+The current rewrite now contains:
 
 ```text
 WorkingWindowRequest
-resolved source facts
-headless source package
-GUI request-snapshot adapter
+ResolvedWorkingWindow
+WorkingWindowStream
+IsolateSession.snapshot_working_window_request()
 ```
 
-Milestone 3 may establish:
-
-- The actual Qt-independent package location.
-- A primitive registered-asset reference.
-- The accepted relationship between GUI snapshots and headless values.
-- Current native media dimensions and their identity status.
-
-Milestone 4 should reuse those seams where appropriate instead of guessing them
-now.
+`WorkingWindowRequest` carries registered identity and half-open temporal
+bounds, not source dimensions or spatial tuning. `ResolvedWorkingWindow`
+contains probed native dimensions and recorded identity status, but obtaining it
+opens a request-local media session. Grid resolution must not open that source.
+It should use primitive registered `ActiveAsset.width,height` for immediate UI
+geometry, then require a later channel to compare its resolved source dimensions
+with its captured grid before combining pixels and cells.
 
 Required disposition:
 
-1. Implement and accept milestone 3.
-2. Rerun the milestone-4 divergence report against that checkout.
-3. Confirm the headless package and GUI snapshot ownership.
-4. Adapt names and placement without changing the grid behavior below.
-5. Only then implement milestone 4.
+1. Accept the implemented milestone 3.
+2. Keep grid geometry in a Qt-independent application module.
+3. Keep one plain grid-settings value in `IsolateTab`.
+4. Do not expand the temporal GUI request snapshot into a general settings
+   controller.
+5. Choose the asset-switch policy, then implement milestone 4.
 
-This review can approve the geometry contract now, but it cannot certify a
-package seam that does not yet exist.
+This review approves the geometry contract and the current package/ownership
+seam, subject to the remaining user decisions above.
 
 ## Important correction 2: map normalized grid boundaries directly into the current player rectangle
 
@@ -167,8 +170,10 @@ The current player receives the width-limited preview dimensions from
 `IsolateDecodeThread`. On a wide asset, those are deliberately not the native
 dimensions.
 
-The headless resolver must receive native source width and height through the
-active-asset/headless snapshot boundary established by milestone 3.
+The headless resolver must receive primitive native source width and height from
+the current `ActiveAsset` snapshot. The milestone-3
+`WorkingWindowRequest` snapshot does not carry dimensions and must not be opened
+merely to obtain them.
 
 For this milestone:
 
@@ -227,8 +232,9 @@ Do not make widget values the only source of truth. Keep one plain settings
 value that future channel orchestration can snapshot without reading spinboxes.
 The widgets present and edit that value.
 
-Milestone 3 may establish a better small GUI snapshot owner before this work
-starts. Reuse it if it remains headless-safe; do not force the layout above.
+Milestone 3 established a temporal request-snapshot method on
+`IsolateSession`, not a general Isolate settings owner. It does not supersede
+the `IsolateTab` ownership above.
 
 ## Important correction 5: define the currently absent asset-switch behavior
 
@@ -236,7 +242,8 @@ The handoff says to use the rewrite's current reset/open-asset behavior, but the
 rewrite has no downsample or block settings today. There is no existing behavior
 to preserve.
 
-Use this milestone's simplest explicit rule:
+The review recommends the following simplest explicit rule, but it is not
+accepted behavior until the user chooses it:
 
 ```text
 on Isolate-tab construction
@@ -259,8 +266,9 @@ Do not add a sidecar, `QSettings` key, per-asset tuning store, or reset button i
 this milestone. Later persistence can deliberately decide whether settings are
 global, session-local, or per asset.
 
-If the user wants asset switches to reset to defaults instead, that is a cheap
-policy change, but the handoff should not leave it undefined.
+Resetting to defaults on every asset switch is the other cheap, coherent policy.
+The handoff now exposes this as an explicit implementation gate rather than
+silently treating this review's recommendation as a decision.
 
 ## Important correction 6: “no worker” means no additional grid worker
 
@@ -543,8 +551,8 @@ $env:QT_QPA_PLATFORM = "offscreen"
    `IsolateSession`.
 4. Allocating one Python or Qt object per block.
 5. Persisting settings before their later ownership is known.
-6. Starting milestone 4 before milestone 3 establishes the headless package
-   seam.
+6. Starting milestone 4 before the implemented milestone-3 package seam is
+   accepted.
 
 ### Correctness risks if left ambiguous
 
@@ -576,9 +584,10 @@ $env:QT_QPA_PLATFORM = "offscreen"
 
 ## Current implementation issues observed during this review
 
-These issues are present in rewrite commit `4b09232`. They are not caused by the
-working-grid handoff and should not be “fixed” by moving their responsibilities
-into grid code.
+These issues were found at rewrite commit `4b09232`. The milestone-3 changes
+through current commit `01b256f` did not address them. They are not caused by
+the working-grid handoff and should not be “fixed” by moving their
+responsibilities into grid code.
 
 ### High: an obsolete decode error can defeat the latest valid request
 
@@ -768,10 +777,11 @@ schema and human report.
 The current focused suites pass:
 
 ```text
+tests/test_working_window.py
 tests/test_isolate_player.py
 tests/test_domain_and_services.py
 
-34 passed in 8.04s
+49 passed in 10.46s
 ```
 
 Passing tests do not negate the findings above; the stale-error path,
@@ -784,10 +794,10 @@ The geometry and scope in `4-Working-grid.md` are safe.
 
 Before implementation:
 
-1. Finish and accept milestone 3.
-2. Refresh the rewrite-side divergence report.
-3. Incorporate the current-player clarifications above.
-4. Explicitly choose session-local intent retention across asset switches.
+1. Accept the implemented milestone 3.
+2. Accept the updated handoff and review.
+3. Choose retain or reset behavior for grid intents across asset switches.
+4. Preserve the current-player and ownership clarifications above.
 
 The smallest implementation for the current rewrite should remain:
 
