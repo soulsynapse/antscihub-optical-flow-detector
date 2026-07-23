@@ -15,10 +15,11 @@ Existing handoffs:
 
 1. `1-Build-the-player.md`
 2. `2-Media-service-handoff.md`
+3. `3-Working-window.md`
 
 ## Candidate next increments
 
-### 3 — Define the working window
+### 3 — Define the working window (handoff written)
 
 Establish the non-Qt request for loading the selected frame window:
 

@@ -11,6 +11,14 @@ Some of these handoffs will be hints from the oracle for improving processing sp
 - Treat the rewrite's implemented contracts as the starting point. When older
   handoffs conflict with a newer decision, state the intended precedence without
   discarding unrelated correctness requirements.
+- The oracle cannot assume that a forward-looking contract is already
+  implemented in the rewrite. Mark unverified rewrite capabilities as
+  assumptions or intended behavior, and do not require a new abstraction merely
+  because an architecture document anticipates it.
+- Before implementation, have the rewrite report where its current types,
+  ownership, lifecycle, and supported behavior diverge from the handoff's
+  assumptions. Use that report to narrow or adapt the handoff while preserving
+  its required outcome; do not force the rewrite to imitate stale oracle shapes.
 - Separate required behavior from suggested implementation and from oracle
   hints. Do not let an example command, filename, class layout, or optimization
   become a permanent public contract accidentally.
@@ -24,3 +32,65 @@ Some of these handoffs will be hints from the oracle for improving processing sp
 - Include focused automated tests and a short manual acceptance path. Automated
   success does not substitute for the user's validation of visible interaction.
 - Do not continue into the next numbered feature after completing the handoff.
+
+## Accepted benchmark-diagnostic decision
+
+Status: accepted on 2026-07-23.
+
+Reusable benchmarks that help a user estimate responsiveness, runtime,
+throughput, or feasibility are product diagnostics, not disposable development
+scripts. When a handoff introduces or extends one:
+
+- Put reusable measurement logic in an importable package module and expose it
+  through a supported CLI or deliberate UI surface.
+- Design useful human output alongside a versioned machine-readable result.
+- Report the asset/content identity, source and measured representation, sample
+  and cache conditions, median and a tail statistic when supported, the
+  software/backend environment, and whether each conclusion is measured,
+  extrapolated, or interpreted.
+- Keep expensive diagnostics behind explicit user action; do not silently run
+  whole-asset work during ordinary startup.
+- Keep Qt diagnostics importable within GUI packages and out of headless CLI
+  imports. Different layers, such as media service, visible GUI painting, and
+  scientific processing, require their own honestly labelled measurements.
+
+Top-level scripts remain appropriate for disposable hypothesis tests, one-time
+investigations or migrations, fixture construction, and thin development
+launchers whose reusable logic lives in the package. A JSON file in `findings/`
+does not by itself make a benchmark a supported product contract.
+
+The accepted initial media surface is:
+
+```powershell
+sieve media benchmark ASSET
+sieve media benchmark ASSET --native
+sieve media benchmark ASSET --json
+```
+
+The default measures the same capped display representation used by Isolate;
+native-resolution measurement is explicit because it is more expensive and
+answers a different question. Media-service results must not claim to measure
+GUI painting, overlays, or scientific processing.
+
+## Forward-looking goals
+
+Each increment should remain small while preserving these later capabilities:
+
+- Scientific work is headless and Qt-independent so the same resolved settings
+  can eventually run through the GUI, CLI, or HPC execution.
+- Large windows and whole assets can use bounded, cancellable streaming rather
+  than requiring full-video arrays in memory.
+- Asset identity, rational time, media planes, coordinates, validity, coverage,
+  and provenance remain explicit at component boundaries.
+- Static value filtering and spectral processing are both legitimate paths; do
+  not design the common boundary around Morlet or any other single method.
+- Stable results can later be consumed by validation, presentation rendering,
+  exports, derived children, and stacked detections without making Isolate own
+  those consumers.
+- Interactive generation tokens and latest-request policy stay in GUI
+  orchestration; reusable headless contracts use stable asset/content identity.
+- Pixel input ranges remain distinct from downstream output ranges so later
+  transforms may request temporal context without changing result ownership.
+- Components provide enough stable source and implementation provenance for
+  later artifacts to identify their evidence, without prematurely building the
+  artifact or pipeline system.
